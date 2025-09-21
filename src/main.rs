@@ -27,6 +27,12 @@ struct ValidationError {
     reason: String,
 }
 
+#[derive(Debug, Clone)]
+enum SequenceType {
+    Burst(String),  // folder name
+    Hdr(String),    // folder name
+}
+
 fn get_exif_data(file_path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
     let output = Command::new("exiftool")
         .arg("-j")
@@ -50,13 +56,31 @@ fn get_exif_date(exif: &Value) -> Option<DateTime<Utc>> {
 }
 
 fn get_sequence_info(exif: &Value, re: &Regex) -> u32 {
-    if let Some(special_mode) = exif.get("SpecialMode").and_then(|v| v.as_str())
-        && let Some(captures) = re.captures(special_mode)
-            && let Some(seq_str) = captures.get(1)
-                && let Ok(seq) = seq_str.as_str().parse::<u32>() {
+    if let Some(special_mode) = exif.get("SpecialMode").and_then(|v| v.as_str()) {
+        if let Some(captures) = re.captures(special_mode) {
+            if let Some(seq_str) = captures.get(1) {
+                if let Ok(seq) = seq_str.as_str().parse::<u32>() {
                     return seq;
                 }
+            }
+        }
+    }
     0
+}
+
+fn get_hdr_info(exif: &Value, hdr_re: &Regex) -> Option<u32> {
+    if let Some(drive_mode) = exif.get("DriveMode").and_then(|v| v.as_str()) {
+        if drive_mode.contains("AE Auto Bracketing") && drive_mode.contains("Electronic shutter") {
+            if let Some(captures) = hdr_re.captures(drive_mode) {
+                if let Some(shot_str) = captures.get(1) {
+                    if let Ok(shot_num) = shot_str.as_str().parse::<u32>() {
+                        return Some(shot_num);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn is_raw_file(filename: &str) -> bool {
@@ -172,11 +196,12 @@ fn cache_exif_data(groups: &HashMap<String, Vec<PathBuf>>) -> HashMap<String, (P
 fn detect_sequences(
     files: &HashMap<String, Vec<PathBuf>>,
     exif_cache: &HashMap<String, (PathBuf, Value)>,
-) -> Vec<(String, Vec<String>)> {
-    let re = Regex::new(r"Sequence:\s*(\d+)").expect("Invalid regex for sequence");
+) -> HashMap<String, SequenceType> {
+    let burst_re = Regex::new(r"Sequence:\s*(\d+)").expect("Invalid regex for burst sequence");
+    let hdr_re = Regex::new(r"Shot\s+(\d+)").expect("Invalid regex for HDR sequence");
     
     // Collect all photo bases with their sequence numbers and dates
-    let mut photo_info: Vec<(String, u32, DateTime<Utc>)> = Vec::new();
+    let mut photo_info: Vec<(String, u32, Option<u32>, DateTime<Utc>)> = Vec::new();
     
     for (base, file_list) in files {
         let photo_files: Vec<PathBuf> = file_list.iter()
@@ -191,19 +216,19 @@ fn detect_sequences(
             .collect();
         
         if !photo_files.is_empty() {
-            if let Some((_, exif)) = exif_cache.get(base) {
-                let seq_num = get_sequence_info(exif, &re);
-                let date = get_exif_date(exif).unwrap_or_else(|| {
-                    // Fallback to modification time if no EXIF date
-                    Utc::now()
-                });
-                photo_info.push((base.clone(), seq_num, date));
-            }
+            let Some((_, exif)) = exif_cache.get(base) else { continue };
+            let burst_seq_num = get_sequence_info(exif, &burst_re);
+            let hdr_shot_num = get_hdr_info(exif, &hdr_re);
+            let date = get_exif_date(exif).unwrap_or_else(|| {
+                // Fallback to modification time if no EXIF date
+                Utc::now()
+            });
+            photo_info.push((base.clone(), burst_seq_num, hdr_shot_num, date));
         }
     }
     
     // Sort by date first, then by name to establish order
-    photo_info.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+    photo_info.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| a.0.cmp(&b.0)));
     
     let pb = ProgressBar::new(photo_info.len() as u64);
     pb.set_style(
@@ -212,57 +237,169 @@ fn detect_sequences(
             .expect("Failed to set progress bar style"),
     );
 
-    let mut sequences: Vec<(String, Vec<String>)> = Vec::new();
-    let mut current_sequence: Vec<String> = Vec::new();
-    let mut expected_seq_num = 0u32;
-    let mut sequence_name = String::new();
+    let mut sequences: HashMap<String, SequenceType> = HashMap::new();
     
-    for (base, seq_num, _date) in photo_info {
+    // First pass: detect HDR sequences
+    let mut current_hdr_sequence: Vec<String> = Vec::new();
+    let mut expected_hdr_shot = 1u32;
+    let mut hdr_sequence_name = String::new();
+    
+    for (base, _burst_seq_num, hdr_shot_num, _date) in &photo_info {
         pb.inc(1);
         
-        if seq_num == 0 {
-            // Not part of a sequence - finish current sequence if any
-            if current_sequence.len() > 1 {
-                sequences.push((sequence_name.clone(), current_sequence.clone()));
+        if let Some(shot_num) = hdr_shot_num {
+            if *shot_num == 1 {
+                // Start of a new HDR sequence
+                if current_hdr_sequence.len() > 1 {
+                    // Finish previous HDR sequence
+                    for hdr_base in &current_hdr_sequence {
+                        sequences.insert(hdr_base.clone(), SequenceType::Hdr(hdr_sequence_name.clone()));
+                    }
+                }
+                hdr_sequence_name = format!("{}_HDR", base);
+                current_hdr_sequence = vec![base.clone()];
+                expected_hdr_shot = 2;
+            } else if *shot_num == expected_hdr_shot && !current_hdr_sequence.is_empty() {
+                // Continue current HDR sequence
+                current_hdr_sequence.push(base.clone());
+                expected_hdr_shot += 1;
+            } else {
+                // HDR sequence broken - finish current sequence if it has multiple photos
+                if current_hdr_sequence.len() > 1 {
+                    for hdr_base in &current_hdr_sequence {
+                        sequences.insert(hdr_base.clone(), SequenceType::Hdr(hdr_sequence_name.clone()));
+                    }
+                }
+                
+                // Check if this starts a new HDR sequence
+                if *shot_num == 1 {
+                    hdr_sequence_name = format!("{}_HDR", base);
+                    current_hdr_sequence = vec![base.clone()];
+                    expected_hdr_shot = 2;
+                } else {
+                    current_hdr_sequence.clear();
+                    expected_hdr_shot = 1;
+                }
             }
-            current_sequence.clear();
-            expected_seq_num = 0;
-        } else if seq_num == 1 {
-            // Start of a new sequence
-            if current_sequence.len() > 1 {
-                sequences.push((sequence_name.clone(), current_sequence.clone()));
-            }
-            sequence_name = format!("seq_{}", base);
-            current_sequence = vec![base];
-            expected_seq_num = 2;
-        } else if seq_num == expected_seq_num && !current_sequence.is_empty() {
-            // Continue current sequence
-            current_sequence.push(base);
-            expected_seq_num += 1;
         } else {
-            // Sequence broken - finish current sequence if it has multiple photos
-            if current_sequence.len() > 1 {
-                sequences.push((sequence_name.clone(), current_sequence.clone()));
+            // Not part of HDR - finish current HDR sequence if any
+            if current_hdr_sequence.len() > 1 {
+                for hdr_base in &current_hdr_sequence {
+                    sequences.insert(hdr_base.clone(), SequenceType::Hdr(hdr_sequence_name.clone()));
+                }
+            }
+            current_hdr_sequence.clear();
+            expected_hdr_shot = 1;
+        }
+    }
+    
+    // Don't forget the last HDR sequence
+    if current_hdr_sequence.len() > 1 {
+        for hdr_base in &current_hdr_sequence {
+            sequences.insert(hdr_base.clone(), SequenceType::Hdr(hdr_sequence_name.clone()));
+        }
+    }
+    
+    // Second pass: detect burst sequences (only for photos not already in HDR sequences)
+    let mut current_burst_sequence: Vec<String> = Vec::new();
+    let mut expected_burst_num = 0u32;
+    let mut burst_sequence_name = String::new();
+    
+    for (base, burst_seq_num, _hdr_shot_num, _date) in &photo_info {
+        // Skip if already part of an HDR sequence
+        if sequences.contains_key(base) {
+            continue;
+        }
+        
+        if *burst_seq_num == 0 {
+            // Not part of a burst sequence - finish current sequence if any
+            if current_burst_sequence.len() > 1 {
+                for burst_base in &current_burst_sequence {
+                    sequences.insert(burst_base.clone(), SequenceType::Burst(burst_sequence_name.clone()));
+                }
+            }
+            current_burst_sequence.clear();
+            expected_burst_num = 0;
+        } else if *burst_seq_num == 1 {
+            // Start of a new burst sequence
+            if current_burst_sequence.len() > 1 {
+                for burst_base in &current_burst_sequence {
+                    sequences.insert(burst_base.clone(), SequenceType::Burst(burst_sequence_name.clone()));
+                }
+            }
+            burst_sequence_name = format!("{}_BURST", base);
+            current_burst_sequence = vec![base.clone()];
+            expected_burst_num = 2;
+        } else if *burst_seq_num == expected_burst_num && !current_burst_sequence.is_empty() {
+            // Continue current burst sequence
+            current_burst_sequence.push(base.clone());
+            expected_burst_num += 1;
+        } else {
+            // Burst sequence broken - finish current sequence if it has multiple photos
+            if current_burst_sequence.len() > 1 {
+                for burst_base in &current_burst_sequence {
+                    sequences.insert(burst_base.clone(), SequenceType::Burst(burst_sequence_name.clone()));
+                }
             }
             
-            // Check if this starts a new sequence
-            if seq_num == 1 {
-                sequence_name = format!("seq_{}", base);
-                current_sequence = vec![base];
-                expected_seq_num = 2;
+            // Check if this starts a new burst sequence
+            if *burst_seq_num == 1 {
+                burst_sequence_name = format!("{}_BURST", base);
+                current_burst_sequence = vec![base.clone()];
+                expected_burst_num = 2;
             } else {
-                current_sequence.clear();
-                expected_seq_num = 0;
+                current_burst_sequence.clear();
+                expected_burst_num = 0;
             }
         }
     }
     
-    // Don't forget the last sequence
-    if current_sequence.len() > 1 {
-        sequences.push((sequence_name, current_sequence));
+    // Don't forget the last burst sequence
+    if current_burst_sequence.len() > 1 {
+        for burst_base in &current_burst_sequence {
+            sequences.insert(burst_base.clone(), SequenceType::Burst(burst_sequence_name.clone()));
+        }
     }
     
-    pb.finish_with_message(format!("Sequence detection complete. Found {} sequences.", sequences.len()));
+    pb.finish_with_message(format!("Sequence detection complete. Found {} photos in sequences.", sequences.len()));
+    
+    // Print detected sequences for debugging
+    let mut hdr_sequences: Vec<String> = Vec::new();
+    let mut burst_sequences: Vec<String> = Vec::new();
+    
+    for (base, seq_type) in &sequences {
+        match seq_type {
+            SequenceType::Hdr(folder_name) => {
+                if !hdr_sequences.contains(folder_name) {
+                    hdr_sequences.push(folder_name.clone());
+                }
+            }
+            SequenceType::Burst(folder_name) => {
+                if !burst_sequences.contains(folder_name) {
+                    burst_sequences.push(folder_name.clone());
+                }
+            }
+        }
+    }
+    
+    if !hdr_sequences.is_empty() {
+        println!("Detected HDR sequences:");
+        for seq in &hdr_sequences {
+            println!("  {}", seq);
+        }
+    } else {
+        println!("No HDR sequences detected.");
+    }
+    
+    if !burst_sequences.is_empty() {
+        println!("Detected BURST sequences:");
+        for seq in &burst_sequences {
+            println!("  {}", seq);
+        }
+    } else {
+        println!("No BURST sequences detected.");
+    }
+    
     sequences
 }
 
@@ -292,7 +429,7 @@ fn determine_target_base(filename: &str, raw_dir: &Path, jpeg_dir: &Path, defaul
 fn validate_and_plan_copy(
     output_dir: &Path,
     groups: &HashMap<String, Vec<PathBuf>>,
-    sequences: &[(String, Vec<String>)],
+    sequences: &HashMap<String, SequenceType>,
     exif_cache: &HashMap<String, (PathBuf, Value)>,
 ) -> Result<Vec<(PathBuf, PathBuf)>, Vec<ValidationError>> {
     let raw_dir = output_dir.join("RAW");
@@ -399,7 +536,13 @@ fn validate_and_plan_copy(
         let month = date.format("%m").to_string();
         let day = date.format("%d").to_string();
 
-        let seq_dir = sequences.iter().find(|(seq_base, _)| seq_base == base).map(|(_, _)| base.clone());
+        // Check if this base is part of a sequence
+        let seq_folder = sequences.get(base).map(|seq_type| {
+            match seq_type {
+                SequenceType::Burst(folder_name) => folder_name.clone(),
+                SequenceType::Hdr(folder_name) => folder_name.clone(),
+            }
+        });
 
         // Default target_base for the group
         let default_target_base = if let Some(filename) = photo_file.file_name().and_then(|n| n.to_str()) {
@@ -438,8 +581,8 @@ fn validate_and_plan_copy(
             let filename = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             let target_base = determine_target_base(filename, &raw_dir, &jpeg_dir, default_target_base);
             let mut target_path = target_base.join(&year).join(&month).join(&day);
-            if let Some(ref seq) = seq_dir {
-                target_path = target_path.join(seq);
+            if let Some(ref seq_folder_name) = seq_folder {
+                target_path = target_path.join(seq_folder_name);
             }
             let dest = target_path.join(filename);
 
@@ -457,6 +600,9 @@ fn validate_and_plan_copy(
             pb.inc(1);
         }
     }
+    
+    // Sort copy plan by source path for meaningful dry-run output order
+    copy_plan.sort_by(|a, b| a.0.cmp(&b.0));
     
     pb.finish_with_message("File validation complete");
 
