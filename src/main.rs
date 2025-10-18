@@ -1,13 +1,13 @@
+use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use regex::Regex;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use chrono::{DateTime, NaiveDateTime, Utc, Datelike};
-use serde_json::Value;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -19,6 +19,9 @@ struct Args {
     /// Print actions without copying files
     #[arg(long)]
     dry_run: bool,
+    /// Only process files newer than the most recent file in the destination directory
+    #[arg(long)]
+    incremental: bool,
 }
 
 #[derive(Debug)]
@@ -29,15 +32,12 @@ struct ValidationError {
 
 #[derive(Debug, Clone)]
 enum SequenceType {
-    Burst(String),  // folder name
-    Hdr(String),    // folder name
+    Burst(String), // folder name
+    Hdr(String),   // folder name
 }
 
 fn get_exif_data(file_path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
-    let output = Command::new("exiftool")
-        .arg("-j")
-        .arg(file_path)
-        .output()?;
+    let output = Command::new("exiftool").arg("-j").arg(file_path).output()?;
     let json: Vec<Value> = serde_json::from_slice(&output.stdout)?;
     Ok(json.into_iter().next().unwrap_or(Value::Null))
 }
@@ -85,7 +85,12 @@ fn get_hdr_info(exif: &Value, hdr_re: &Regex) -> Option<u32> {
 
 fn is_raw_file(filename: &str) -> bool {
     let ext = filename.to_lowercase();
-    ext.ends_with(".cr2") || ext.ends_with(".nef") || ext.ends_with(".arw") || ext.ends_with(".dng") || ext.ends_with(".raw") || ext.ends_with(".orf")
+    ext.ends_with(".cr2")
+        || ext.ends_with(".nef")
+        || ext.ends_with(".arw")
+        || ext.ends_with(".dng")
+        || ext.ends_with(".raw")
+        || ext.ends_with(".orf")
 }
 
 fn is_jpeg_file(filename: &str) -> bool {
@@ -93,9 +98,161 @@ fn is_jpeg_file(filename: &str) -> bool {
     ext.ends_with(".jpg") || ext.ends_with(".jpeg")
 }
 
+fn find_most_recent_file_in_destination(
+    output_dir: &Path,
+) -> Result<Option<DateTime<Utc>>, Box<dyn std::error::Error>> {
+    let raw_dir = output_dir.join("RAW");
+    let jpeg_dir = output_dir.join("JPEG");
+
+    let mut most_recent_date: Option<DateTime<Utc>> = None;
+    let mut files_checked = 0;
+
+    // Check both RAW and JPEG directories
+    for base_dir in [&raw_dir, &jpeg_dir] {
+        if !base_dir.exists() {
+            continue;
+        }
+
+        // Walk through year/month/day directories in reverse order for efficiency
+        let mut year_dirs: Vec<_> = fs::read_dir(base_dir)?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Some(year_name) = path.file_name()?.to_str() {
+                        if let Ok(year) = year_name.parse::<u32>() {
+                            return Some((year, path));
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+
+        // Sort years in descending order (most recent first)
+        year_dirs.sort_by(|a, b| b.0.cmp(&a.0));
+
+        'outer: for (_year, year_dir) in year_dirs {
+            let mut month_dirs: Vec<_> = fs::read_dir(&year_dir)?
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    let path = entry.path();
+                    if path.is_dir() {
+                        if let Some(month_name) = path.file_name()?.to_str() {
+                            if let Ok(month) = month_name.parse::<u32>() {
+                                return Some((month, path));
+                            }
+                        }
+                    }
+                    None
+                })
+                .collect();
+
+            // Sort months in descending order (most recent first)
+            month_dirs.sort_by(|a, b| b.0.cmp(&a.0));
+
+            for (_month, month_dir) in month_dirs {
+                let mut day_dirs: Vec<_> = fs::read_dir(&month_dir)?
+                    .filter_map(|entry| {
+                        let entry = entry.ok()?;
+                        let path = entry.path();
+                        if path.is_dir() {
+                            if let Some(day_name) = path.file_name()?.to_str() {
+                                if let Ok(day) = day_name.parse::<u32>() {
+                                    return Some((day, path));
+                                }
+                            }
+                        }
+                        None
+                    })
+                    .collect();
+
+                // Sort days in descending order (most recent first)
+                day_dirs.sort_by(|a, b| b.0.cmp(&a.0));
+
+                for (_day, day_dir) in day_dirs {
+                    // Check all files and subdirectories in this day directory
+                    fn check_directory_for_photos(
+                        dir: &Path,
+                        most_recent: &mut Option<DateTime<Utc>>,
+                        files_checked: &mut usize,
+                    ) -> Result<(), Box<dyn std::error::Error>> {
+                        for entry in fs::read_dir(dir)? {
+                            let entry = entry?;
+                            let path = entry.path();
+
+                            if path.is_dir() {
+                                // Recursively check subdirectories (for sequence folders)
+                                check_directory_for_photos(&path, most_recent, files_checked)?;
+                            } else if path.is_file() {
+                                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                                    if is_raw_file(filename) || is_jpeg_file(filename) {
+                                        *files_checked += 1;
+
+                                        // First try to get EXIF date
+                                        if let Ok(exif) = get_exif_data(&path) {
+                                            if let Some(exif_date) = get_exif_date(&exif) {
+                                                if most_recent
+                                                    .map_or(true, |current| exif_date > current)
+                                                {
+                                                    *most_recent = Some(exif_date);
+                                                }
+                                                continue;
+                                            }
+                                        }
+
+                                        // Fall back to modification time
+                                        if let Ok(metadata) = fs::metadata(&path) {
+                                            if let Ok(mtime) = metadata.modified() {
+                                                let mtime_dt = DateTime::<Utc>::from(mtime);
+                                                if most_recent
+                                                    .map_or(true, |current| mtime_dt > current)
+                                                {
+                                                    *most_recent = Some(mtime_dt);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(())
+                    }
+
+                    check_directory_for_photos(
+                        &day_dir,
+                        &mut most_recent_date,
+                        &mut files_checked,
+                    )?;
+
+                    // If we found files in this day and we're going in reverse chronological order,
+                    // we can be confident this is the most recent date
+                    if most_recent_date.is_some() {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+
+    if files_checked > 0 {
+        println!("Scanned {} files in destination directory.", files_checked);
+        if let Some(date) = most_recent_date {
+            println!(
+                "Most recent file found: {}",
+                date.format("%Y-%m-%d %H:%M:%S UTC")
+            );
+        }
+    } else {
+        println!("No photo files found in destination directory.");
+    }
+
+    Ok(most_recent_date)
+}
+
 fn collect_all_files_recursive(directory: &Path) -> Vec<PathBuf> {
     let mut all_files = Vec::new();
-    
+
     fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
@@ -108,7 +265,7 @@ fn collect_all_files_recursive(directory: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    
+
     collect_recursive(directory, &mut all_files);
     all_files
 }
@@ -116,14 +273,14 @@ fn collect_all_files_recursive(directory: &Path) -> Vec<PathBuf> {
 fn group_files_by_base(directory: &Path) -> HashMap<String, Vec<PathBuf>> {
     let all_files = collect_all_files_recursive(directory);
     let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    
+
     let pb = ProgressBar::new(all_files.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta}) Grouping files...")
             .expect("Failed to set progress bar style"),
     );
-    
+
     for file_path in all_files {
         if let Some(filename) = file_path.file_name().and_then(|n| n.to_str()) {
             let base = filename.split('.').next().unwrap_or("").to_string();
@@ -131,7 +288,7 @@ fn group_files_by_base(directory: &Path) -> HashMap<String, Vec<PathBuf>> {
         }
         pb.inc(1);
     }
-    
+
     pb.finish_with_message("File grouping complete");
     groups
 }
@@ -139,7 +296,8 @@ fn group_files_by_base(directory: &Path) -> HashMap<String, Vec<PathBuf>> {
 fn cache_exif_data(groups: &HashMap<String, Vec<PathBuf>>) -> HashMap<String, (PathBuf, Value)> {
     let mut representative_files = Vec::new();
     for (base, file_list) in groups {
-        let photo_files: Vec<PathBuf> = file_list.iter()
+        let photo_files: Vec<PathBuf> = file_list
+            .iter()
             .filter(|f| {
                 if let Some(filename) = f.file_name().and_then(|n| n.to_str()) {
                     is_raw_file(filename) || is_jpeg_file(filename)
@@ -149,10 +307,11 @@ fn cache_exif_data(groups: &HashMap<String, Vec<PathBuf>>) -> HashMap<String, (P
             })
             .cloned()
             .collect();
-        
+
         if !photo_files.is_empty() {
             // Pick JPEG if available, else first photo file
-            let rep_file = photo_files.iter()
+            let rep_file = photo_files
+                .iter()
                 .find(|f| {
                     if let Some(filename) = f.file_name().and_then(|n| n.to_str()) {
                         is_jpeg_file(filename)
@@ -165,30 +324,28 @@ fn cache_exif_data(groups: &HashMap<String, Vec<PathBuf>>) -> HashMap<String, (P
             representative_files.push((base.clone(), rep_file));
         }
     }
-    
+
     let pb = ProgressBar::new(representative_files.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta}) Caching EXIF data...")
             .expect("Failed to set progress bar style"),
     );
-    
+
     let exif_cache: HashMap<String, (PathBuf, Value)> = representative_files
         .par_iter()
-        .filter_map(|(base, rep_file)| {
-            match get_exif_data(rep_file) {
-                Ok(data) => {
-                    pb.inc(1);
-                    Some((base.clone(), (rep_file.clone(), data)))
-                }
-                Err(_) => {
-                    pb.inc(1);
-                    None
-                }
+        .filter_map(|(base, rep_file)| match get_exif_data(rep_file) {
+            Ok(data) => {
+                pb.inc(1);
+                Some((base.clone(), (rep_file.clone(), data)))
+            }
+            Err(_) => {
+                pb.inc(1);
+                None
             }
         })
         .collect();
-    
+
     pb.finish_with_message("EXIF caching complete");
     exif_cache
 }
@@ -199,12 +356,13 @@ fn detect_sequences(
 ) -> HashMap<String, SequenceType> {
     let burst_re = Regex::new(r"Sequence:\s*(\d+)").expect("Invalid regex for burst sequence");
     let hdr_re = Regex::new(r"Shot\s+(\d+)").expect("Invalid regex for HDR sequence");
-    
+
     // Collect all photo bases with their sequence numbers and dates
     let mut photo_info: Vec<(String, u32, Option<u32>, DateTime<Utc>)> = Vec::new();
-    
+
     for (base, file_list) in files {
-        let photo_files: Vec<PathBuf> = file_list.iter()
+        let photo_files: Vec<PathBuf> = file_list
+            .iter()
             .filter(|f| {
                 if let Some(filename) = f.file_name().and_then(|n| n.to_str()) {
                     is_raw_file(filename) || is_jpeg_file(filename)
@@ -214,9 +372,11 @@ fn detect_sequences(
             })
             .cloned()
             .collect();
-        
+
         if !photo_files.is_empty() {
-            let Some((_, exif)) = exif_cache.get(base) else { continue };
+            let Some((_, exif)) = exif_cache.get(base) else {
+                continue;
+            };
             let burst_seq_num = get_sequence_info(exif, &burst_re);
             let hdr_shot_num = get_hdr_info(exif, &hdr_re);
             let date = get_exif_date(exif).unwrap_or_else(|| {
@@ -226,10 +386,10 @@ fn detect_sequences(
             photo_info.push((base.clone(), burst_seq_num, hdr_shot_num, date));
         }
     }
-    
+
     // Sort by date first, then by name to establish order
     photo_info.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| a.0.cmp(&b.0)));
-    
+
     let pb = ProgressBar::new(photo_info.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -238,22 +398,25 @@ fn detect_sequences(
     );
 
     let mut sequences: HashMap<String, SequenceType> = HashMap::new();
-    
+
     // First pass: detect HDR sequences
     let mut current_hdr_sequence: Vec<String> = Vec::new();
     let mut expected_hdr_shot = 1u32;
     let mut hdr_sequence_name = String::new();
-    
+
     for (base, _burst_seq_num, hdr_shot_num, _date) in &photo_info {
         pb.inc(1);
-        
+
         if let Some(shot_num) = hdr_shot_num {
             if *shot_num == 1 {
                 // Start of a new HDR sequence
                 if current_hdr_sequence.len() > 1 {
                     // Finish previous HDR sequence
                     for hdr_base in &current_hdr_sequence {
-                        sequences.insert(hdr_base.clone(), SequenceType::Hdr(hdr_sequence_name.clone()));
+                        sequences.insert(
+                            hdr_base.clone(),
+                            SequenceType::Hdr(hdr_sequence_name.clone()),
+                        );
                     }
                 }
                 hdr_sequence_name = format!("{}_HDR", base);
@@ -267,10 +430,13 @@ fn detect_sequences(
                 // HDR sequence broken - finish current sequence if it has multiple photos
                 if current_hdr_sequence.len() > 1 {
                     for hdr_base in &current_hdr_sequence {
-                        sequences.insert(hdr_base.clone(), SequenceType::Hdr(hdr_sequence_name.clone()));
+                        sequences.insert(
+                            hdr_base.clone(),
+                            SequenceType::Hdr(hdr_sequence_name.clone()),
+                        );
                     }
                 }
-                
+
                 // Check if this starts a new HDR sequence
                 if *shot_num == 1 {
                     hdr_sequence_name = format!("{}_HDR", base);
@@ -285,37 +451,46 @@ fn detect_sequences(
             // Not part of HDR - finish current HDR sequence if any
             if current_hdr_sequence.len() > 1 {
                 for hdr_base in &current_hdr_sequence {
-                    sequences.insert(hdr_base.clone(), SequenceType::Hdr(hdr_sequence_name.clone()));
+                    sequences.insert(
+                        hdr_base.clone(),
+                        SequenceType::Hdr(hdr_sequence_name.clone()),
+                    );
                 }
             }
             current_hdr_sequence.clear();
             expected_hdr_shot = 1;
         }
     }
-    
+
     // Don't forget the last HDR sequence
     if current_hdr_sequence.len() > 1 {
         for hdr_base in &current_hdr_sequence {
-            sequences.insert(hdr_base.clone(), SequenceType::Hdr(hdr_sequence_name.clone()));
+            sequences.insert(
+                hdr_base.clone(),
+                SequenceType::Hdr(hdr_sequence_name.clone()),
+            );
         }
     }
-    
+
     // Second pass: detect burst sequences (only for photos not already in HDR sequences)
     let mut current_burst_sequence: Vec<String> = Vec::new();
     let mut expected_burst_num = 0u32;
     let mut burst_sequence_name = String::new();
-    
+
     for (base, burst_seq_num, _hdr_shot_num, _date) in &photo_info {
         // Skip if already part of an HDR sequence
         if sequences.contains_key(base) {
             continue;
         }
-        
+
         if *burst_seq_num == 0 {
             // Not part of a burst sequence - finish current sequence if any
             if current_burst_sequence.len() > 1 {
                 for burst_base in &current_burst_sequence {
-                    sequences.insert(burst_base.clone(), SequenceType::Burst(burst_sequence_name.clone()));
+                    sequences.insert(
+                        burst_base.clone(),
+                        SequenceType::Burst(burst_sequence_name.clone()),
+                    );
                 }
             }
             current_burst_sequence.clear();
@@ -324,7 +499,10 @@ fn detect_sequences(
             // Start of a new burst sequence
             if current_burst_sequence.len() > 1 {
                 for burst_base in &current_burst_sequence {
-                    sequences.insert(burst_base.clone(), SequenceType::Burst(burst_sequence_name.clone()));
+                    sequences.insert(
+                        burst_base.clone(),
+                        SequenceType::Burst(burst_sequence_name.clone()),
+                    );
                 }
             }
             burst_sequence_name = format!("{}_BURST", base);
@@ -338,10 +516,13 @@ fn detect_sequences(
             // Burst sequence broken - finish current sequence if it has multiple photos
             if current_burst_sequence.len() > 1 {
                 for burst_base in &current_burst_sequence {
-                    sequences.insert(burst_base.clone(), SequenceType::Burst(burst_sequence_name.clone()));
+                    sequences.insert(
+                        burst_base.clone(),
+                        SequenceType::Burst(burst_sequence_name.clone()),
+                    );
                 }
             }
-            
+
             // Check if this starts a new burst sequence
             if *burst_seq_num == 1 {
                 burst_sequence_name = format!("{}_BURST", base);
@@ -353,21 +534,27 @@ fn detect_sequences(
             }
         }
     }
-    
+
     // Don't forget the last burst sequence
     if current_burst_sequence.len() > 1 {
         for burst_base in &current_burst_sequence {
-            sequences.insert(burst_base.clone(), SequenceType::Burst(burst_sequence_name.clone()));
+            sequences.insert(
+                burst_base.clone(),
+                SequenceType::Burst(burst_sequence_name.clone()),
+            );
         }
     }
-    
-    pb.finish_with_message(format!("Sequence detection complete. Found {} photos in sequences.", sequences.len()));
-    
+
+    pb.finish_with_message(format!(
+        "Sequence detection complete. Found {} photos in sequences.",
+        sequences.len()
+    ));
+
     // Print detected sequences for debugging
     let mut hdr_sequences: Vec<String> = Vec::new();
     let mut burst_sequences: Vec<String> = Vec::new();
-    
-    for (base, seq_type) in &sequences {
+
+    for (_base, seq_type) in &sequences {
         match seq_type {
             SequenceType::Hdr(folder_name) => {
                 if !hdr_sequences.contains(folder_name) {
@@ -381,7 +568,7 @@ fn detect_sequences(
             }
         }
     }
-    
+
     if !hdr_sequences.is_empty() {
         println!("Detected HDR sequences:");
         for seq in &hdr_sequences {
@@ -390,7 +577,7 @@ fn detect_sequences(
     } else {
         println!("No HDR sequences detected.");
     }
-    
+
     if !burst_sequences.is_empty() {
         println!("Detected BURST sequences:");
         for seq in &burst_sequences {
@@ -399,11 +586,16 @@ fn detect_sequences(
     } else {
         println!("No BURST sequences detected.");
     }
-    
+
     sequences
 }
 
-fn determine_target_base(filename: &str, raw_dir: &Path, jpeg_dir: &Path, default_base: &Path) -> PathBuf {
+fn determine_target_base(
+    filename: &str,
+    raw_dir: &Path,
+    jpeg_dir: &Path,
+    default_base: &Path,
+) -> PathBuf {
     if is_raw_file(filename) {
         raw_dir.to_path_buf()
     } else if is_jpeg_file(filename) {
@@ -413,7 +605,13 @@ fn determine_target_base(filename: &str, raw_dir: &Path, jpeg_dir: &Path, defaul
         let parts: Vec<&str> = filename.split('.').collect();
         if parts.len() >= 3 {
             let format = parts[parts.len() - 2].to_uppercase();
-            if format == "ORF" || format == "CR2" || format == "NEF" || format == "ARW" || format == "DNG" || format == "RAW" {
+            if format == "ORF"
+                || format == "CR2"
+                || format == "NEF"
+                || format == "ARW"
+                || format == "DNG"
+                || format == "RAW"
+            {
                 raw_dir.to_path_buf()
             } else if format == "JPG" || format == "JPEG" {
                 jpeg_dir.to_path_buf()
@@ -431,6 +629,7 @@ fn validate_and_plan_copy(
     groups: &HashMap<String, Vec<PathBuf>>,
     sequences: &HashMap<String, SequenceType>,
     exif_cache: &HashMap<String, (PathBuf, Value)>,
+    cutoff_date: Option<DateTime<Utc>>,
 ) -> Result<Vec<(PathBuf, PathBuf)>, Vec<ValidationError>> {
     let raw_dir = output_dir.join("RAW");
     let jpeg_dir = output_dir.join("JPEG");
@@ -447,7 +646,8 @@ fn validate_and_plan_copy(
 
     for (base, file_list) in groups {
         // Prefer JPEG for representative, else any photo
-        let photo_file_opt = file_list.iter()
+        let photo_file_opt = file_list
+            .iter()
             .find(|f| {
                 if let Some(filename) = f.file_name().and_then(|n| n.to_str()) {
                     is_jpeg_file(filename)
@@ -464,32 +664,30 @@ fn validate_and_plan_copy(
                     }
                 })
             });
-        
+
         let (photo_file, date) = if let Some(photo_file) = photo_file_opt {
             let date = if let Some((_, exif)) = exif_cache.get(base) {
                 get_exif_date(exif)
             } else {
                 None
             };
-            
+
             let final_date = if let Some(valid_date) = date {
                 valid_date
             } else {
                 // Try to get file modification time as fallback
                 match fs::metadata(photo_file) {
-                    Ok(metadata) => {
-                        match metadata.modified() {
-                            Ok(mtime) => DateTime::<Utc>::from(mtime),
-                            Err(_) => {
-                                errors.push(ValidationError {
-                                    file: photo_file.display().to_string(),
-                                    reason: "Cannot get file modification time".to_string(),
-                                });
-                                pb.inc(file_list.len() as u64);
-                                continue;
-                            }
+                    Ok(metadata) => match metadata.modified() {
+                        Ok(mtime) => DateTime::<Utc>::from(mtime),
+                        Err(_) => {
+                            errors.push(ValidationError {
+                                file: photo_file.display().to_string(),
+                                reason: "Cannot get file modification time".to_string(),
+                            });
+                            pb.inc(file_list.len() as u64);
+                            continue;
                         }
-                    }
+                    },
                     Err(_) => {
                         errors.push(ValidationError {
                             file: photo_file.display().to_string(),
@@ -505,22 +703,20 @@ fn validate_and_plan_copy(
             // No photo file, use mtime of first file
             let first_file = &file_list[0];
             match fs::metadata(first_file) {
-                Ok(metadata) => {
-                    match metadata.modified() {
-                        Ok(mtime) => {
-                            let date = DateTime::<Utc>::from(mtime);
-                            (first_file.clone(), date)
-                        }
-                        Err(_) => {
-                            errors.push(ValidationError {
-                                file: first_file.display().to_string(),
-                                reason: "Cannot get file modification time".to_string(),
-                            });
-                            pb.inc(file_list.len() as u64);
-                            continue;
-                        }
+                Ok(metadata) => match metadata.modified() {
+                    Ok(mtime) => {
+                        let date = DateTime::<Utc>::from(mtime);
+                        (first_file.clone(), date)
                     }
-                }
+                    Err(_) => {
+                        errors.push(ValidationError {
+                            file: first_file.display().to_string(),
+                            reason: "Cannot get file modification time".to_string(),
+                        });
+                        pb.inc(file_list.len() as u64);
+                        continue;
+                    }
+                },
                 Err(_) => {
                     errors.push(ValidationError {
                         file: first_file.display().to_string(),
@@ -532,28 +728,35 @@ fn validate_and_plan_copy(
             }
         };
 
+        // Skip this group if incremental mode is enabled and the date is not newer than cutoff
+        if let Some(cutoff) = cutoff_date {
+            if date <= cutoff {
+                pb.inc(file_list.len() as u64);
+                continue;
+            }
+        }
+
         let year = date.format("%Y").to_string();
         let month = date.format("%m").to_string();
         let day = date.format("%d").to_string();
 
         // Check if this base is part of a sequence
-        let seq_folder = sequences.get(base).map(|seq_type| {
-            match seq_type {
-                SequenceType::Burst(folder_name) => folder_name.clone(),
-                SequenceType::Hdr(folder_name) => folder_name.clone(),
-            }
+        let seq_folder = sequences.get(base).map(|seq_type| match seq_type {
+            SequenceType::Burst(folder_name) => folder_name.clone(),
+            SequenceType::Hdr(folder_name) => folder_name.clone(),
         });
 
         // Default target_base for the group
-        let default_target_base = if let Some(filename) = photo_file.file_name().and_then(|n| n.to_str()) {
-            if is_raw_file(filename) {
-                &raw_dir
+        let default_target_base =
+            if let Some(filename) = photo_file.file_name().and_then(|n| n.to_str()) {
+                if is_raw_file(filename) {
+                    &raw_dir
+                } else {
+                    &jpeg_dir
+                }
             } else {
                 &jpeg_dir
-            }
-        } else {
-            &jpeg_dir
-        };
+            };
 
         for file_path in file_list {
             // Validate source file exists and is a regular file
@@ -579,7 +782,8 @@ fn validate_and_plan_copy(
             }
 
             let filename = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let target_base = determine_target_base(filename, &raw_dir, &jpeg_dir, default_target_base);
+            let target_base =
+                determine_target_base(filename, &raw_dir, &jpeg_dir, default_target_base);
             let mut target_path = target_base.join(&year).join(&month).join(&day);
             if let Some(ref seq_folder_name) = seq_folder {
                 target_path = target_path.join(seq_folder_name);
@@ -600,10 +804,10 @@ fn validate_and_plan_copy(
             pb.inc(1);
         }
     }
-    
+
     // Sort copy plan by source path for meaningful dry-run output order
     copy_plan.sort_by(|a, b| a.0.cmp(&b.0));
-    
+
     pb.finish_with_message("File validation complete");
 
     if errors.is_empty() {
@@ -635,7 +839,7 @@ fn copy_files(
         }
         pb.inc(1);
     }
-    
+
     pb.finish_with_message("File copying complete");
     Ok(())
 }
@@ -645,17 +849,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input_dir = PathBuf::from(&args.input_dir);
     let output_dir = PathBuf::from(&args.output_dir);
 
+    // Handle incremental mode
+    let cutoff_date = if args.incremental {
+        println!(
+            "Incremental mode enabled. Scanning destination directory for most recent file..."
+        );
+        match find_most_recent_file_in_destination(&output_dir)? {
+            Some(date) => {
+                println!(
+                    "Only processing files newer than: {}",
+                    date.format("%Y-%m-%d %H:%M:%S UTC")
+                );
+                Some(date)
+            }
+            None => {
+                println!("No existing files found in destination. Processing all files.");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let groups = group_files_by_base(&input_dir);
     let exif_cache = cache_exif_data(&groups);
     let sequences = detect_sequences(&groups, &exif_cache);
-    
-    match validate_and_plan_copy(&output_dir, &groups, &sequences, &exif_cache) {
+
+    match validate_and_plan_copy(&output_dir, &groups, &sequences, &exif_cache, cutoff_date) {
         Ok(copy_plan) => {
-            println!("Validation successful! {} files ready to copy.", copy_plan.len());
-            copy_files(copy_plan, args.dry_run)?;
+            if cutoff_date.is_some() {
+                println!(
+                    "Incremental validation successful! {} new files ready to copy.",
+                    copy_plan.len()
+                );
+            } else {
+                println!(
+                    "Validation successful! {} files ready to copy.",
+                    copy_plan.len()
+                );
+            }
+
+            if copy_plan.is_empty() {
+                println!("No files to process.");
+            } else {
+                copy_files(copy_plan, args.dry_run)?;
+            }
         }
         Err(errors) => {
-            println!("Validation failed! Found {} problematic files:", errors.len());
+            println!(
+                "Validation failed! Found {} problematic files:",
+                errors.len()
+            );
             for error in &errors {
                 println!("  {} - {}", error.file, error.reason);
             }
@@ -663,6 +907,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     }
-    
+
     Ok(())
 }
