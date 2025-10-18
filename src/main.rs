@@ -36,6 +36,28 @@ enum SequenceType {
     Hdr(String),   // folder name
 }
 
+fn check_exiftool_installed() -> Result<(), Box<dyn std::error::Error>> {
+    match Command::new("exiftool").arg("-ver").output() {
+        Ok(output) => {
+            if output.status.success() {
+                let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                println!("Found exiftool version: {}", version);
+                Ok(())
+            } else {
+                Err("exiftool command failed to execute properly".into())
+            }
+        }
+        Err(_) => {
+            Err("exiftool is not installed or not found in PATH. 
+
+Please install exiftool to use this program:
+- On Ubuntu/Debian: sudo apt install libimage-exiftool-perl
+- On macOS: brew install exiftool
+- On other systems: https://exiftool.org/install.html".into())
+        }
+    }
+}
+
 fn get_exif_data(file_path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
     let output = Command::new("exiftool").arg("-j").arg(file_path).output()?;
     let json: Vec<Value> = serde_json::from_slice(&output.stdout)?;
@@ -570,19 +592,13 @@ fn detect_sequences(
     }
 
     if !hdr_sequences.is_empty() {
-        println!("Detected HDR sequences:");
-        for seq in &hdr_sequences {
-            println!("  {}", seq);
-        }
+        println!("Detected {} HDR sequences.", hdr_sequences.len());
     } else {
         println!("No HDR sequences detected.");
     }
 
     if !burst_sequences.is_empty() {
-        println!("Detected BURST sequences:");
-        for seq in &burst_sequences {
-            println!("  {}", seq);
-        }
+        println!("Detected {} BURST sequences.", burst_sequences.len());
     } else {
         println!("No BURST sequences detected.");
     }
@@ -846,6 +862,10 @@ fn copy_files(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    
+    // Check if exiftool is available before proceeding
+    check_exiftool_installed()?;
+    
     let input_dir = PathBuf::from(&args.input_dir);
     let output_dir = PathBuf::from(&args.output_dir);
 
