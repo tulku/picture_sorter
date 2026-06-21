@@ -22,6 +22,12 @@ struct Args {
     /// Only process files newer than the most recent file in the destination directory
     #[arg(long)]
     incremental: bool,
+    /// Overwrite files that already exist in the destination directory
+    #[arg(long = "override")]
+    force_override: bool,
+    /// Skip files that already exist in the destination directory (instead of erroring)
+    #[arg(long = "skip-existing")]
+    skip_existing: bool,
 }
 
 #[derive(Debug)]
@@ -66,7 +72,14 @@ fn get_exif_data(file_path: &Path) -> Result<Value, Box<dyn std::error::Error>> 
 
 fn get_exif_date(exif: &Value) -> Option<DateTime<Utc>> {
     if let Some(date_str) = exif.get("DateTimeOriginal").and_then(|v| v.as_str()) {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(date_str, "%Y:%m:%d %H:%M:%S") {
+        // Take only the first 19 characters (standard EXIF format: "YYYY:MM:DD HH:MM:SS")
+        // This also handles variants with sub-seconds or timezone offsets
+        let truncated = if date_str.len() >= 19 {
+            &date_str[..19]
+        } else {
+            date_str
+        };
+        if let Ok(dt) = NaiveDateTime::parse_from_str(truncated, "%Y:%m:%d %H:%M:%S") {
             let date = DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
             // Validate date is reasonable (between 1990 and 2050)
             if date.year() >= 1990 && date.year() <= 2050 {
@@ -92,7 +105,10 @@ fn get_sequence_info(exif: &Value, re: &Regex) -> u32 {
 
 fn get_hdr_info(exif: &Value, hdr_re: &Regex) -> Option<u32> {
     if let Some(drive_mode) = exif.get("DriveMode").and_then(|v| v.as_str()) {
-        if drive_mode.contains("AE Auto Bracketing") && drive_mode.contains("Electronic shutter") {
+        let is_bracket = drive_mode.contains("Bracket")
+            || drive_mode.contains("Bracketing")
+            || drive_mode.contains("HDR");
+        if is_bracket {
             if let Some(captures) = hdr_re.captures(drive_mode) {
                 if let Some(shot_str) = captures.get(1) {
                     if let Ok(shot_num) = shot_str.as_str().parse::<u32>() {
@@ -646,11 +662,17 @@ fn validate_and_plan_copy(
     sequences: &HashMap<String, SequenceType>,
     exif_cache: &HashMap<String, (PathBuf, Value)>,
     cutoff_date: Option<DateTime<Utc>>,
-) -> Result<Vec<(PathBuf, PathBuf)>, Vec<ValidationError>> {
+    force_override: bool,
+    skip_existing: bool,
+    dry_run: bool,
+) -> Result<(Vec<(PathBuf, PathBuf)>, Vec<(PathBuf, PathBuf)>, usize, usize), Vec<ValidationError>> {
     let raw_dir = output_dir.join("RAW");
     let jpeg_dir = output_dir.join("JPEG");
     let mut errors = Vec::new();
     let mut copy_plan = Vec::new();
+    let mut move_plan = Vec::new();
+    let mut skipped_cutoff: usize = 0;
+    let mut skipped_existing: usize = 0;
 
     let total_files: u64 = groups.values().map(|fl| fl.len() as u64).sum();
     let pb = ProgressBar::new(total_files);
@@ -747,6 +769,7 @@ fn validate_and_plan_copy(
         // Skip this group if incremental mode is enabled and the date is not newer than cutoff
         if let Some(cutoff) = cutoff_date {
             if date <= cutoff {
+                skipped_cutoff += file_list.len();
                 pb.inc(file_list.len() as u64);
                 continue;
             }
@@ -800,14 +823,51 @@ fn validate_and_plan_copy(
             let filename = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             let target_base =
                 determine_target_base(filename, &raw_dir, &jpeg_dir, default_target_base);
+            let flat_dest = target_base
+                .join(&year)
+                .join(&month)
+                .join(&day)
+                .join(filename);
             let mut target_path = target_base.join(&year).join(&month).join(&day);
             if let Some(ref seq_folder_name) = seq_folder {
                 target_path = target_path.join(seq_folder_name);
             }
             let dest = target_path.join(filename);
 
+            // If this file belongs to a sequence, check whether it was already
+            // copied to the flat (non-sequence) destination in a previous run
+            if seq_folder.is_some() && flat_dest.exists() && !force_override {
+                if dest.exists() {
+                    // Both flat and sequence destinations exist - conflict
+                    if skip_existing || dry_run {
+                        skipped_existing += 1;
+                        pb.inc(1);
+                        continue;
+                    }
+                    errors.push(ValidationError {
+                        file: file_path.display().to_string(),
+                        reason: format!(
+                            "File exists at both flat and sequence paths: {} and {}",
+                            flat_dest.display(),
+                            dest.display()
+                        ),
+                    });
+                    pb.inc(1);
+                    continue;
+                }
+                // Flat exists but sequence doesn't - move it to the correct location
+                move_plan.push((flat_dest.clone(), dest));
+                pb.inc(1);
+                continue;
+            }
+
             // Check if destination already exists
-            if dest.exists() {
+            if dest.exists() && !force_override {
+                if skip_existing || dry_run {
+                    skipped_existing += 1;
+                    pb.inc(1);
+                    continue;
+                }
                 errors.push(ValidationError {
                     file: file_path.display().to_string(),
                     reason: format!("Destination already exists: {}", dest.display()),
@@ -823,11 +883,12 @@ fn validate_and_plan_copy(
 
     // Sort copy plan by source path for meaningful dry-run output order
     copy_plan.sort_by(|a, b| a.0.cmp(&b.0));
+    move_plan.sort_by(|a, b| a.0.cmp(&b.0));
 
     pb.finish_with_message("File validation complete");
 
     if errors.is_empty() {
-        Ok(copy_plan)
+        Ok((copy_plan, move_plan, skipped_cutoff, skipped_existing))
     } else {
         Err(errors)
     }
@@ -852,11 +913,46 @@ fn copy_files(
                 fs::create_dir_all(parent)?;
             }
             fs::copy(&source, &dest)?;
+            // Preserve modification time from source file
+            // (fs::copy does not preserve mtime on Linux, which causes
+            // incremental mode to set the cutoff too high on next run)
+            if let Ok(metadata) = fs::metadata(&source)
+                && let Ok(mtime) = metadata.modified()
+            {
+                let _ = std::fs::File::open(&dest).and_then(|f| f.set_modified(mtime));
+            }
         }
         pb.inc(1);
     }
 
     pb.finish_with_message("File copying complete");
+    Ok(())
+}
+
+fn move_files(
+    move_plan: Vec<(PathBuf, PathBuf)>,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pb = ProgressBar::new(move_plan.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta}) Moving misplaced files...")
+            .expect("Failed to set progress bar style"),
+    );
+
+    for (from, to) in move_plan {
+        if dry_run {
+            println!("Would move {} -> {}", from.display(), to.display());
+        } else {
+            if let Some(parent) = to.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(&from, &to)?;
+        }
+        pb.inc(1);
+    }
+
+    pb.finish_with_message("File moves complete");
     Ok(())
 }
 
@@ -895,21 +991,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let exif_cache = cache_exif_data(&groups);
     let sequences = detect_sequences(&groups, &exif_cache);
 
-    match validate_and_plan_copy(&output_dir, &groups, &sequences, &exif_cache, cutoff_date) {
-        Ok(copy_plan) => {
+    match validate_and_plan_copy(&output_dir, &groups, &sequences, &exif_cache, cutoff_date, args.force_override, args.skip_existing, args.dry_run) {
+        Ok((copy_plan, move_plan, skipped_cutoff, skipped_existing)) => {
+            let total_new = copy_plan.len() + move_plan.len();
+
+            // Print skip summary
+            if skipped_cutoff > 0 {
+                println!(
+                    "Skipped {} file(s) older than cutoff (already in destination).",
+                    skipped_cutoff
+                );
+            }
+            if skipped_existing > 0 {
+                println!(
+                    "Skipped {} file(s) that already exist in destination.",
+                    skipped_existing
+                );
+            }
+
+            if !move_plan.is_empty() {
+                println!(
+                    "\n{} file(s) found at flat path - will move to sequence folder:",
+                    move_plan.len()
+                );
+                move_files(move_plan, args.dry_run)?;
+            }
+
             if cutoff_date.is_some() {
                 println!(
-                    "Incremental validation successful! {} new files ready to copy.",
+                    "\nIncremental check: {} new file(s) to copy.",
                     copy_plan.len()
                 );
             } else {
                 println!(
-                    "Validation successful! {} files ready to copy.",
+                    "\n{} new file(s) to copy.",
                     copy_plan.len()
                 );
             }
 
-            if copy_plan.is_empty() {
+            if total_new == 0 {
                 println!("No files to process.");
             } else {
                 copy_files(copy_plan, args.dry_run)?;
