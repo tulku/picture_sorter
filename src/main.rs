@@ -1,13 +1,20 @@
 use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
+use photo_sorter::classify::{
+    classify_name, dest_tree, group_stem, is_jpeg_file, is_raw_file, FileRole, MediaKind,
+};
+use photo_sorter::plan::{decide, orig_sidecar_path, PlanDecision, PlanInput};
+use photo_sorter::sidecar::{self, IncrementalState};
 use rayon::prelude::*;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -19,7 +26,7 @@ struct Args {
     /// Print actions without copying files
     #[arg(long)]
     dry_run: bool,
-    /// Only process files newer than the most recent file in the destination directory
+    /// Only process files newer than the dest sidecar / newest dest photo
     #[arg(long)]
     incremental: bool,
     /// Overwrite files that already exist in the destination directory
@@ -38,8 +45,17 @@ struct ValidationError {
 
 #[derive(Debug, Clone)]
 enum SequenceType {
-    Burst(String), // folder name
-    Hdr(String),   // folder name
+    Burst(String),
+    Hdr(String),
+}
+
+struct PlanResult {
+    copy_plan: Vec<(PathBuf, PathBuf)>,
+    move_plan: Vec<(PathBuf, PathBuf)>,
+    skipped_cutoff: usize,
+    skipped_existing: usize,
+    recopied: usize,
+    newest_copied: Option<(DateTime<Utc>, String)>,
 }
 
 fn check_exiftool_installed() -> Result<(), Box<dyn std::error::Error>> {
@@ -53,36 +69,60 @@ fn check_exiftool_installed() -> Result<(), Box<dyn std::error::Error>> {
                 Err("exiftool command failed to execute properly".into())
             }
         }
-        Err(_) => {
-            Err("exiftool is not installed or not found in PATH. 
+        Err(_) => Err("exiftool is not installed or not found in PATH.
 
 Please install exiftool to use this program:
 - On Ubuntu/Debian: sudo apt install libimage-exiftool-perl
 - On macOS: brew install exiftool
-- On other systems: https://exiftool.org/install.html".into())
-        }
+- On other systems: https://exiftool.org/install.html"
+            .into()),
     }
 }
 
 fn get_exif_data(file_path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
-    let output = Command::new("exiftool").arg("-j").arg(file_path).output()?;
+    let output = Command::new("exiftool")
+        .args([
+            "-j",
+            "-fast2",
+            "-DateTimeOriginal",
+            "-CreateDate",
+            "-SpecialMode",
+            "-DriveMode",
+        ])
+        .arg(file_path)
+        .output()?;
+    if output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "exiftool produced no JSON for {}: {}",
+            file_path.display(),
+            stderr.trim()
+        )
+        .into());
+    }
     let json: Vec<Value> = serde_json::from_slice(&output.stdout)?;
     Ok(json.into_iter().next().unwrap_or(Value::Null))
 }
 
+fn parse_exif_datetime(date_str: &str) -> Option<DateTime<Utc>> {
+    let truncated = if date_str.len() >= 19 {
+        &date_str[..19]
+    } else {
+        date_str
+    };
+    let dt = NaiveDateTime::parse_from_str(truncated, "%Y:%m:%d %H:%M:%S").ok()?;
+    let date = DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
+    if date.year() >= 1990 && date.year() <= 2050 {
+        Some(date)
+    } else {
+        None
+    }
+}
+
 fn get_exif_date(exif: &Value) -> Option<DateTime<Utc>> {
-    if let Some(date_str) = exif.get("DateTimeOriginal").and_then(|v| v.as_str()) {
-        // Take only the first 19 characters (standard EXIF format: "YYYY:MM:DD HH:MM:SS")
-        // This also handles variants with sub-seconds or timezone offsets
-        let truncated = if date_str.len() >= 19 {
-            &date_str[..19]
-        } else {
-            date_str
-        };
-        if let Ok(dt) = NaiveDateTime::parse_from_str(truncated, "%Y:%m:%d %H:%M:%S") {
-            let date = DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
-            // Validate date is reasonable (between 1990 and 2050)
-            if date.year() >= 1990 && date.year() <= 2050 {
+    for key in ["DateTimeOriginal", "CreateDate"] {
+        if let Some(date_str) = exif.get(key).and_then(|v| v.as_str()) {
+            if let Some(date) = parse_exif_datetime(date_str) {
                 return Some(date);
             }
         }
@@ -105,9 +145,10 @@ fn get_sequence_info(exif: &Value, re: &Regex) -> u32 {
 
 fn get_hdr_info(exif: &Value, hdr_re: &Regex) -> Option<u32> {
     if let Some(drive_mode) = exif.get("DriveMode").and_then(|v| v.as_str()) {
-        let is_bracket = drive_mode.contains("Bracket")
-            || drive_mode.contains("Bracketing")
-            || drive_mode.contains("HDR");
+        let is_bracket = drive_mode.contains("HDR")
+            || drive_mode.contains("AE Auto Bracketing")
+            || drive_mode.contains("AE Bracketing")
+            || drive_mode.contains("Exposure Bracketing");
         if is_bracket {
             if let Some(captures) = hdr_re.captures(drive_mode) {
                 if let Some(shot_str) = captures.get(1) {
@@ -121,185 +162,190 @@ fn get_hdr_info(exif: &Value, hdr_re: &Regex) -> Option<u32> {
     None
 }
 
-fn is_raw_file(filename: &str) -> bool {
-    let ext = filename.to_lowercase();
-    ext.ends_with(".cr2")
-        || ext.ends_with(".nef")
-        || ext.ends_with(".arw")
-        || ext.ends_with(".dng")
-        || ext.ends_with(".raw")
-        || ext.ends_with(".orf")
-}
-
-fn is_jpeg_file(filename: &str) -> bool {
-    let ext = filename.to_lowercase();
-    ext.ends_with(".jpg") || ext.ends_with(".jpeg")
-}
-
-fn find_most_recent_file_in_destination(
-    output_dir: &Path,
-) -> Result<Option<DateTime<Utc>>, Box<dyn std::error::Error>> {
-    let raw_dir = output_dir.join("RAW");
-    let jpeg_dir = output_dir.join("JPEG");
-
-    let mut most_recent_date: Option<DateTime<Utc>> = None;
-    let mut files_checked = 0;
-
-    // Check both RAW and JPEG directories
-    for base_dir in [&raw_dir, &jpeg_dir] {
-        if !base_dir.exists() {
+fn numbered_dirs(dir: &Path) -> io::Result<Vec<(u32, PathBuf)>> {
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
             continue;
         }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if let Ok(n) = name.parse::<u32>() {
+                dirs.push((n, path));
+            }
+        }
+    }
+    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    Ok(dirs)
+}
 
-        // Walk through year/month/day directories in reverse order for efficiency
-        let mut year_dirs: Vec<_> = fs::read_dir(base_dir)?
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let path = entry.path();
-                if path.is_dir() {
-                    if let Some(year_name) = path.file_name()?.to_str() {
-                        if let Ok(year) = year_name.parse::<u32>() {
-                            return Some((year, path));
-                        }
-                    }
+fn day_has_photos(dir: &Path) -> bool {
+    fn walk(dir: &Path) -> bool {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if walk(&path) {
+                    return true;
                 }
-                None
-            })
-            .collect();
+            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if matches!(classify_name(name), FileRole::Media(_)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    walk(dir)
+}
 
-        // Sort years in descending order (most recent first)
-        year_dirs.sort_by(|a, b| b.0.cmp(&a.0));
-
-        'outer: for (_year, year_dir) in year_dirs {
-            let mut month_dirs: Vec<_> = fs::read_dir(&year_dir)?
-                .filter_map(|entry| {
-                    let entry = entry.ok()?;
-                    let path = entry.path();
-                    if path.is_dir() {
-                        if let Some(month_name) = path.file_name()?.to_str() {
-                            if let Ok(month) = month_name.parse::<u32>() {
-                                return Some((month, path));
-                            }
-                        }
-                    }
-                    None
-                })
-                .collect();
-
-            // Sort months in descending order (most recent first)
-            month_dirs.sort_by(|a, b| b.0.cmp(&a.0));
-
-            for (_month, month_dir) in month_dirs {
-                let mut day_dirs: Vec<_> = fs::read_dir(&month_dir)?
-                    .filter_map(|entry| {
-                        let entry = entry.ok()?;
-                        let path = entry.path();
-                        if path.is_dir() {
-                            if let Some(day_name) = path.file_name()?.to_str() {
-                                if let Ok(day) = day_name.parse::<u32>() {
-                                    return Some((day, path));
-                                }
-                            }
-                        }
-                        None
-                    })
-                    .collect();
-
-                // Sort days in descending order (most recent first)
-                day_dirs.sort_by(|a, b| b.0.cmp(&a.0));
-
-                for (_day, day_dir) in day_dirs {
-                    // Check all files and subdirectories in this day directory
-                    fn check_directory_for_photos(
-                        dir: &Path,
-                        most_recent: &mut Option<DateTime<Utc>>,
-                        files_checked: &mut usize,
-                    ) -> Result<(), Box<dyn std::error::Error>> {
-                        for entry in fs::read_dir(dir)? {
-                            let entry = entry?;
-                            let path = entry.path();
-
-                            if path.is_dir() {
-                                // Recursively check subdirectories (for sequence folders)
-                                check_directory_for_photos(&path, most_recent, files_checked)?;
-                            } else if path.is_file() {
-                                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                                    if is_raw_file(filename) || is_jpeg_file(filename) {
-                                        *files_checked += 1;
-
-                                        // First try to get EXIF date
-                                        if let Ok(exif) = get_exif_data(&path) {
-                                            if let Some(exif_date) = get_exif_date(&exif) {
-                                                if most_recent
-                                                    .map_or(true, |current| exif_date > current)
-                                                {
-                                                    *most_recent = Some(exif_date);
-                                                }
-                                                continue;
-                                            }
-                                        }
-
-                                        // Fall back to modification time
-                                        if let Ok(metadata) = fs::metadata(&path) {
-                                            if let Ok(mtime) = metadata.modified() {
-                                                let mtime_dt = DateTime::<Utc>::from(mtime);
-                                                if most_recent
-                                                    .map_or(true, |current| mtime_dt > current)
-                                                {
-                                                    *most_recent = Some(mtime_dt);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Ok(())
-                    }
-
-                    check_directory_for_photos(
-                        &day_dir,
-                        &mut most_recent_date,
-                        &mut files_checked,
-                    )?;
-
-                    // If we found files in this day and we're going in reverse chronological order,
-                    // we can be confident this is the most recent date
-                    if most_recent_date.is_some() {
-                        break 'outer;
-                    }
+fn newest_day_dir(base_dir: &Path) -> io::Result<Option<PathBuf>> {
+    if !base_dir.exists() {
+        return Ok(None);
+    }
+    for (_year, year_dir) in numbered_dirs(base_dir)? {
+        for (_month, month_dir) in numbered_dirs(&year_dir)? {
+            for (_day, day_dir) in numbered_dirs(&month_dir)? {
+                if day_has_photos(&day_dir) {
+                    return Ok(Some(day_dir));
                 }
             }
         }
     }
+    Ok(None)
+}
 
-    if files_checked > 0 {
-        println!("Scanned {} files in destination directory.", files_checked);
-        if let Some(date) = most_recent_date {
-            println!(
-                "Most recent file found: {}",
-                date.format("%Y-%m-%d %H:%M:%S UTC")
-            );
+fn max_date_in_dir(
+    dir: &Path,
+) -> Result<Option<(DateTime<Utc>, PathBuf)>, Box<dyn std::error::Error>> {
+    let output = Command::new("exiftool")
+        .args([
+            "-j",
+            "-r",
+            "-fast2",
+            "-DateTimeOriginal",
+            "-CreateDate",
+            "-ext",
+            "orf",
+            "-ext",
+            "ori",
+            "-ext",
+            "jpg",
+            "-ext",
+            "jpeg",
+            "-ext",
+            "dng",
+            "-ext",
+            "cr2",
+            "-ext",
+            "nef",
+            "-ext",
+            "arw",
+            "-ext",
+            "raw",
+            "-ext",
+            "mov",
+            "-ext",
+            "mp4",
+            "-ext",
+            "tif",
+            "-ext",
+            "tiff",
+            "-ext",
+            "png",
+        ])
+        .arg(dir)
+        .output()?;
+    if output.stdout.is_empty() {
+        return Ok(None);
+    }
+    let json: Vec<Value> = serde_json::from_slice(&output.stdout)?;
+    let mut best: Option<(DateTime<Utc>, PathBuf)> = None;
+    for item in json {
+        let Some(path) = item
+            .get("SourceFile")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+        else {
+            continue;
+        };
+        let Some(date) = get_exif_date(&item) else {
+            continue;
+        };
+        if best.as_ref().map_or(true, |(d, _)| date > *d) {
+            best = Some((date, path));
         }
+    }
+    Ok(best)
+}
+
+fn find_most_recent_file_in_destination(
+    output_dir: &Path,
+) -> Result<Option<(DateTime<Utc>, PathBuf)>, Box<dyn std::error::Error>> {
+    let mut best: Option<(DateTime<Utc>, PathBuf)> = None;
+    for tree in ["RAW", "JPEG", "VIDEO"] {
+        let Some(day_dir) = newest_day_dir(&output_dir.join(tree))? else {
+            continue;
+        };
+        println!("Scanning newest {} day: {}", tree, day_dir.display());
+        if let Some((date, path)) = max_date_in_dir(&day_dir)? {
+            if best.as_ref().map_or(true, |(d, _)| date > *d) {
+                best = Some((date, path));
+            }
+        }
+    }
+    if let Some((date, path)) = &best {
+        println!(
+            "Most recent dest file: {} ({})",
+            date.format("%Y-%m-%d %H:%M:%S"),
+            path.display()
+        );
     } else {
         println!("No photo files found in destination directory.");
     }
+    Ok(best)
+}
 
-    Ok(most_recent_date)
+fn relative_to_output(output_dir: &Path, path: &Path) -> String {
+    path.strip_prefix(output_dir)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path.display().to_string())
+}
+
+fn input_root(input_dir: &Path) -> PathBuf {
+    let dcim = input_dir.join("DCIM");
+    if dcim.is_dir() {
+        dcim
+    } else {
+        input_dir.to_path_buf()
+    }
 }
 
 fn collect_all_files_recursive(directory: &Path) -> Vec<PathBuf> {
     let mut all_files = Vec::new();
 
     fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    files.push(path);
-                } else if path.is_dir() {
-                    collect_recursive(&path, files);
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if !matches!(classify_name(name), FileRole::Ignore) {
+                        files.push(path);
+                    }
                 }
+            } else if path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                }
+                collect_recursive(&path, files);
             }
         }
     }
@@ -321,8 +367,9 @@ fn group_files_by_base(directory: &Path) -> HashMap<String, Vec<PathBuf>> {
 
     for file_path in all_files {
         if let Some(filename) = file_path.file_name().and_then(|n| n.to_str()) {
-            let base = filename.split('.').next().unwrap_or("").to_string();
-            groups.entry(base).or_default().push(file_path);
+            if let Some(base) = group_stem(filename) {
+                groups.entry(base.to_string()).or_default().push(file_path);
+            }
         }
         pb.inc(1);
     }
@@ -337,25 +384,29 @@ fn cache_exif_data(groups: &HashMap<String, Vec<PathBuf>>) -> HashMap<String, (P
         let photo_files: Vec<PathBuf> = file_list
             .iter()
             .filter(|f| {
-                if let Some(filename) = f.file_name().and_then(|n| n.to_str()) {
-                    is_raw_file(filename) || is_jpeg_file(filename)
-                } else {
-                    false
-                }
+                f.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| matches!(classify_name(name), FileRole::Media(_)))
             })
             .cloned()
             .collect();
 
         if !photo_files.is_empty() {
-            // Pick JPEG if available, else first photo file
             let rep_file = photo_files
                 .iter()
                 .find(|f| {
-                    if let Some(filename) = f.file_name().and_then(|n| n.to_str()) {
-                        is_jpeg_file(filename)
-                    } else {
-                        false
-                    }
+                    f.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(is_jpeg_file)
+                })
+                .or_else(|| {
+                    photo_files
+                        .iter()
+                        .find(|f| {
+                            f.file_name()
+                                .and_then(|n| n.to_str())
+                                .is_some_and(is_raw_file)
+                        })
                 })
                 .unwrap_or(&photo_files[0])
                 .clone();
@@ -370,6 +421,7 @@ fn cache_exif_data(groups: &HashMap<String, Vec<PathBuf>>) -> HashMap<String, (P
             .expect("Failed to set progress bar style"),
     );
 
+    let failed = AtomicUsize::new(0);
     let exif_cache: HashMap<String, (PathBuf, Value)> = representative_files
         .par_iter()
         .filter_map(|(base, rep_file)| match get_exif_data(rep_file) {
@@ -378,6 +430,7 @@ fn cache_exif_data(groups: &HashMap<String, Vec<PathBuf>>) -> HashMap<String, (P
                 Some((base.clone(), (rep_file.clone(), data)))
             }
             Err(_) => {
+                failed.fetch_add(1, Ordering::Relaxed);
                 pb.inc(1);
                 None
             }
@@ -385,7 +438,18 @@ fn cache_exif_data(groups: &HashMap<String, Vec<PathBuf>>) -> HashMap<String, (P
         .collect();
 
     pb.finish_with_message("EXIF caching complete");
+    let failed = failed.load(Ordering::Relaxed);
+    if failed > 0 {
+        eprintln!("Warning: exiftool failed for {failed} representative file(s).");
+    }
     exif_cache
+}
+
+fn file_mtime_utc(path: &Path) -> Option<DateTime<Utc>> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(DateTime::<Utc>::from)
 }
 
 fn detect_sequences(
@@ -395,37 +459,29 @@ fn detect_sequences(
     let burst_re = Regex::new(r"Sequence:\s*(\d+)").expect("Invalid regex for burst sequence");
     let hdr_re = Regex::new(r"Shot\s+(\d+)").expect("Invalid regex for HDR sequence");
 
-    // Collect all photo bases with their sequence numbers and dates
     let mut photo_info: Vec<(String, u32, Option<u32>, DateTime<Utc>)> = Vec::new();
 
     for (base, file_list) in files {
-        let photo_files: Vec<PathBuf> = file_list
-            .iter()
-            .filter(|f| {
-                if let Some(filename) = f.file_name().and_then(|n| n.to_str()) {
-                    is_raw_file(filename) || is_jpeg_file(filename)
-                } else {
-                    false
-                }
-            })
-            .cloned()
-            .collect();
-
-        if !photo_files.is_empty() {
-            let Some((_, exif)) = exif_cache.get(base) else {
-                continue;
-            };
-            let burst_seq_num = get_sequence_info(exif, &burst_re);
-            let hdr_shot_num = get_hdr_info(exif, &hdr_re);
-            let date = get_exif_date(exif).unwrap_or_else(|| {
-                // Fallback to modification time if no EXIF date
-                Utc::now()
-            });
-            photo_info.push((base.clone(), burst_seq_num, hdr_shot_num, date));
+        let has_photo = file_list.iter().any(|f| {
+            f.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| matches!(classify_name(name), FileRole::Media(_)))
+        });
+        if !has_photo {
+            continue;
         }
+        let Some((rep_file, exif)) = exif_cache.get(base) else {
+            continue;
+        };
+        let burst_seq_num = get_sequence_info(exif, &burst_re);
+        let hdr_shot_num = get_hdr_info(exif, &hdr_re);
+        let date = get_exif_date(exif).or_else(|| file_mtime_utc(rep_file));
+        let Some(date) = date else {
+            continue;
+        };
+        photo_info.push((base.clone(), burst_seq_num, hdr_shot_num, date));
     }
 
-    // Sort by date first, then by name to establish order
     photo_info.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| a.0.cmp(&b.0)));
 
     let pb = ProgressBar::new(photo_info.len() as u64);
@@ -437,7 +493,6 @@ fn detect_sequences(
 
     let mut sequences: HashMap<String, SequenceType> = HashMap::new();
 
-    // First pass: detect HDR sequences
     let mut current_hdr_sequence: Vec<String> = Vec::new();
     let mut expected_hdr_shot = 1u32;
     let mut hdr_sequence_name = String::new();
@@ -447,9 +502,7 @@ fn detect_sequences(
 
         if let Some(shot_num) = hdr_shot_num {
             if *shot_num == 1 {
-                // Start of a new HDR sequence
                 if current_hdr_sequence.len() > 1 {
-                    // Finish previous HDR sequence
                     for hdr_base in &current_hdr_sequence {
                         sequences.insert(
                             hdr_base.clone(),
@@ -461,11 +514,9 @@ fn detect_sequences(
                 current_hdr_sequence = vec![base.clone()];
                 expected_hdr_shot = 2;
             } else if *shot_num == expected_hdr_shot && !current_hdr_sequence.is_empty() {
-                // Continue current HDR sequence
                 current_hdr_sequence.push(base.clone());
                 expected_hdr_shot += 1;
             } else {
-                // HDR sequence broken - finish current sequence if it has multiple photos
                 if current_hdr_sequence.len() > 1 {
                     for hdr_base in &current_hdr_sequence {
                         sequences.insert(
@@ -474,19 +525,10 @@ fn detect_sequences(
                         );
                     }
                 }
-
-                // Check if this starts a new HDR sequence
-                if *shot_num == 1 {
-                    hdr_sequence_name = format!("{}_HDR", base);
-                    current_hdr_sequence = vec![base.clone()];
-                    expected_hdr_shot = 2;
-                } else {
-                    current_hdr_sequence.clear();
-                    expected_hdr_shot = 1;
-                }
+                current_hdr_sequence.clear();
+                expected_hdr_shot = 1;
             }
         } else {
-            // Not part of HDR - finish current HDR sequence if any
             if current_hdr_sequence.len() > 1 {
                 for hdr_base in &current_hdr_sequence {
                     sequences.insert(
@@ -500,7 +542,6 @@ fn detect_sequences(
         }
     }
 
-    // Don't forget the last HDR sequence
     if current_hdr_sequence.len() > 1 {
         for hdr_base in &current_hdr_sequence {
             sequences.insert(
@@ -510,19 +551,16 @@ fn detect_sequences(
         }
     }
 
-    // Second pass: detect burst sequences (only for photos not already in HDR sequences)
     let mut current_burst_sequence: Vec<String> = Vec::new();
     let mut expected_burst_num = 0u32;
     let mut burst_sequence_name = String::new();
 
     for (base, burst_seq_num, _hdr_shot_num, _date) in &photo_info {
-        // Skip if already part of an HDR sequence
         if sequences.contains_key(base) {
             continue;
         }
 
         if *burst_seq_num == 0 {
-            // Not part of a burst sequence - finish current sequence if any
             if current_burst_sequence.len() > 1 {
                 for burst_base in &current_burst_sequence {
                     sequences.insert(
@@ -534,7 +572,6 @@ fn detect_sequences(
             current_burst_sequence.clear();
             expected_burst_num = 0;
         } else if *burst_seq_num == 1 {
-            // Start of a new burst sequence
             if current_burst_sequence.len() > 1 {
                 for burst_base in &current_burst_sequence {
                     sequences.insert(
@@ -547,11 +584,9 @@ fn detect_sequences(
             current_burst_sequence = vec![base.clone()];
             expected_burst_num = 2;
         } else if *burst_seq_num == expected_burst_num && !current_burst_sequence.is_empty() {
-            // Continue current burst sequence
             current_burst_sequence.push(base.clone());
             expected_burst_num += 1;
         } else {
-            // Burst sequence broken - finish current sequence if it has multiple photos
             if current_burst_sequence.len() > 1 {
                 for burst_base in &current_burst_sequence {
                     sequences.insert(
@@ -560,20 +595,11 @@ fn detect_sequences(
                     );
                 }
             }
-
-            // Check if this starts a new burst sequence
-            if *burst_seq_num == 1 {
-                burst_sequence_name = format!("{}_BURST", base);
-                current_burst_sequence = vec![base.clone()];
-                expected_burst_num = 2;
-            } else {
-                current_burst_sequence.clear();
-                expected_burst_num = 0;
-            }
+            current_burst_sequence.clear();
+            expected_burst_num = 0;
         }
     }
 
-    // Don't forget the last burst sequence
     if current_burst_sequence.len() > 1 {
         for burst_base in &current_burst_sequence {
             sequences.insert(
@@ -588,33 +614,32 @@ fn detect_sequences(
         sequences.len()
     ));
 
-    // Print detected sequences for debugging
-    let mut hdr_sequences: Vec<String> = Vec::new();
-    let mut burst_sequences: Vec<String> = Vec::new();
+    let hdr_count = sequences
+        .values()
+        .filter(|s| matches!(s, SequenceType::Hdr(_)))
+        .map(|s| match s {
+            SequenceType::Hdr(n) => n.clone(),
+            _ => String::new(),
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let burst_count = sequences
+        .values()
+        .filter(|s| matches!(s, SequenceType::Burst(_)))
+        .map(|s| match s {
+            SequenceType::Burst(n) => n.clone(),
+            _ => String::new(),
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .len();
 
-    for (_base, seq_type) in &sequences {
-        match seq_type {
-            SequenceType::Hdr(folder_name) => {
-                if !hdr_sequences.contains(folder_name) {
-                    hdr_sequences.push(folder_name.clone());
-                }
-            }
-            SequenceType::Burst(folder_name) => {
-                if !burst_sequences.contains(folder_name) {
-                    burst_sequences.push(folder_name.clone());
-                }
-            }
-        }
-    }
-
-    if !hdr_sequences.is_empty() {
-        println!("Detected {} HDR sequences.", hdr_sequences.len());
+    if hdr_count > 0 {
+        println!("Detected {hdr_count} HDR sequences.");
     } else {
         println!("No HDR sequences detected.");
     }
-
-    if !burst_sequences.is_empty() {
-        println!("Detected {} BURST sequences.", burst_sequences.len());
+    if burst_count > 0 {
+        println!("Detected {burst_count} BURST sequences.");
     } else {
         println!("No BURST sequences detected.");
     }
@@ -626,33 +651,40 @@ fn determine_target_base(
     filename: &str,
     raw_dir: &Path,
     jpeg_dir: &Path,
+    video_dir: &Path,
     default_base: &Path,
 ) -> PathBuf {
-    if is_raw_file(filename) {
-        raw_dir.to_path_buf()
-    } else if is_jpeg_file(filename) {
-        jpeg_dir.to_path_buf()
-    } else {
-        // For associated files, parse the name
-        let parts: Vec<&str> = filename.split('.').collect();
-        if parts.len() >= 3 {
-            let format = parts[parts.len() - 2].to_uppercase();
-            if format == "ORF"
-                || format == "CR2"
-                || format == "NEF"
-                || format == "ARW"
-                || format == "DNG"
-                || format == "RAW"
-            {
-                raw_dir.to_path_buf()
-            } else if format == "JPG" || format == "JPEG" {
-                jpeg_dir.to_path_buf()
-            } else {
-                default_base.to_path_buf()
-            }
-        } else {
-            default_base.to_path_buf()
-        }
+    match classify_name(filename) {
+        FileRole::Media(kind) | FileRole::Sidecar(kind) => match kind {
+            MediaKind::Raw => raw_dir.to_path_buf(),
+            MediaKind::Jpeg => jpeg_dir.to_path_buf(),
+            MediaKind::Video => video_dir.to_path_buf(),
+        },
+        FileRole::SidecarUnknown | FileRole::Ignore => default_base.to_path_buf(),
+    }
+}
+
+fn default_base_for_file<'a>(
+    filename: &str,
+    raw_dir: &'a Path,
+    jpeg_dir: &'a Path,
+    video_dir: &'a Path,
+) -> &'a Path {
+    match classify_name(filename) {
+        FileRole::Media(MediaKind::Raw) | FileRole::Sidecar(MediaKind::Raw) => raw_dir,
+        FileRole::Media(MediaKind::Video) | FileRole::Sidecar(MediaKind::Video) => video_dir,
+        _ => jpeg_dir,
+    }
+}
+
+fn note_newest(
+    newest: &mut Option<(DateTime<Utc>, String)>,
+    date: DateTime<Utc>,
+    dest: &Path,
+    output_dir: &Path,
+) {
+    if newest.as_ref().map_or(true, |(d, _)| date > *d) {
+        *newest = Some((date, relative_to_output(output_dir, dest)));
     }
 }
 
@@ -664,15 +696,18 @@ fn validate_and_plan_copy(
     cutoff_date: Option<DateTime<Utc>>,
     force_override: bool,
     skip_existing: bool,
-    dry_run: bool,
-) -> Result<(Vec<(PathBuf, PathBuf)>, Vec<(PathBuf, PathBuf)>, usize, usize), Vec<ValidationError>> {
-    let raw_dir = output_dir.join("RAW");
-    let jpeg_dir = output_dir.join("JPEG");
+    incremental: bool,
+) -> Result<PlanResult, Vec<ValidationError>> {
+    let raw_dir = output_dir.join(dest_tree(MediaKind::Raw));
+    let jpeg_dir = output_dir.join(dest_tree(MediaKind::Jpeg));
+    let video_dir = output_dir.join(dest_tree(MediaKind::Video));
     let mut errors = Vec::new();
     let mut copy_plan = Vec::new();
     let mut move_plan = Vec::new();
     let mut skipped_cutoff: usize = 0;
     let mut skipped_existing: usize = 0;
+    let mut recopied: usize = 0;
+    let mut newest_copied: Option<(DateTime<Utc>, String)> = None;
 
     let total_files: u64 = groups.values().map(|fl| fl.len() as u64).sum();
     let pb = ProgressBar::new(total_files);
@@ -683,132 +718,73 @@ fn validate_and_plan_copy(
     );
 
     for (base, file_list) in groups {
-        // Prefer JPEG for representative, else any photo
         let photo_file_opt = file_list
             .iter()
             .find(|f| {
-                if let Some(filename) = f.file_name().and_then(|n| n.to_str()) {
-                    is_jpeg_file(filename)
-                } else {
-                    false
-                }
+                f.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_jpeg_file)
             })
             .or_else(|| {
                 file_list.iter().find(|f| {
-                    if let Some(filename) = f.file_name().and_then(|n| n.to_str()) {
-                        is_raw_file(filename) || is_jpeg_file(filename)
-                    } else {
-                        false
-                    }
+                    f.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|name| matches!(classify_name(name), FileRole::Media(_)))
                 })
             });
 
         let (photo_file, date) = if let Some(photo_file) = photo_file_opt {
-            let date = if let Some((_, exif)) = exif_cache.get(base) {
-                get_exif_date(exif)
-            } else {
-                None
-            };
-
-            let final_date = if let Some(valid_date) = date {
-                valid_date
-            } else {
-                // Try to get file modification time as fallback
-                match fs::metadata(photo_file) {
-                    Ok(metadata) => match metadata.modified() {
-                        Ok(mtime) => DateTime::<Utc>::from(mtime),
-                        Err(_) => {
-                            errors.push(ValidationError {
-                                file: photo_file.display().to_string(),
-                                reason: "Cannot get file modification time".to_string(),
-                            });
-                            pb.inc(file_list.len() as u64);
-                            continue;
-                        }
-                    },
-                    Err(_) => {
-                        errors.push(ValidationError {
-                            file: photo_file.display().to_string(),
-                            reason: "Cannot read file metadata".to_string(),
-                        });
-                        pb.inc(file_list.len() as u64);
-                        continue;
-                    }
-                }
-            };
-            (photo_file.clone(), final_date)
-        } else {
-            // No photo file, use mtime of first file
-            let first_file = &file_list[0];
-            match fs::metadata(first_file) {
-                Ok(metadata) => match metadata.modified() {
-                    Ok(mtime) => {
-                        let date = DateTime::<Utc>::from(mtime);
-                        (first_file.clone(), date)
-                    }
-                    Err(_) => {
-                        errors.push(ValidationError {
-                            file: first_file.display().to_string(),
-                            reason: "Cannot get file modification time".to_string(),
-                        });
-                        pb.inc(file_list.len() as u64);
-                        continue;
-                    }
-                },
-                Err(_) => {
-                    errors.push(ValidationError {
-                        file: first_file.display().to_string(),
-                        reason: "Cannot read file metadata".to_string(),
-                    });
-                    pb.inc(file_list.len() as u64);
-                    continue;
-                }
-            }
-        };
-
-        // Skip this group if incremental mode is enabled and the date is not newer than cutoff
-        if let Some(cutoff) = cutoff_date {
-            if date <= cutoff {
-                skipped_cutoff += file_list.len();
+            let date = exif_cache
+                .get(base)
+                .and_then(|(_, exif)| get_exif_date(exif))
+                .or_else(|| file_mtime_utc(photo_file));
+            let Some(date) = date else {
+                errors.push(ValidationError {
+                    file: photo_file.display().to_string(),
+                    reason: "Cannot get EXIF date or modification time".to_string(),
+                });
                 pb.inc(file_list.len() as u64);
                 continue;
-            }
-        }
+            };
+            (photo_file.clone(), date)
+        } else {
+            let first_file = &file_list[0];
+            let Some(date) = file_mtime_utc(first_file) else {
+                errors.push(ValidationError {
+                    file: first_file.display().to_string(),
+                    reason: "Cannot get file modification time".to_string(),
+                });
+                pb.inc(file_list.len() as u64);
+                continue;
+            };
+            (first_file.clone(), date)
+        };
 
         let year = date.format("%Y").to_string();
         let month = date.format("%m").to_string();
         let day = date.format("%d").to_string();
 
-        // Check if this base is part of a sequence
         let seq_folder = sequences.get(base).map(|seq_type| match seq_type {
             SequenceType::Burst(folder_name) => folder_name.clone(),
             SequenceType::Hdr(folder_name) => folder_name.clone(),
         });
 
-        // Default target_base for the group
-        let default_target_base =
-            if let Some(filename) = photo_file.file_name().and_then(|n| n.to_str()) {
-                if is_raw_file(filename) {
-                    &raw_dir
-                } else {
-                    &jpeg_dir
-                }
-            } else {
-                &jpeg_dir
-            };
+        let default_target_base = photo_file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|name| default_base_for_file(name, &raw_dir, &jpeg_dir, &video_dir))
+            .unwrap_or(jpeg_dir.as_path());
 
         for file_path in file_list {
-            // Validate source file exists and is a regular file
-            match fs::metadata(file_path) {
-                Ok(metadata) => {
-                    if !metadata.is_file() {
-                        errors.push(ValidationError {
-                            file: file_path.display().to_string(),
-                            reason: "Source is not a regular file".to_string(),
-                        });
-                        pb.inc(1);
-                        continue;
-                    }
+            let metadata = match fs::metadata(file_path) {
+                Ok(metadata) if metadata.is_file() => metadata,
+                Ok(_) => {
+                    errors.push(ValidationError {
+                        file: file_path.display().to_string(),
+                        reason: "Source is not a regular file".to_string(),
+                    });
+                    pb.inc(1);
+                    continue;
                 }
                 Err(_) => {
                     errors.push(ValidationError {
@@ -818,32 +794,71 @@ fn validate_and_plan_copy(
                     pb.inc(1);
                     continue;
                 }
-            }
+            };
+            let source_len = metadata.len();
 
             let filename = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             let target_base =
-                determine_target_base(filename, &raw_dir, &jpeg_dir, default_target_base);
-            let flat_dest = target_base
-                .join(&year)
-                .join(&month)
-                .join(&day)
-                .join(filename);
-            let mut target_path = target_base.join(&year).join(&month).join(&day);
-            if let Some(ref seq_folder_name) = seq_folder {
-                target_path = target_path.join(seq_folder_name);
-            }
-            let dest = target_path.join(filename);
+                determine_target_base(filename, &raw_dir, &jpeg_dir, &video_dir, default_target_base);
+            let day_dir = target_base.join(&year).join(&month).join(&day);
+            let flat_dest = day_dir.join(filename);
+            let dest = if let Some(ref seq_folder_name) = seq_folder {
+                day_dir.join(seq_folder_name).join(filename)
+            } else {
+                flat_dest.clone()
+            };
 
-            // If this file belongs to a sequence, check whether it was already
-            // copied to the flat (non-sequence) destination in a previous run
-            if seq_folder.is_some() && flat_dest.exists() && !force_override {
-                if dest.exists() {
-                    // Both flat and sequence destinations exist - conflict
-                    if skip_existing || dry_run {
-                        skipped_existing += 1;
-                        pb.inc(1);
-                        continue;
-                    }
+            let dest_meta = fs::metadata(&dest).ok();
+            let dest_exists = dest_meta.as_ref().is_some_and(|m| m.is_file());
+            let dest_len = dest_meta.map(|m| m.len());
+            let has_orig = fs::metadata(orig_sidecar_path(&dest))
+                .ok()
+                .is_some_and(|m| m.is_file());
+            let flat_exists = seq_folder.is_some()
+                && fs::metadata(&flat_dest).ok().is_some_and(|m| m.is_file());
+            let seq_dest_exists = seq_folder.is_some() && dest_exists;
+
+            let decision = decide(PlanInput {
+                dest_exists,
+                dest_len,
+                source_len,
+                date,
+                cutoff: cutoff_date,
+                in_sequence: seq_folder.is_some(),
+                flat_exists,
+                seq_dest_exists,
+                force_override,
+                skip_existing,
+                incremental,
+                has_orig,
+            });
+
+            match decision {
+                PlanDecision::Copy => {
+                    copy_plan.push((file_path.clone(), dest.clone()));
+                    note_newest(&mut newest_copied, date, &dest, output_dir);
+                }
+                PlanDecision::RecopyIncomplete => {
+                    copy_plan.push((file_path.clone(), dest.clone()));
+                    recopied += 1;
+                    note_newest(&mut newest_copied, date, &dest, output_dir);
+                }
+                PlanDecision::MoveFromFlat => {
+                    move_plan.push((flat_dest, dest));
+                }
+                PlanDecision::SkipOlderThanCutoff => {
+                    skipped_cutoff += 1;
+                }
+                PlanDecision::SkipExisting => {
+                    skipped_existing += 1;
+                }
+                PlanDecision::ConflictExists => {
+                    errors.push(ValidationError {
+                        file: file_path.display().to_string(),
+                        reason: format!("Destination already exists: {}", dest.display()),
+                    });
+                }
+                PlanDecision::ConflictFlatAndSequence => {
                     errors.push(ValidationError {
                         file: file_path.display().to_string(),
                         reason: format!(
@@ -852,46 +867,35 @@ fn validate_and_plan_copy(
                             dest.display()
                         ),
                     });
-                    pb.inc(1);
-                    continue;
                 }
-                // Flat exists but sequence doesn't - move it to the correct location
-                move_plan.push((flat_dest.clone(), dest));
-                pb.inc(1);
-                continue;
             }
-
-            // Check if destination already exists
-            if dest.exists() && !force_override {
-                if skip_existing || dry_run {
-                    skipped_existing += 1;
-                    pb.inc(1);
-                    continue;
-                }
-                errors.push(ValidationError {
-                    file: file_path.display().to_string(),
-                    reason: format!("Destination already exists: {}", dest.display()),
-                });
-                pb.inc(1);
-                continue;
-            }
-
-            copy_plan.push((file_path.clone(), dest));
             pb.inc(1);
         }
     }
 
-    // Sort copy plan by source path for meaningful dry-run output order
     copy_plan.sort_by(|a, b| a.0.cmp(&b.0));
     move_plan.sort_by(|a, b| a.0.cmp(&b.0));
 
     pb.finish_with_message("File validation complete");
 
     if errors.is_empty() {
-        Ok((copy_plan, move_plan, skipped_cutoff, skipped_existing))
+        Ok(PlanResult {
+            copy_plan,
+            move_plan,
+            skipped_cutoff,
+            skipped_existing,
+            recopied,
+            newest_copied,
+        })
     } else {
         Err(errors)
     }
+}
+
+fn set_dest_mtime(dest: &Path, source: &Path) -> io::Result<()> {
+    let metadata = fs::metadata(source)?;
+    let mtime = metadata.modified()?;
+    OpenOptions::new().write(true).open(dest)?.set_modified(mtime)
 }
 
 fn copy_files(
@@ -912,14 +916,33 @@ fn copy_files(
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::copy(&source, &dest)?;
-            // Preserve modification time from source file
-            // (fs::copy does not preserve mtime on Linux, which causes
-            // incremental mode to set the cutoff too high on next run)
-            if let Ok(metadata) = fs::metadata(&source)
-                && let Ok(mtime) = metadata.modified()
-            {
-                let _ = std::fs::File::open(&dest).and_then(|f| f.set_modified(mtime));
+            let tmp_name = format!(
+                "{}.part",
+                dest.file_name().and_then(|n| n.to_str()).unwrap_or("file")
+            );
+            let tmp = dest.with_file_name(tmp_name);
+            if let Err(e) = (|| -> Result<(), Box<dyn std::error::Error>> {
+                fs::copy(&source, &tmp)?;
+                let src_len = fs::metadata(&source)?.len();
+                let tmp_len = fs::metadata(&tmp)?.len();
+                if src_len != tmp_len {
+                    return Err(format!(
+                        "size mismatch after copy of {} (src {src_len}, dest {tmp_len})",
+                        source.display()
+                    )
+                    .into());
+                }
+                if let Err(e) = set_dest_mtime(&tmp, &source) {
+                    eprintln!(
+                        "Warning: could not preserve mtime on {}: {e}",
+                        tmp.display()
+                    );
+                }
+                fs::rename(&tmp, &dest)?;
+                Ok(())
+            })() {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
             }
         }
         pb.inc(1);
@@ -947,7 +970,11 @@ fn move_files(
             if let Some(parent) = to.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::rename(&from, &to)?;
+            if let Err(e) = fs::rename(&from, &to) {
+                fs::copy(&from, &to)?;
+                fs::remove_file(&from)?;
+                let _ = e;
+            }
         }
         pb.inc(1);
     }
@@ -956,84 +983,152 @@ fn move_files(
     Ok(())
 }
 
+fn resolve_cutoff(
+    output_dir: &Path,
+    incremental: bool,
+    dry_run: bool,
+) -> Result<Option<DateTime<Utc>>, Box<dyn std::error::Error>> {
+    if !incremental {
+        return Ok(None);
+    }
+    println!("Incremental mode enabled.");
+    if let Some(state) = sidecar::load(output_dir)? {
+        if let Some(date) = state.cutoff_dt() {
+            println!(
+                "Loaded sidecar cutoff {} ({})",
+                date.format("%Y-%m-%d %H:%M:%S"),
+                state.last_file
+            );
+            return Ok(Some(date));
+        }
+        eprintln!(
+            "Warning: ignoring unreadable sidecar cutoff {:?}",
+            state.cutoff
+        );
+    }
+    println!("No sidecar found. Scanning destination for most recent file...");
+    match find_most_recent_file_in_destination(output_dir)? {
+        Some((date, path)) => {
+            let last_file = relative_to_output(output_dir, &path);
+            if !dry_run {
+                sidecar::save(output_dir, &IncrementalState::new(date, &last_file))?;
+                println!("Wrote {}", sidecar::sidecar_path(output_dir).display());
+            }
+            println!(
+                "Only processing files on or after: {}",
+                date.format("%Y-%m-%d %H:%M:%S")
+            );
+            Ok(Some(date))
+        }
+        None => {
+            println!("No existing files found in destination. Processing all files.");
+            Ok(None)
+        }
+    }
+}
+
+fn maybe_update_sidecar(
+    output_dir: &Path,
+    dry_run: bool,
+    previous: Option<DateTime<Utc>>,
+    newest_copied: Option<(DateTime<Utc>, String)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if dry_run {
+        return Ok(());
+    }
+    let Some((date, last_file)) = newest_copied else {
+        return Ok(());
+    };
+    if previous.is_some_and(|p| date <= p) {
+        return Ok(());
+    }
+    sidecar::save(output_dir, &IncrementalState::new(date, last_file))?;
+    println!("Updated {}", sidecar::sidecar_path(output_dir).display());
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    
-    // Check if exiftool is available before proceeding
+
     check_exiftool_installed()?;
-    
+
     let input_dir = PathBuf::from(&args.input_dir);
     let output_dir = PathBuf::from(&args.output_dir);
 
-    // Handle incremental mode
-    let cutoff_date = if args.incremental {
-        println!(
-            "Incremental mode enabled. Scanning destination directory for most recent file..."
-        );
-        match find_most_recent_file_in_destination(&output_dir)? {
-            Some(date) => {
-                println!(
-                    "Only processing files newer than: {}",
-                    date.format("%Y-%m-%d %H:%M:%S UTC")
-                );
-                Some(date)
-            }
-            None => {
-                println!("No existing files found in destination. Processing all files.");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    if !input_dir.is_dir() {
+        return Err(format!("Input directory does not exist: {}", input_dir.display()).into());
+    }
+    if !output_dir.is_dir() {
+        return Err(format!("Output directory does not exist: {}", output_dir.display()).into());
+    }
 
-    let groups = group_files_by_base(&input_dir);
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(4).build_global();
+
+    let cutoff_date = resolve_cutoff(&output_dir, args.incremental, args.dry_run)?;
+
+    let source_root = input_root(&input_dir);
+    if source_root != input_dir {
+        println!("Scanning DCIM: {}", source_root.display());
+    }
+
+    let groups = group_files_by_base(&source_root);
     let exif_cache = cache_exif_data(&groups);
     let sequences = detect_sequences(&groups, &exif_cache);
 
-    match validate_and_plan_copy(&output_dir, &groups, &sequences, &exif_cache, cutoff_date, args.force_override, args.skip_existing, args.dry_run) {
-        Ok((copy_plan, move_plan, skipped_cutoff, skipped_existing)) => {
-            let total_new = copy_plan.len() + move_plan.len();
-
-            // Print skip summary
-            if skipped_cutoff > 0 {
+    match validate_and_plan_copy(
+        &output_dir,
+        &groups,
+        &sequences,
+        &exif_cache,
+        cutoff_date,
+        args.force_override,
+        args.skip_existing,
+        args.incremental,
+    ) {
+        Ok(plan) => {
+            if plan.skipped_cutoff > 0 {
                 println!(
                     "Skipped {} file(s) older than cutoff (already in destination).",
-                    skipped_cutoff
+                    plan.skipped_cutoff
                 );
             }
-            if skipped_existing > 0 {
+            if plan.skipped_existing > 0 {
                 println!(
                     "Skipped {} file(s) that already exist in destination.",
-                    skipped_existing
+                    plan.skipped_existing
+                );
+            }
+            if plan.recopied > 0 {
+                println!(
+                    "Re-copying {} incomplete dest file(s).",
+                    plan.recopied
                 );
             }
 
-            if !move_plan.is_empty() {
+            if !plan.move_plan.is_empty() {
                 println!(
                     "\n{} file(s) found at flat path - will move to sequence folder:",
-                    move_plan.len()
+                    plan.move_plan.len()
                 );
-                move_files(move_plan, args.dry_run)?;
+                move_files(plan.move_plan, args.dry_run)?;
             }
 
-            if cutoff_date.is_some() {
+            if args.incremental {
                 println!(
                     "\nIncremental check: {} new file(s) to copy.",
-                    copy_plan.len()
+                    plan.copy_plan.len()
                 );
             } else {
-                println!(
-                    "\n{} new file(s) to copy.",
-                    copy_plan.len()
-                );
+                println!("\n{} new file(s) to copy.", plan.copy_plan.len());
             }
 
-            if total_new == 0 {
-                println!("No files to process.");
+            if plan.copy_plan.is_empty() {
+                println!("No files to copy.");
             } else {
-                copy_files(copy_plan, args.dry_run)?;
+                copy_files(plan.copy_plan, args.dry_run)?;
             }
+
+            maybe_update_sidecar(&output_dir, args.dry_run, cutoff_date, plan.newest_copied)?;
         }
         Err(errors) => {
             println!(
