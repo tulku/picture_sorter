@@ -6,6 +6,7 @@ pub mod domain;
 pub mod edit;
 pub mod error;
 pub mod fs;
+pub mod immich;
 pub mod import;
 pub mod plan;
 pub mod sidecar;

@@ -135,6 +135,7 @@ pub(crate) fn merge(
         )?;
         for table in [
             "placements",
+            "pin_targets",
             "sidecars",
             "mappings",
             "conflicts",

@@ -1,0 +1,28 @@
+{
+  "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "ownerId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+  "type": "IMAGE",
+  "originalPath": "/external/a.JPG",
+  "originalFileName": "a.JPG",
+  "originalMimeType": "image/jpeg",
+  "checksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "createdAt": "2026-10-25T12:00:00.000Z",
+  "updatedAt": "2026-10-25T12:00:00.000Z",
+  "fileCreatedAt": "2026-10-25T12:00:00.000Z",
+  "fileModifiedAt": "2026-10-25T12:00:00.000Z",
+  "localDateTime": "2026-10-25T12:00:00.000Z",
+  "duration": "0:00:00.000000",
+  "hasMetadata": true,
+  "height": 1,
+  "width": 1,
+  "isArchived": false,
+  "isEdited": false,
+  "isFavorite": false,
+  "isOffline": false,
+  "isTrashed": false,
+  "thumbhash": null,
+  "visibility": "timeline",
+  "exifInfo": {
+    "rating": 3
+  }
+}

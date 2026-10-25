@@ -1,0 +1,107 @@
+{
+  "source_commit": "8303cb117e197c700332b33b61b45314c9cc5bb4",
+  "version": "3.3.5",
+  "base_path": "/api",
+  "operations": {
+    "GET /assets/{id}": "getAssetInfo",
+    "GET /server/about": "getAboutInfo",
+    "PUT /assets/{id}": "updateAsset"
+  },
+  "schemas": {
+    "AssetResponseDto": {
+      "required": [
+        "checksum",
+        "createdAt",
+        "duration",
+        "fileCreatedAt",
+        "fileModifiedAt",
+        "hasMetadata",
+        "height",
+        "id",
+        "isArchived",
+        "isEdited",
+        "isFavorite",
+        "isOffline",
+        "isTrashed",
+        "localDateTime",
+        "originalFileName",
+        "originalPath",
+        "ownerId",
+        "thumbhash",
+        "type",
+        "updatedAt",
+        "visibility",
+        "width"
+      ],
+      "properties": {
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/components/schemas/AssetTypeEnum"
+        },
+        "originalPath": {
+          "type": "string"
+        },
+        "originalFileName": {
+          "type": "string"
+        },
+        "originalMimeType": {
+          "type": "string"
+        },
+        "libraryId": {
+          "format": "uuid",
+          "nullable": true,
+          "type": "string"
+        },
+        "checksum": {
+          "type": "string"
+        },
+        "exifInfo": {
+          "$ref": "#/components/schemas/ExifResponseDto"
+        }
+      }
+    },
+    "ExifResponseDto": {
+      "required": [],
+      "properties": {
+        "rating": {
+          "maximum": 5,
+          "minimum": 1,
+          "nullable": true,
+          "type": "integer"
+        }
+      }
+    },
+    "ServerAboutResponseDto": {
+      "required": [
+        "licensed",
+        "version",
+        "versionUrl"
+      ],
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "versionUrl": {
+          "type": "string"
+        },
+        "licensed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "UpdateAssetDto": {
+      "required": [],
+      "properties": {
+        "rating": {
+          "maximum": 5,
+          "minimum": -1,
+          "nullable": true,
+          "type": "integer"
+        }
+      }
+    }
+  }
+}

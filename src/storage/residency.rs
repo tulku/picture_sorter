@@ -37,7 +37,7 @@ impl Catalog {
                     "operation reused with different pin",
                 ));
             }
-            serde_json::from_str(&format!("\"{id}\""))?
+            return serde_json::from_str(&format!("\"{id}\"")).map_err(Into::into);
         } else {
             let id = JobId::new();
             tx.execute(
@@ -136,7 +136,12 @@ impl Catalog {
         let missing:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM members m LEFT JOIN placements p ON p.group_id=m.group_id AND p.path=m.path AND p.digest=m.digest WHERE m.group_id=? AND (p.id IS NULL OR p.local_ready=0))",[group.id.to_string()],|r|r.get(0))?;
         let protection = self.protection(group.id)?;
         let originals_ready = !group.members.is_empty() && !missing;
-        let metadata_current = protection.metadata_current && !protection.conflict;
+        let no_sidecars: bool = self.db.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM sidecars WHERE group_id=?)",
+            [group.id.to_string()],
+            |r| r.get(0),
+        )?;
+        let metadata_current = (protection.metadata_current || no_sidecars) && !protection.conflict;
         let reason = if protection.conflict {
             Some("unresolved conflict".into())
         } else if !originals_ready {

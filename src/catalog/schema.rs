@@ -23,7 +23,9 @@ CREATE TABLE residency(group_id TEXT PRIMARY KEY REFERENCES groups(id),pin INTEG
 CREATE TABLE snapshots(digest TEXT PRIMARY KEY,path TEXT NOT NULL,size INTEGER NOT NULL,archived INTEGER NOT NULL DEFAULT 0,refs INTEGER NOT NULL DEFAULT 1,cleanup_intent INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE rating_observations(id TEXT PRIMARY KEY,group_id TEXT NOT NULL,local TEXT,remote TEXT,common TEXT,applied TEXT,pending TEXT);
 CREATE TABLE rating_intents(id TEXT PRIMARY KEY,operation TEXT NOT NULL UNIQUE,group_id TEXT NOT NULL,server TEXT NOT NULL,asset TEXT NOT NULL,jpeg TEXT NOT NULL,expected TEXT NOT NULL,desired INTEGER NOT NULL,state TEXT NOT NULL);
-CREATE TABLE mappings(server TEXT NOT NULL,asset TEXT NOT NULL,library TEXT,path TEXT NOT NULL,digest TEXT,group_id TEXT NOT NULL REFERENCES groups(id),stale INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(server,asset));
+CREATE TABLE pin_targets(job TEXT PRIMARY KEY REFERENCES jobs(id),group_id TEXT NOT NULL REFERENCES groups(id));
+CREATE TABLE pin_batches(operation TEXT NOT NULL,asset TEXT NOT NULL,child_operation TEXT NOT NULL UNIQUE,PRIMARY KEY(operation,asset));
+CREATE TABLE mappings(server TEXT NOT NULL,asset TEXT NOT NULL,library TEXT,path TEXT NOT NULL,digest TEXT,group_id TEXT NOT NULL REFERENCES groups(id),stale INTEGER NOT NULL DEFAULT 0,remote_checksum TEXT NOT NULL DEFAULT '',external_path TEXT NOT NULL DEFAULT '',PRIMARY KEY(server,asset));
 CREATE TABLE conflicts(id TEXT PRIMARY KEY,kind TEXT NOT NULL,group_id TEXT,revision INTEGER NOT NULL DEFAULT 0,details TEXT NOT NULL,resolved INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE capabilities(id TEXT PRIMARY KEY,report TEXT NOT NULL);
 CREATE TABLE blocked_records(id TEXT PRIMARY KEY,reason TEXT NOT NULL);

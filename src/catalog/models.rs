@@ -17,6 +17,10 @@ pub enum JobKind {
     Refresh {
         groups: Vec<GroupId>,
     },
+    PinUrl {
+        server: String,
+        asset: uuid::Uuid,
+    },
     Clean,
     Evict {
         group: GroupId,
@@ -44,6 +48,7 @@ pub enum JobState {
     Running,
     WaitingSource,
     WaitingNas,
+    WaitingImmich,
     WaitingCapacity,
     WaitingApplication,
     Conflict,

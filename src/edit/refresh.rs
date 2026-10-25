@@ -136,7 +136,21 @@ impl RefreshCoordinator<'_> {
                     continue;
                 }
                 let observed = observed_body(self.local, &plan.path)?;
-                if observed != plan.expected && observed != plan.body {
+                let local_head = self.catalog.local_head(plan.sidecar)?;
+                let expected_local = match local_head {
+                    Some(version) => self.catalog.version(version)?.body,
+                    None => VersionBody::Reset,
+                };
+                if local_head.is_some()
+                    && self.catalog.snapshot_dirty(plan.sidecar)?
+                    && observed != plan.body
+                {
+                    self.sessions.revoke(request.application_session);
+                    report.conflicts.push(plan.sidecar);
+                    return Ok(report);
+                }
+
+                if observed != expected_local && observed != plan.body {
                     self.sessions.revoke(request.application_session);
                     report.conflicts.push(plan.sidecar);
                     self.catalog.db.execute(
@@ -198,7 +212,7 @@ impl RefreshCoordinator<'_> {
                                 OperationId::new()
                             ))?;
                             publish_noreplace(self.local, &plan.path, &displaced)?;
-                            if observed_body(self.local, &displaced)? != plan.expected {
+                            if observed_body(self.local, &displaced)? != expected_local {
                                 self.sessions.revoke(request.application_session);
                                 report.conflicts.push(plan.sidecar);
                                 return Ok(report);
@@ -215,7 +229,7 @@ impl RefreshCoordinator<'_> {
                                 }
                             } else {
                                 self.local.exchange(&staged, &plan.path)?;
-                                if observed_body(self.local, &staged)? != plan.expected {
+                                if observed_body(self.local, &staged)? != expected_local {
                                     self.sessions.revoke(request.application_session);
                                     report.conflicts.push(plan.sidecar);
                                     return Ok(report);

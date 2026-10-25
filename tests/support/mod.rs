@@ -32,3 +32,4 @@ impl TestRig {
         }
     }
 }
+pub mod http;

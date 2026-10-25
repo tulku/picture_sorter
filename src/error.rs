@@ -4,6 +4,9 @@ pub type AppResult<T> = Result<T, AppError>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCode {
     InvalidConfig,
+    Authentication,
+    Permission,
+    NotFound,
     Unsupported,
     Unavailable,
     Capacity,

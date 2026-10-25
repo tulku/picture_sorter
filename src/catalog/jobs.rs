@@ -100,6 +100,7 @@ impl Catalog {
                 if !matches!(
                     next,
                     JobState::WaitingSource
+                        | JobState::WaitingImmich
                         | JobState::WaitingNas
                         | JobState::WaitingCapacity
                         | JobState::WaitingApplication

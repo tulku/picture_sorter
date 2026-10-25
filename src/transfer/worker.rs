@@ -23,6 +23,11 @@ pub enum NasCommand {
         root: PathBuf,
     },
     Stage(TransferSpec),
+    FetchArchive {
+        archive: crate::domain::ArchiveId,
+        writer: crate::domain::WriterId,
+        spec: TransferSpec,
+    },
     StageArchive {
         archive: crate::domain::ArchiveId,
         writer: crate::domain::WriterId,
@@ -180,6 +185,9 @@ impl WorkerSupervisor {
             _locks: locks,
             completed: None,
         })
+    }
+    pub fn available(&mut self) -> AppResult<bool> {
+        Ok(self.pending.is_none() && !self.timed_out && self.child.try_wait()?.is_none())
     }
     pub fn pid(&self) -> u32 {
         self.child.id()
@@ -345,6 +353,28 @@ struct ArchiveRuntime {
 impl ArchiveRuntime {
     fn execute(&mut self, command: NasCommand) -> AppResult<NasReply> {
         match command {
+            NasCommand::FetchArchive {
+                archive,
+                writer,
+                spec,
+            } => {
+                use std::os::unix::fs::MetadataExt;
+                let device = std::fs::metadata(&spec.source.root)?.dev();
+                let store = ArchiveStore::open(
+                    RootHandle::open(
+                        &spec.source.root,
+                        RootPolicy::Archive {
+                            expected_device: device,
+                        },
+                    )?,
+                    archive,
+                    writer,
+                )?;
+                let dest = RootHandle::open(&spec.destination_root, RootPolicy::Local)?;
+                let result = TransferEngine::stage_confined(&spec, &store.root, &dest)?;
+                store.validate()?;
+                Ok(NasReply::Staged(result))
+            }
             NasCommand::StageArchive {
                 archive,
                 writer,

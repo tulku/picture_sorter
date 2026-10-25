@@ -162,3 +162,15 @@ fn enospc_after_admission() {
         .unwrap();
     assert_eq!(c.remaining_reservations(FilesystemId(1)).unwrap(), 0);
 }
+#[test]
+fn old_request_retry_does_not_reverse_later_unpin() {
+    let r = support::TestRig::new();
+    let root = RootHandle::open(&r.state, RootPolicy::Local).unwrap();
+    let mut c = Catalog::open(&root).unwrap();
+    let group = c.create_group(false).unwrap();
+    let operation = OperationId::new();
+    let old = c.request_pin(group, operation).unwrap();
+    c.unpin(group).unwrap();
+    assert_eq!(c.request_pin(group, operation).unwrap(), old);
+    assert!(!c.protection(group).unwrap().pinned);
+}

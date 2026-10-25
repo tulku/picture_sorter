@@ -103,6 +103,11 @@ impl TransferEngine {
         source: &RootHandle,
         dest: &RootHandle,
     ) -> AppResult<TransferReceipt> {
+        if spec.staged_path != staging_path(spec.job, spec.generation) {
+            return Err(AppError::invalid(
+                "transfer destination must be its job-owned hidden staging path",
+            ));
+        }
         use std::io::{Seek, SeekFrom};
         let mut original =
             source.open_relative(&spec.source.path, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;

@@ -138,9 +138,7 @@ impl<'a> Snapshotter<'a> {
                 });
             }
         }
-        let parents = previous
-            .map(|v| vec![v])
-            .unwrap_or(self.catalog.heads(owner.id)?);
+        let parents = previous.map(|v| vec![v]).unwrap_or_default();
         let version = VersionStore::new(self.catalog, self.state).record(SnapshotIntent {
             sidecar: owner.id,
             parents,
