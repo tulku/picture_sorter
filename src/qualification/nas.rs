@@ -7,6 +7,43 @@ pub fn nas_fingerprint(
     mode: &PublicationMode,
     revision: u64,
 ) -> AppResult<Digest> {
+    fingerprint_with_environment(
+        root,
+        archive,
+        writer,
+        mode,
+        revision,
+        &client_environment()?,
+    )
+}
+#[derive(Clone, Serialize)]
+struct ClientEnvironment {
+    machine: Digest,
+    boot: Digest,
+    kernel: String,
+}
+fn client_environment() -> AppResult<ClientEnvironment> {
+    let boot = std::fs::read("/proc/sys/kernel/random/boot_id")?;
+    let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")?
+        .trim()
+        .to_owned();
+    if boot.is_empty() || kernel.is_empty() {
+        return Err(AppError::invalid("client boot/kernel identity unavailable"));
+    }
+    Ok(ClientEnvironment {
+        machine: machine()?,
+        boot: Digest::of(&boot),
+        kernel,
+    })
+}
+fn fingerprint_with_environment(
+    root: &RootHandle,
+    archive: ArchiveId,
+    writer: WriterId,
+    mode: &PublicationMode,
+    revision: u64,
+    environment: &ClientEnvironment,
+) -> AppResult<Digest> {
     Ok(Digest::of(&serde_json::to_vec(&(
         NAS_IMPLEMENTATION,
         root.path(),
@@ -15,8 +52,10 @@ pub fn nas_fingerprint(
         writer,
         mode,
         revision,
+        environment,
     ))?))
 }
+
 use super::{CapabilityReport, ProbeOutcome, ProbeResult, ProbeScope};
 use crate::{
     error::{AppError, ErrorCode},
@@ -57,6 +96,7 @@ struct ProbeSession {
     archive: ArchiveId,
     writer: WriterId,
     machine: Digest,
+    boot: Digest,
     fingerprint: Digest,
     nonce: String,
     results: Vec<ProbeResult>,
@@ -67,6 +107,7 @@ struct PeerEvidence {
     archive: ArchiveId,
     writer: WriterId,
     machine: Digest,
+    boot: Digest,
     nonce: String,
     bytes: u64,
     digest: Digest,
@@ -208,7 +249,10 @@ pub fn qualify_nas(request: NasProbeRequest) -> AppResult<CapabilityReport> {
         &request.mode,
         request.mode_revision,
     )?;
-    let machine = machine()?;
+    let environment = client_environment()?;
+    let machine = environment.machine.clone();
+    let boot = environment.boot.clone();
+    let is_peer = matches!(&request.phase, NasProbePhase::Peer);
     let dir = format!(".photo-sorter-qualification/{}", request.session);
     let session_path = p(&dir)?;
     let mut fresh = false;
@@ -238,6 +282,7 @@ pub fn qualify_nas(request: NasProbeRequest) -> AppResult<CapabilityReport> {
                 archive: request.archive,
                 writer: request.writer,
                 machine: machine.clone(),
+                boot: boot.clone(),
                 fingerprint: fingerprint.clone(),
                 nonce: format!("{}:{}", request.session, OperationId::new()),
                 results: basic(&root),
@@ -263,6 +308,7 @@ pub fn qualify_nas(request: NasProbeRequest) -> AppResult<CapabilityReport> {
             NasProbePhase::Prepare => {
                 if session.writer != request.writer
                     || session.machine != machine
+                    || session.boot != boot
                     || session.fingerprint != fingerprint
                 {
                     return Err(AppError::new(
@@ -274,10 +320,13 @@ pub fn qualify_nas(request: NasProbeRequest) -> AppResult<CapabilityReport> {
             }
             NasProbePhase::Peer => {
                 verify(&root, "handoff-owner", session.nonce.as_bytes())?;
-                if session.machine == machine || session.writer == request.writer {
+                if session.machine == machine
+                    || session.boot == boot
+                    || session.writer == request.writer
+                {
                     peer_outcome = ProbeOutcome::Inconclusive;
                     peer_detail =
-                    "same machine or copied writer identity cannot qualify multi-client behavior"
+                    "same machine, kernel boot or copied writer identity cannot qualify multi-client behavior"
                         .into();
                 } else {
                     let bytes = block(&session.nonce);
@@ -293,6 +342,7 @@ pub fn qualify_nas(request: NasProbeRequest) -> AppResult<CapabilityReport> {
                         archive: request.archive,
                         writer: request.writer,
                         machine: machine.clone(),
+                        boot: boot.clone(),
                         nonce: session.nonce.clone(),
                         bytes: request.interrupt_bytes,
                         digest: Digest::parse(&format!("blake3:{}", expected.finalize().to_hex()))?,
@@ -344,6 +394,7 @@ pub fn qualify_nas(request: NasProbeRequest) -> AppResult<CapabilityReport> {
                 if peer.schema_version != 1
                     || peer.archive != request.archive
                     || peer.machine == machine
+                    || peer.boot == boot
                     || peer.writer == request.writer
                     || peer.nonce != session.nonce
                 {
@@ -362,7 +413,10 @@ pub fn qualify_nas(request: NasProbeRequest) -> AppResult<CapabilityReport> {
                     let owner: PeerEvidence = serde_json::from_slice(
                         &root.read(&p("disconnect-lock/owner.json")?, 65536)?,
                     )?;
-                    if owner.nonce != peer.nonce || owner.machine != peer.machine {
+                    if owner.nonce != peer.nonce
+                        || owner.machine != peer.machine
+                        || owner.boot != peer.boot
+                    {
                         return Err(AppError::integrity("disconnect lock owner differs"));
                     }
                     let expected = block(&session.nonce);
@@ -409,6 +463,12 @@ pub fn qualify_nas(request: NasProbeRequest) -> AppResult<CapabilityReport> {
             }
         }
     }
+    if is_peer {
+        for result in &mut session.results {
+            result.outcome = ProbeOutcome::Unrun;
+            result.detail="Owner checks do not certify this peer; run a separate prepare/verify session on this client".into();
+        }
+    }
     session.results.push(ProbeResult {
         name: "peer_handoff".into(),
         outcome: peer_outcome,
@@ -419,10 +479,67 @@ pub fn qualify_nas(request: NasProbeRequest) -> AppResult<CapabilityReport> {
         outcome: disconnect_outcome,
         detail: disconnect_detail,
     });
-    let report=CapabilityReport {schema_version:1,capability:"nas-publication".into(),backend_or_application:if request.local_test_backend {"local-test"}else {"linux-filesystem"}.into(),tested_version:NAS_IMPLEMENTATION.into(),mount_identity:Some(archive.mount_identity()?),config_fingerprint:fingerprint,scope,results:session.results,limitations:vec!["Flush/reopen does not simulate NAS power loss or certify storage hardware durability.".into(),"Disconnect evidence includes explicit operator attestation and requires positive prior-writer shutdown; elapsed time never authorizes takeover.".into(),"Artifacts are retained only inside this explicitly requested scratch session; no original/archive object is repaired or removed.".into()]};
+    let report=CapabilityReport {schema_version:1,capability:"nas-publication".into(),backend_or_application:if request.local_test_backend {"local-test"}else {"linux-filesystem"}.into(),tested_version:NAS_IMPLEMENTATION.into(),mount_identity:Some(archive.mount_identity()?),config_fingerprint:fingerprint,scope,results:session.results,limitations:vec![format!("Client kernel: {}. Evidence is bound to this client boot; each writer requires its own prepare/verify session.",environment.kernel),"Flush/reopen does not simulate NAS power loss or certify storage hardware durability.".into(),"Disconnect evidence includes explicit operator attestation and requires positive prior-writer shutdown; elapsed time never authorizes takeover.".into(),"Artifacts are retained only inside this explicitly requested scratch session; no original/archive object is repaired or removed.".into()]};
     root.write_new(
         &p(&format!("report-{}.json", OperationId::new()))?,
         &serde_json::to_vec(&report)?,
     )?;
     Ok(report)
+}
+#[cfg(test)]
+mod environment_tests {
+    use super::*;
+    #[test]
+    fn copied_mount_and_writer_evidence_is_invalid_on_another_boot_or_kernel() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = RootHandle::open(temp.path(), RootPolicy::TestArchive).unwrap();
+        let archive = ArchiveId::new();
+        let writer = WriterId::new();
+        let env = ClientEnvironment {
+            machine: Digest::of(b"client"),
+            boot: Digest::of(b"boot-one"),
+            kernel: "kernel-one".into(),
+        };
+        let first = fingerprint_with_environment(
+            &root,
+            archive,
+            writer,
+            &PublicationMode::SingleWriter,
+            1,
+            &env,
+        )
+        .unwrap();
+        let reboot = ClientEnvironment {
+            boot: Digest::of(b"boot-two"),
+            ..env.clone()
+        };
+        let upgrade = ClientEnvironment {
+            kernel: "kernel-two".into(),
+            ..env
+        };
+        assert_ne!(
+            first,
+            fingerprint_with_environment(
+                &root,
+                archive,
+                writer,
+                &PublicationMode::SingleWriter,
+                1,
+                &reboot
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            first,
+            fingerprint_with_environment(
+                &root,
+                archive,
+                writer,
+                &PublicationMode::SingleWriter,
+                1,
+                &upgrade
+            )
+            .unwrap()
+        );
+    }
 }

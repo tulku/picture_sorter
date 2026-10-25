@@ -583,3 +583,76 @@ fn uncertain_isolated_asset_probe_never_blindly_retries_or_restores() {
             .allowed
     );
 }
+#[test]
+fn peer_handoff_does_not_certify_the_peers_untested_filesystem_operations() {
+    let r = support::TestRig::new();
+    let scratch = r._temp.path().join("peer-scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    let mut request = NasProbeRequest {
+        archive_root: r.archive.clone(),
+        archive: ArchiveId::new(),
+        writer: WriterId::new(),
+        mode: PublicationMode::SingleWriter,
+        mode_revision: 1,
+        scratch_root: scratch,
+        session: OperationId::new(),
+        phase: NasProbePhase::Prepare,
+        local_test_backend: false,
+        prior_peer_stopped: false,
+        all_writers_quiescent: false,
+        disconnect_observed: false,
+        interrupt_bytes: 1024,
+    };
+    qualify_nas(request.clone()).unwrap();
+    request.writer = WriterId::new();
+    request.phase = NasProbePhase::Peer;
+    let report = qualify_nas(request).unwrap();
+    let registry = CapabilityRegistry::new(vec![report.clone()]);
+    assert!(
+        !registry
+            .allows(OperationKind::ArchiveWrite {
+                mount_identity: report.mount_identity.as_ref().unwrap(),
+                fingerprint: &report.config_fingerprint,
+                mode: &PublicationMode::SingleWriter
+            })
+            .allowed
+    );
+}
+#[test]
+fn different_machine_ids_on_one_kernel_boot_are_not_two_nas_clients() {
+    let r = support::TestRig::new();
+    let scratch = r._temp.path().join("shared-boot");
+    std::fs::create_dir(&scratch).unwrap();
+    let mut request = NasProbeRequest {
+        archive_root: r.archive.clone(),
+        archive: ArchiveId::new(),
+        writer: WriterId::new(),
+        mode: PublicationMode::MultiWriter,
+        mode_revision: 2,
+        scratch_root: scratch.clone(),
+        session: OperationId::new(),
+        phase: NasProbePhase::Prepare,
+        local_test_backend: false,
+        prior_peer_stopped: false,
+        all_writers_quiescent: false,
+        disconnect_observed: false,
+        interrupt_bytes: 1024,
+    };
+    qualify_nas(request.clone()).unwrap();
+    let directory = scratch.join(format!(".photo-sorter-qualification/{}", request.session));
+    let path = directory.join("session.json");
+    let mut owner: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    owner["machine"] = serde_json::to_value(Digest::of(b"another container machine id")).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&owner).unwrap()).unwrap();
+    request.writer = WriterId::new();
+    request.phase = NasProbePhase::Peer;
+    let report = qualify_nas(request).unwrap();
+    assert!(
+        report
+            .results
+            .iter()
+            .any(|r| r.name == "peer_handoff" && matches!(r.outcome, ProbeOutcome::Inconclusive))
+    );
+    assert!(!directory.join("peer.json").exists());
+}
