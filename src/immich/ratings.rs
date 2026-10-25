@@ -53,7 +53,7 @@ struct RatingIntent {
 }
 pub struct RatingSynchronizer<'a> {
     pub catalog: &'a mut Catalog,
-    pub client: &'a ImmichClient,
+    pub client: &'a dyn ImmichAccess,
 }
 impl Catalog {
     pub fn prepare_rating_write(
@@ -107,6 +107,10 @@ impl Catalog {
         }
         let id = RatingIntentId::new();
         let tx = self.db.transaction()?;
+        tx.execute(
+            "UPDATE rating_intents SET state='superseded' WHERE group_id=? AND state='prepared'",
+            [group.to_string()],
+        )?;
         tx.execute("INSERT INTO rating_intents(id,operation,group_id,server,asset,jpeg,expected,desired,state) VALUES(?,?,?,?,?,?,?,?,'prepared')",params![id.to_string(),operation.to_string(),group.to_string(),server,asset.to_string(),serde_json::to_string(&jpeg)?,serde_json::to_string(&expected)?,u8::from(desired)])?;
         tx.execute(
             "UPDATE residency SET protected=1 WHERE group_id=?",
@@ -133,6 +137,12 @@ impl Catalog {
 impl RatingSynchronizer<'_> {
     pub fn advance(&mut self, id: RatingIntentId) -> AppResult<RatingSyncReport> {
         let intent = self.catalog.rating_intent(id)?;
+        if intent.state == "superseded" {
+            return Ok(RatingSyncReport {
+                reason: Some("superseded by a newer unsent local intent".into()),
+                ..Default::default()
+            });
+        }
         if intent.state == "confirmed" {
             return Ok(RatingSyncReport {
                 confirmed: true,
@@ -173,6 +183,33 @@ impl RatingSynchronizer<'_> {
             ));
         }
         if intent.state == "sent" {
+            match self.client.write_progress(intent.asset) {
+                WriteProgress::Pending => {
+                    return Ok(RatingSyncReport {
+                        waiting: true,
+                        reason: Some("rating request remains in flight".into()),
+                        ..Default::default()
+                    });
+                }
+                WriteProgress::Finished(Ok(WriteOutcome::Confirmed)) => {
+                    return self.finish(&intent, true, RatingObservation::Stars(intent.desired));
+                }
+                WriteProgress::Finished(Ok(WriteOutcome::Conflict { observed })) => {
+                    return self.finish(&intent, false, observed);
+                }
+                WriteProgress::Finished(Err(error)) => {
+                    self.catalog.db.execute(
+                        "UPDATE rating_intents SET state='prepared' WHERE id=?",
+                        [id.to_string()],
+                    )?;
+                    return Ok(RatingSyncReport {
+                        waiting: true,
+                        reason: Some(error.to_string()),
+                        ..Default::default()
+                    });
+                }
+                WriteProgress::Finished(Ok(WriteOutcome::Uncertain)) | WriteProgress::None => {}
+            }
             let asset = self.client.asset(intent.asset)?;
             let observed = remote_rating(&asset)?;
             if asset.checksum == intent.jpeg.remote_checksum
@@ -181,6 +218,33 @@ impl RatingSynchronizer<'_> {
                 return self.finish(&intent, true, observed);
             }
             return self.finish(&intent, false, observed);
+        }
+        if self.catalog.protection(intent.group)?.conflict {
+            return Ok(RatingSyncReport {
+                waiting: true,
+                reason: Some(
+                    "unresolved photograph conflict blocks a prepared rating write".into(),
+                ),
+                ..Default::default()
+            });
+        }
+        let authority: Option<(String, String)> = self
+            .catalog
+            .db
+            .query_row(
+                "SELECT server,asset FROM rating_authorities WHERE group_id=?",
+                [intent.group.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if authority.is_some_and(|(server, asset)| {
+            server != intent.server || asset != intent.asset.to_string()
+        }) {
+            return Ok(RatingSyncReport {
+                waiting: true,
+                reason: Some("rating authority changed before send".into()),
+                ..Default::default()
+            });
         }
         if !self.client.outbound_enabled() {
             return Ok(RatingSyncReport {
@@ -265,6 +329,9 @@ pub(crate) fn remote_rating(asset: &AssetInfo) -> AppResult<RatingObservation> {
     let Some(exif) = &asset.exif_info else {
         return Ok(RatingObservation::Unobserved);
     };
+    if !exif.rating_observed {
+        return Ok(RatingObservation::Unobserved);
+    }
     Ok(match exif.rating {
         None => RatingObservation::Stars(Rating::try_from(0)?),
         Some(n @ 1..=5) => RatingObservation::Stars(Rating::try_from(n as u8)?),
@@ -408,13 +475,29 @@ impl RatingSynchronizer<'_> {
                     continue;
                 }
             }
-            let remote = match self.client.rating(asset) {
-                Ok(remote) => remote,
+            let asset_info = match self.client.asset(asset) {
+                Ok(asset) => asset,
                 Err(_) => {
                     report.pending += 1;
                     continue;
                 }
             };
+            let binding:(String,String,Option<String>)=self.catalog.db.query_row("SELECT external_path,remote_checksum,library FROM mappings WHERE server=? AND asset=? AND stale=0",params![server,asset.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            if asset_info.original_path != binding.0
+                || asset_info.checksum != binding.1
+                || asset_info.library_id.map(|id| id.to_string()) != binding.2
+                || asset_info.kind != "IMAGE"
+                || asset_info.original_mime_type.as_deref() != Some("image/jpeg")
+            {
+                self.catalog.db.execute(
+                    "UPDATE mappings SET stale=1 WHERE server=? AND asset=?",
+                    params![server, asset.to_string()],
+                )?;
+                self.catalog.record_rating_conflict(group,"mapping_identity",serde_json::json!({"asset":asset,"reason":"upstream asset path, checksum, library or media identity changed"}))?;
+                report.conflicts += 1;
+                continue;
+            }
+            let remote = remote_rating(&asset_info)?;
             let observation = self
                 .catalog
                 .observe_remote_rating(&server, asset, &remote)?;
@@ -557,11 +640,12 @@ impl RatingSynchronizer<'_> {
                         let group_data = self.catalog.group(group)?;
                         let primary = primary_raw(&group_data);
                         if let Some(primary) = primary {
-                            let sidecar = SidecarId::new();
+                            let path = ArchivePath::parse(&format!("{}.rrdata", primary.as_str()))?;
+                            let sidecar = self.catalog.managed_sidecar_id(&path)?;
                             self.catalog.register_sidecar(
                                 sidecar,
                                 Some(group),
-                                ArchivePath::parse(&format!("{}.rrdata", primary.as_str()))?,
+                                path,
                                 "rapidraw-base",
                             )?;
                             let bytes = adapter.initial_document(rating)?;

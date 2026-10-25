@@ -228,7 +228,16 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         }
         state.unlink(&ArchivePath::parse("service.sock")?, false)?;
     }
-    let catalog = Catalog::open(&state)?;
+    let mut catalog = Catalog::open(&state)?;
+    let _recovery = super::ServiceRecovery::restore(&mut catalog)?;
+    let observation_worker = WorkerSupervisor::new_local(
+        std::env::current_exe()?,
+        vec![profile.inherit()?, work.inherit()?],
+    )?;
+    let local_worker = WorkerSupervisor::new_local(
+        std::env::current_exe()?,
+        vec![profile.inherit()?, work.inherit()?],
+    )?;
     let worker = WorkerSupervisor::new(
         std::env::current_exe()?,
         vec![profile.inherit()?, work.inherit()?],
@@ -240,11 +249,23 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         inode: std::fs::symlink_metadata(&socket)?.ino(),
         path: socket,
     };
+    let (http, http_reason) = match super::http::AsyncImmich::new(&config) {
+        Ok(http) => (http, None),
+        Err(error) => (None, Some(error.to_string())),
+    };
     let mut runtime = Runtime {
-        engine: ImportCoordinator::new(config, catalog),
+        http,
+        http_reason,
+        rating_cursor: None,
+        engine: ImportCoordinator::new(config.clone(), catalog),
         local,
         state,
         worker,
+        observation: super::observation::ObservationDriver::new(observation_worker),
+        shared_publisher: super::publication::SharedPublisher::default(),
+        scan: super::scan::ScanDriver::default(),
+        local_transfer: super::local_transfer::LocalTransferDriver::new(local_worker),
+        scheduler: super::Scheduler::new(&config),
         upload: UploadDriver::default(),
         bootstrap: BootstrapDriver::default(),
         fetch: crate::immich::PinFetchDriver::default(),
@@ -254,6 +275,7 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         archive_status: serde_json::json!({"availability":"unobserved","identity":null}),
         last_tick: Instant::now(),
     };
+    runtime.engine.bind_archive()?;
     let mut peers: Vec<Connection> = vec![];
     loop {
         for _ in 0..32 {
@@ -356,17 +378,20 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         for peer in &mut peers {
             if !peer.closed
                 && let (Some(job), Some(request)) = (peer.waiting, peer.request.as_ref())
-                && let Some(response) = runtime.wait_response(request, job)? {
-                    peer.respond(response)?;
-                }
+                && let Some(response) = runtime.wait_response(request, job)?
+            {
+                peer.respond(response)?;
+            }
             if peer.flush().is_err() {
                 peer.closed = true;
             }
-            if peer.opened.elapsed() > Duration::from_secs(25) && peer.waiting.is_some()
-                && let (Some(job), Some(request)) = (peer.waiting, peer.request.as_ref()) {
-                    let response = runtime.job_response(request.request_id, job)?;
-                    peer.respond(response)?;
-                }
+            if peer.opened.elapsed() > Duration::from_secs(25)
+                && peer.waiting.is_some()
+                && let (Some(job), Some(request)) = (peer.waiting, peer.request.as_ref())
+            {
+                let response = runtime.job_response(request.request_id, job)?;
+                peer.respond(response)?;
+            }
         }
         peers.retain(|peer| {
             !peer.closed
@@ -382,10 +407,18 @@ struct Control {
 }
 struct Runtime {
     engine: ImportCoordinator,
+    http: Option<super::http::AsyncImmich>,
+    http_reason: Option<String>,
+    rating_cursor: Option<Option<uuid::Uuid>>,
     local: RootHandle,
     state: RootHandle,
     worker: WorkerSupervisor,
     upload: UploadDriver,
+    observation: super::observation::ObservationDriver,
+    shared_publisher: super::publication::SharedPublisher,
+    scan: super::scan::ScanDriver,
+    local_transfer: super::local_transfer::LocalTransferDriver,
+    scheduler: super::Scheduler,
     bootstrap: BootstrapDriver,
     fetch: crate::immich::PinFetchDriver,
     sessions: ApplicationSessions,
@@ -415,22 +448,25 @@ impl Runtime {
         }
         match &request.command {
             Command::Status => {
-                let status = StatusSnapshot::collect(
+                let mut status = StatusSnapshot::collect(
                     &self.engine,
                     &self.local,
                     &self.state,
-                    serde_json::json!({"pid":self.worker.pid(),"available":self.worker.available()?}),
+                    serde_json::json!({"pid":self.worker.pid(),"local_pid":self.local_transfer.worker.pid(),"observation_pid":self.observation.worker.pid(),"available":self.worker.available()?}),
                     self.archive_status.clone(),
                 )?;
+                status.watcher = serde_json::to_value(&self.observation.status)?;
                 data(serde_json::to_value(status)?)
             }
-            Command::Import { source, strict } => self.enqueue(
-                request,
-                JobKind::Import {
-                    source: source.clone(),
+            Command::Import { source, strict } => {
+                let job = self.engine.begin_scan(&ImportRequest {
+                    source_path: source.clone(),
                     strict: *strict,
-                },
-            ),
+                    dry_run: false,
+                    operation_id: request.request_id,
+                })?;
+                Ok(ResponseOutcome::Accepted { job })
+            }
             Command::Bootstrap { scope } => {
                 let config = self.engine.config.clone();
                 let job = BootstrapCoordinator::new(
@@ -631,6 +667,12 @@ impl Runtime {
             },
             _ => false,
         };
+        if matches!(record.request.kind, JobKind::PinUrl { .. })
+            && record.state == JobState::WaitingImmich
+            && self.http.as_ref().is_some_and(|http| http.in_flight())
+        {
+            return Ok(None);
+        }
         let blocked = matches!(
             record.state,
             JobState::WaitingSource
@@ -671,6 +713,27 @@ impl Runtime {
             .transition(job, record.generation, JobTransition::Wait(state, reason))
     }
     fn tick(&mut self) -> AppResult<()> {
+        let clock = SystemClock::default();
+        let timing = self.scheduler.tick(clock.now())?;
+        if timing.poll_ratings {
+            self.rating_cursor = Some(None);
+        }
+        if let Some(http) = &self.http
+            && let Err(error) = http.pump()
+        {
+            self.http_reason = Some(error.to_string());
+        }
+
+        if let Err(error) = self.observation.advance(
+            &mut self.engine,
+            &self.local,
+            &self.state,
+            &clock,
+            timing.observe_edits,
+            timing.reconcile,
+        ) {
+            self.observation.status.reason = Some(error.to_string());
+        }
         self.worker.timeout(Duration::from_secs(5));
         if let Some(control) = self.control.take() {
             match self.worker.poll(control.ticket)? {
@@ -736,36 +799,89 @@ impl Runtime {
                 self.wait(record.id, state, error.to_string())?;
             }
         }
+        if let Some(http) = &self.http {
+            if let Some(after) = self.rating_cursor {
+                let config = &self.engine.config;
+                let scope = crate::immich::RatingScope {
+                    state_root: config.state_root.clone(),
+                    editor_version: config.rapidraw_version.clone(),
+                    after,
+                    limit: 1,
+                };
+                match (crate::immich::RatingSynchronizer {
+                    catalog: &mut self.engine.catalog,
+                    client: http,
+                })
+                .poll(scope)
+                {
+                    Ok(report) => {
+                        if report.observed > 0 || !http.in_flight() {
+                            self.rating_cursor = report.next.map(Some);
+                        }
+                    }
+                    Err(error) => {
+                        self.http_reason = Some(error.to_string());
+                        self.rating_cursor = None;
+                    }
+                }
+            }
+            let intent:Option<String>=self.engine.catalog.db.query_row("SELECT id FROM rating_intents WHERE state IN('prepared','sent') ORDER BY rowid LIMIT 1",[],|r|r.get(0)).optional()?;
+            if let Some(id) = intent {
+                let id = serde_json::from_str(&format!("\"{id}\""))?;
+                match (crate::immich::RatingSynchronizer {
+                    catalog: &mut self.engine.catalog,
+                    client: http,
+                })
+                .advance(id)
+                {
+                    Ok(report) => {
+                        if let Some(reason) = report.reason {
+                            self.http_reason = Some(reason);
+                        }
+                    }
+                    Err(error) => self.http_reason = Some(error.to_string()),
+                }
+            }
+        }
+        if self.shared_publisher.busy()
+            || (self.control.is_none()
+                && self.upload.active_job().is_none()
+                && self.worker.available()?)
+        {
+            self.shared_publisher
+                .advance(&mut self.engine, &self.state, &mut self.worker)?;
+        }
         Ok(())
     }
     fn advance(&mut self, record: &JobRecord) -> AppResult<()> {
         let job = record.id;
         let config = self.engine.config.clone();
         match &record.request.kind {
-            JobKind::Import { source, strict } => {
-                let prepared: bool = self.engine.catalog.db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM import_stats WHERE job=?)",
-                    [job.to_string()],
-                    |r| r.get(0),
-                )?;
-                if !prepared {
-                    self.engine.prepare(ImportRequest {
-                        source_path: source.clone(),
-                        strict: *strict,
-                        dry_run: false,
-                        operation_id: record.request.operation_id,
-                    })?;
-                }
-                let report = self.engine.advance(job)?;
+            JobKind::LocalTransfer { .. } => {}
+            JobKind::Import { .. } => {
+                self.scan.advance(&mut self.engine, job)?;
+                self.local_transfer.advance(&mut self.engine, job)?;
+                let report = self.engine.report(job)?;
                 if report.conflicting > 0 {
-                    self.wait(job,JobState::Conflict,"one or more selected originals have a collision; independent groups may continue".into())?;
+                    self.wait(
+                        job,
+                        JobState::Conflict,
+                        "one or more selected items have a collision; independent groups continue"
+                            .into(),
+                    )?;
                 }
-                if report.archive_committed == report.selected
+                if self.engine.scan_complete(job)?
+                    && report.archive_committed == report.selected
                     && report.waiting == 0
                     && report.conflicting == 0
                 {
                     self.complete(job)?;
-                } else if self.worker.available()? || self.control.is_none() {
+                } else if self.upload.active_job() == Some(job)
+                    || (self.upload.active_job().is_none()
+                        && self.local_transfer.active_parent() != Some(job)
+                        && self.control.is_none()
+                        && self.worker.available()?)
+                {
                     let _ = self
                         .upload
                         .advance(&mut self.engine, &mut self.worker, job)?;
@@ -792,11 +908,68 @@ impl Runtime {
                     self.wait(job,JobState::WaitingApplication,"originals are resident; retained sidecars require foreground refresh --editor-closed".into())?;
                 }
             }
-            JobKind::PinUrl { .. } => self.wait(
-                job,
-                JobState::WaitingImmich,
-                "URL mapping awaits Immich observation".into(),
-            )?,
+            JobKind::PinUrl { server, asset } => {
+                let existing: Option<String> = self
+                    .engine
+                    .catalog
+                    .db
+                    .query_row(
+                        "SELECT group_id FROM pin_targets WHERE job=?",
+                        [job.to_string()],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if existing.is_none() {
+                    use crate::immich::ImmichAccess;
+                    let Some(http) = &self.http else {
+                        return self.wait(
+                            job,
+                            JobState::WaitingImmich,
+                            self.http_reason
+                                .clone()
+                                .unwrap_or_else(|| "Immich is not configured".into()),
+                        );
+                    };
+                    match http.asset(*asset) {
+                        Ok(asset_info) => {
+                            if http.origin().origin().ascii_serialization() != *server {
+                                return Err(AppError::new(
+                                    ErrorCode::Conflict,
+                                    "URL origin changed",
+                                ));
+                            }
+                            let group = crate::immich::resolve_asset(
+                                &asset_info,
+                                &config.immich_path_mappings,
+                                &self.engine.catalog,
+                            )?;
+                            self.engine
+                                .catalog
+                                .bind_asset(http.origin(), &asset_info, group)?;
+                            self.engine.catalog.pin_url_target(job, group)?;
+                            let current = self.engine.catalog.job(job)?;
+                            self.engine.catalog.transition(
+                                job,
+                                current.generation,
+                                JobTransition::Start,
+                            )?;
+                            self.rating_cursor = Some(None);
+                        }
+                        Err(error) => {
+                            return self.wait(job, JobState::WaitingImmich, error.to_string());
+                        }
+                    }
+                }
+                let readiness =
+                    self.fetch
+                        .advance(&mut self.engine.catalog, &config, &mut self.worker, job)?;
+                self.result(job, &readiness)?;
+                if readiness.originals_ready && readiness.metadata_current {
+                    self.complete(job)?;
+                } else if readiness.originals_ready {
+                    self.wait(job,JobState::WaitingApplication,"originals are resident; use foreground refresh --editor-closed for pending metadata".into())?;
+                }
+            }
             JobKind::Unpin { group } => {
                 self.engine.catalog.unpin(*group)?;
                 self.complete(job)?;

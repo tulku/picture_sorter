@@ -7,6 +7,7 @@ use crate::{
 use rusqlite::{OptionalExtension, params};
 #[derive(Debug, Clone)]
 pub enum SnapshotPayload {
+    Stored(super::StoredSnapshot),
     Content(Vec<u8>),
     File {
         file: std::sync::Arc<std::fs::File>,
@@ -62,10 +63,21 @@ impl<'a> VersionStore<'a> {
         Self { catalog, root }
     }
     pub fn record(&mut self, intent: SnapshotIntent) -> AppResult<VersionId> {
+        self.record_with_head(intent, true)
+    }
+    pub(crate) fn record_detached(&mut self, intent: SnapshotIntent) -> AppResult<VersionId> {
+        self.record_with_head(intent, false)
+    }
+    fn record_with_head(
+        &mut self,
+        intent: SnapshotIntent,
+        advance_head: bool,
+    ) -> AppResult<VersionId> {
         self.catalog
             .db
             .execute_batch(crate::catalog::schema::EDIT_SCHEMA)?;
         let body = match &intent.payload {
+            SnapshotPayload::Stored(stored) => stored.body(),
             SnapshotPayload::Content(bytes) => VersionBody::Content {
                 digest: Digest::of(bytes),
                 size: bytes.len() as u64,
@@ -118,6 +130,9 @@ impl<'a> VersionStore<'a> {
         )?;
         if recorded {
             return Ok(version);
+        }
+        if let SnapshotPayload::Stored(stored) = &intent.payload {
+            stored.register(self.root, self.catalog)?;
         }
         if let SnapshotPayload::Content(bytes) = &intent.payload {
             let digest = Digest::of(bytes);
@@ -194,7 +209,7 @@ impl<'a> VersionStore<'a> {
                 params![version.to_string(), parent.to_string()],
             )?;
         }
-        if intent.origin == VersionOrigin::Observed {
+        if intent.origin == VersionOrigin::Observed && advance_head {
             let previous: Option<String> = tx
                 .query_row(
                     "SELECT version FROM local_heads WHERE sidecar=?",
@@ -350,5 +365,37 @@ impl Catalog {
             .optional()?;
         id.map(|id| serde_json::from_str(&format!("\"{id}\"")).map_err(Into::into))
             .transpose()
+    }
+}
+
+impl Catalog {
+    pub fn managed_sidecar_id(&self, path: &ArchivePath) -> AppResult<SidecarId> {
+        validate_sidecar_path(path)?;
+        let mut query = self
+            .db
+            .prepare("SELECT id FROM sidecars WHERE path=? ORDER BY id LIMIT 2")?;
+        let ids = query
+            .query_map([path.as_str()], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if ids.len() > 1 {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "multiple sidecar identities claim this path; explicit association is required",
+            ));
+        }
+        if let Some(id) = ids.first() {
+            return Ok(serde_json::from_str(&format!("\"{id}\""))?);
+        }
+        let archive: Option<String> = self
+            .db
+            .query_row("SELECT id FROM archives LIMIT 1", [], |r| r.get(0))
+            .optional()?;
+        let Some(archive) = archive else {
+            return Ok(SidecarId::new());
+        };
+        let digest = blake3::hash(format!("sidecar-v1:{archive}:{}", path.as_str()).as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest.as_bytes()[..16]);
+        Ok(SidecarId(uuid::Uuid::from_bytes(bytes)))
     }
 }

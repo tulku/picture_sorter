@@ -49,3 +49,12 @@ pub fn offline_backup(config: &Config, destination: &Path) -> AppResult<()> {
     catalog.backup(destination)?;
     Ok(())
 }
+mod recovery;
+pub use recovery::{RecoveryReport, ServiceRecovery};
+mod local_transfer;
+mod scan;
+mod scheduler;
+pub use scheduler::*;
+mod http;
+mod observation;
+mod publication;

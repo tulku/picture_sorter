@@ -10,13 +10,13 @@ use std::{
     fs::File,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
-pub struct LocalWatcher<'a> {
-    root: &'a RootHandle,
+pub struct LocalWatcher {
+    root: RootHandle,
     fd: OwnedFd,
     directories: BTreeMap<i32, String>,
 }
-impl<'a> LocalWatcher<'a> {
-    pub fn open(root: &'a RootHandle) -> AppResult<Self> {
+impl LocalWatcher {
+    pub fn open(root: &RootHandle) -> AppResult<Self> {
         // The returned inotify descriptor is owned and nonblocking from creation.
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if fd < 0 {
@@ -25,7 +25,7 @@ impl<'a> LocalWatcher<'a> {
         // A successful inotify_init1 returns a newly owned descriptor.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let mut watcher = Self {
-            root,
+            root: root.try_clone()?,
             fd,
             directories: BTreeMap::new(),
         };

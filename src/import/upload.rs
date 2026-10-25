@@ -94,6 +94,10 @@ impl ImportCoordinator {
     }
 }
 impl UploadDriver {
+    pub fn active_job(&self) -> Option<JobId> {
+        self.active.as_ref().map(|active| active.job)
+    }
+
     pub fn advance(
         &mut self,
         engine: &mut ImportCoordinator,
@@ -275,12 +279,26 @@ impl UploadDriver {
                             engine.catalog.db.execute("INSERT INTO placements(id,group_id,path,digest,local_ready,archived) VALUES(?,?,?,?,?,1) ON CONFLICT(path,group_id) DO UPDATE SET archived=1",params![OperationId::new().to_string(),group.to_string(),active.item.destination.as_str(),active.item.digest.as_str(),active.item.local_ready])?;
                         }
                         let report = engine.report(active.job)?;
-                        if report.archive_committed == report.selected && report.conflicting == 0 {
+                        if report.archive_committed == report.selected
+                            && report.conflicting == 0
+                            && engine.scan_complete(active.job)?
+                        {
                             let generation = engine.catalog.job(active.job)?.generation;
                             engine.catalog.transition(
                                 active.job,
                                 generation,
                                 JobTransition::Archived,
+                            )?;
+                        }
+                        if report.waiting == 0
+                            && report.conflicting == 0
+                            && engine.scan_complete(active.job)?
+                        {
+                            let record = engine.catalog.job(active.job)?;
+                            engine.catalog.transition(
+                                active.job,
+                                record.generation,
+                                JobTransition::Ingested,
                             )?;
                         }
                         return engine.report(job);
@@ -367,7 +385,9 @@ fn prepare_plan(engine: &mut ImportCoordinator, active: &Active) -> AppResult<Pu
             },
         ]
     } else {
-        let sidecar = SidecarId::new();
+        let sidecar = engine
+            .catalog
+            .managed_sidecar_id(&active.item.destination)?;
         let version = Version {
             id: VersionId::new(),
             sidecar,

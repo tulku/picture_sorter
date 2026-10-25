@@ -19,6 +19,27 @@ use std::{
 const MAX_LINE: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasCommand {
+    LocalInventoryStart {
+        root: PathBuf,
+    },
+    LocalInventoryNext {
+        limit: usize,
+    },
+    WatchLocal {
+        root: PathBuf,
+    },
+    LocalEvents,
+    CaptureLocal {
+        local: PathBuf,
+        state: PathBuf,
+        path: crate::domain::ArchivePath,
+        kind: crate::edit::SidecarKind,
+        ceiling: u64,
+    },
+    LocalTransfer {
+        spec: TransferSpec,
+        destination: crate::domain::ArchivePath,
+    },
     RecoverArchive {
         root: PathBuf,
         archive: crate::domain::ArchiveId,
@@ -122,6 +143,13 @@ pub enum NasCommand {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasReply {
+    LocalFiles {
+        entries: Vec<LocalFile>,
+        end: bool,
+        skipped: u64,
+    },
+    LocalEvents(Vec<crate::edit::LocalEvent>),
+    Captured(crate::edit::SnapshotReceipt),
     ReadSession(OperationId),
     Integrity(crate::catalog::IntegrityReport),
     Inventory(ArchiveInventoryBatch),
@@ -141,6 +169,12 @@ pub enum NasReply {
     Published(PublicationReceipt),
     Projection(ProjectionOutcome),
     Done,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalFile {
+    pub path: crate::domain::ArchivePath,
+    pub size: u64,
+    pub role: crate::import::SourceRole,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerTicket(pub OperationId);
@@ -188,10 +222,16 @@ fn nonblocking(fd: RawFd) -> AppResult<()> {
 }
 impl WorkerSupervisor {
     pub fn new(executable: PathBuf, locks: Vec<OwnedFd>) -> AppResult<Self> {
+        Self::spawn(executable, locks, "--nas-worker")
+    }
+    pub fn new_local(executable: PathBuf, locks: Vec<OwnedFd>) -> AppResult<Self> {
+        Self::spawn(executable, locks, "--local-worker")
+    }
+    fn spawn(executable: PathBuf, locks: Vec<OwnedFd>, mode: &str) -> AppResult<Self> {
         let inherited = locks.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>();
         let mut command = Command::new(executable);
         command
-            .arg("--nas-worker")
+            .arg(mode)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -297,9 +337,6 @@ impl WorkerSupervisor {
         if self.pending != Some(ticket) {
             return Err(AppError::invalid("obsolete worker ticket"));
         }
-        if self.timed_out {
-            return Ok(WorkerState::TimedOutStillAlive);
-        }
         self.flush()?;
         let mut buffer = [0u8; 8192];
         loop {
@@ -328,10 +365,15 @@ impl WorkerSupervisor {
                 Err(e) => WorkerState::Failed(e),
             };
             self.pending = None;
+            self.timed_out = false;
             self.completed = Some((ticket, state.clone()));
             return Ok(state);
         }
-        Ok(WorkerState::Active)
+        Ok(if self.timed_out {
+            WorkerState::TimedOutStillAlive
+        } else {
+            WorkerState::Active
+        })
     }
 }
 impl Drop for WorkerSupervisor {
@@ -341,7 +383,14 @@ impl Drop for WorkerSupervisor {
     }
 }
 pub fn run_worker() -> AppResult<()> {
+    run_worker_mode(false)
+}
+pub fn run_local_worker() -> AppResult<()> {
+    run_worker_mode(true)
+}
+fn run_worker_mode(local_only: bool) -> AppResult<()> {
     let mut runtime = ArchiveRuntime::default();
+    let mut local_runtime = LocalRuntime::default();
     let input = std::io::stdin();
     let mut input = input.lock();
     let mut output = std::io::stdout().lock();
@@ -357,27 +406,31 @@ pub fn run_worker() -> AppResult<()> {
             return Err(AppError::invalid("oversized/incomplete worker command"));
         }
         let message: Message = serde_json::from_slice(&bytes)?;
-        let result = match message.command {
-            NasCommand::Inspect { root } => {
-                let device = std::fs::metadata(&root).map(|m| {
-                    use std::os::unix::fs::MetadataExt;
-                    m.dev()
-                });
-                device.map_err(Into::into).and_then(|device| {
-                    let root = RootHandle::open(
-                        &root,
-                        RootPolicy::Archive {
-                            expected_device: device,
-                        },
-                    )?;
-                    Ok(NasReply::Root {
-                        device,
-                        free: crate::fs::available_bytes(&root)?,
+        let result = if local_only {
+            local_runtime.execute(message.command)
+        } else {
+            match message.command {
+                NasCommand::Inspect { root } => {
+                    let device = std::fs::metadata(&root).map(|m| {
+                        use std::os::unix::fs::MetadataExt;
+                        m.dev()
+                    });
+                    device.map_err(Into::into).and_then(|device| {
+                        let root = RootHandle::open(
+                            &root,
+                            RootPolicy::Archive {
+                                expected_device: device,
+                            },
+                        )?;
+                        Ok(NasReply::Root {
+                            device,
+                            free: crate::fs::available_bytes(&root)?,
+                        })
                     })
-                })
+                }
+                NasCommand::Stage(spec) => TransferEngine::stage(&spec).map(NasReply::Staged),
+                command => runtime.execute(command),
             }
-            NasCommand::Stage(spec) => TransferEngine::stage(&spec).map(NasReply::Staged),
-            command => runtime.execute(command),
         };
         let reply = Reply {
             ticket: message.ticket,
@@ -693,5 +746,75 @@ impl ArchiveRuntime {
             ));
         }
         Ok((store, guard))
+    }
+}
+
+#[derive(Default)]
+struct LocalRuntime {
+    inventory: Option<crate::import::Inventory>,
+    watcher: Option<crate::edit::LocalWatcher>,
+}
+impl LocalRuntime {
+    fn execute(&mut self, command: NasCommand) -> AppResult<NasReply> {
+        match command {
+            NasCommand::CaptureLocal {
+                local,
+                state,
+                path,
+                kind,
+                ceiling,
+            } => {
+                let local = RootHandle::open(&local, RootPolicy::Local)?;
+                let state = RootHandle::open(&state, RootPolicy::Local)?;
+                Ok(NasReply::Captured(crate::edit::capture_local(
+                    &local, &state, &path, kind, ceiling,
+                )?))
+            }
+            NasCommand::LocalTransfer { spec, destination } => {
+                TransferEngine::local_transfer(&spec, &destination).map(NasReply::Staged)
+            }
+            NasCommand::LocalInventoryStart { root } => {
+                self.inventory = Some(crate::import::Inventory::open_all(
+                    RootHandle::open(&root, RootPolicy::Local)?,
+                    None,
+                )?);
+                Ok(NasReply::Done)
+            }
+            NasCommand::LocalInventoryNext { limit } => {
+                let inventory = self
+                    .inventory
+                    .as_mut()
+                    .ok_or_else(|| AppError::invalid("local inventory not started"))?;
+                let entries = inventory.next_batch(limit)?;
+                let end = entries.is_empty();
+                let entries = entries
+                    .into_iter()
+                    .map(|e| LocalFile {
+                        path: e.path,
+                        size: e.size,
+                        role: e.role,
+                    })
+                    .collect();
+                Ok(NasReply::LocalFiles {
+                    entries,
+                    end,
+                    skipped: inventory.skipped,
+                })
+            }
+            NasCommand::WatchLocal { root } => {
+                let root = RootHandle::open(&root, RootPolicy::Local)?;
+                self.watcher = Some(crate::edit::LocalWatcher::open(&root)?);
+                Ok(NasReply::Done)
+            }
+            NasCommand::LocalEvents => Ok(NasReply::LocalEvents(
+                self.watcher
+                    .as_mut()
+                    .ok_or_else(|| AppError::invalid("local watcher not started"))?
+                    .poll()?,
+            )),
+            _ => Err(AppError::invalid(
+                "local worker refuses archive/network commands",
+            )),
+        }
     }
 }

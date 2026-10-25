@@ -6,3 +6,34 @@ mod fetch;
 pub use fetch::*;
 mod ratings;
 pub use ratings::*;
+pub enum WriteProgress {
+    None,
+    Pending,
+    Finished(crate::error::AppResult<WriteOutcome>),
+}
+pub trait ImmichAccess {
+    fn origin(&self) -> &url::Url;
+    fn asset(&self, id: uuid::Uuid) -> crate::error::AppResult<AssetInfo>;
+    fn rating(&self, id: uuid::Uuid) -> crate::error::AppResult<crate::domain::RatingObservation> {
+        ratings::remote_rating(&self.asset(id)?)
+    }
+    fn outbound_enabled(&self) -> bool;
+    fn set_rating(&self, write: RatingWrite) -> crate::error::AppResult<WriteOutcome>;
+    fn write_progress(&self, _asset: uuid::Uuid) -> WriteProgress {
+        WriteProgress::None
+    }
+}
+impl ImmichAccess for ImmichClient {
+    fn origin(&self) -> &url::Url {
+        self.origin()
+    }
+    fn asset(&self, id: uuid::Uuid) -> crate::error::AppResult<AssetInfo> {
+        self.asset(id)
+    }
+    fn outbound_enabled(&self) -> bool {
+        self.outbound_enabled()
+    }
+    fn set_rating(&self, write: RatingWrite) -> crate::error::AppResult<WriteOutcome> {
+        self.set_rating(write)
+    }
+}

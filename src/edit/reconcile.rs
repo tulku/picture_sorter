@@ -1,6 +1,6 @@
 use super::*;
 use crate::{catalog::Catalog, domain::*, error::AppResult, fs::RootHandle};
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum LocalEvent {
     Changed(ArchivePath),
     RescanRequired,
@@ -182,8 +182,12 @@ impl EditTracker<'_> {
                     }
                     OwnerDecision::Unassociated => (None, "opaque-unassociated"),
                 };
-                self.catalog
-                    .register_sidecar(SidecarId::new(), group, entry.path, owner)?;
+                self.catalog.register_sidecar(
+                    self.catalog.managed_sidecar_id(&entry.path)?,
+                    group,
+                    entry.path,
+                    owner,
+                )?;
             }
         }
         Ok(())

@@ -44,6 +44,7 @@ pub fn serve(
 }
 #[derive(Clone)]
 pub struct RatingServerState {
+    pub checksum: std::sync::Arc<std::sync::Mutex<String>>,
     pub rating: std::sync::Arc<std::sync::Mutex<Option<i8>>>,
     pub version: std::sync::Arc<std::sync::Mutex<String>>,
     pub writes: std::sync::Arc<std::sync::Mutex<Vec<Option<i8>>>>,
@@ -69,6 +70,7 @@ impl RatingServer {
             url::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
         let asset = uuid::Uuid::new_v4();
         let state = RatingServerState {
+            checksum: Arc::new(Mutex::new("AAAAAAAAAAAAAAAAAAAAAAAAAAA=".into())),
             rating: Arc::new(Mutex::new(None)),
             version: Arc::new(Mutex::new("3.3.5".into())),
             writes: Arc::new(Mutex::new(Vec::new())),
@@ -140,6 +142,8 @@ impl RatingServer {
                         serde_json::from_str(include_str!("../fixtures/immich/asset.json"))
                             .unwrap();
                     asset_value["id"] = serde_json::json!(asset);
+                    asset_value["checksum"] =
+                        serde_json::json!(*worker_state.checksum.lock().unwrap());
                     asset_value["exifInfo"]["rating"] =
                         serde_json::json!(*worker_state.rating.lock().unwrap());
                     asset_value

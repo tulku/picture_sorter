@@ -4,6 +4,10 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum JobKind {
+    LocalTransfer {
+        parent: JobId,
+        item: JobId,
+    },
     ArchiveInit,
     RecoverLock {
         prior_owner_stopped: bool,

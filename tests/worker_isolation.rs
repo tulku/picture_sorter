@@ -93,3 +93,34 @@ fn cancel_uncertain_worker_keeps_reservation() {
         14
     );
 }
+#[test]
+fn exact_late_reply_can_confirm_same_worker_after_deadline() {
+    let r = support::TestRig::new();
+    let mut worker =
+        WorkerSupervisor::new(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+    unsafe {
+        libc::kill(worker.pid() as i32, libc::SIGSTOP);
+    };
+    let ticket = worker
+        .submit(NasCommand::Inspect { root: r.archive })
+        .unwrap();
+    worker.timeout(Duration::ZERO);
+    assert!(matches!(
+        worker.poll(ticket).unwrap(),
+        WorkerState::TimedOutStillAlive
+    ));
+    let pid = worker.pid();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGCONT);
+    };
+    let start = Instant::now();
+    loop {
+        if matches!(worker.poll(ticket).unwrap(), WorkerState::Completed(_)) {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(3));
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(worker.pid(), pid);
+    assert!(worker.available().unwrap());
+}

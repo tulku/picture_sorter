@@ -54,7 +54,7 @@ fn offline_capacity_pause_then_resume() {
     let progress = e.advance(report.job.unwrap()).unwrap();
     assert_eq!(progress.waiting, 1);
     assert_eq!(std::fs::read(r.source.join("a.ORF")).unwrap(), b"photo");
-    e.config.budget = 10000;
+    e.config.budget = 10_000_000;
     assert_eq!(drive(&mut e, report.job.unwrap()).local_ready, 1);
 }
 #[test]

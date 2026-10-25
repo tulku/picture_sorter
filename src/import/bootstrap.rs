@@ -456,7 +456,7 @@ impl<'a> BootstrapCoordinator<'a> {
                         let id = serde_json::from_str(&format!("\"{id}\""))?;
                         (id, self.catalog.heads(id)?)
                     } else {
-                        (SidecarId::new(), vec![])
+                        (self.catalog.managed_sidecar_id(&entry.path)?, vec![])
                     };
                     let body = VersionBody::Content {
                         digest: entry.digest.clone(),

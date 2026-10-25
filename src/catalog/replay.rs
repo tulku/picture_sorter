@@ -183,6 +183,10 @@ fn apply_record(db: &Connection, archive: &str, record: ArchiveRecord) -> AppRes
                 ));
             }
             db.execute("INSERT INTO conflicts(id,kind,group_id,details) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",params![id.to_string(),kind,expected.1,expected.2])?;
+            db.execute(
+                "INSERT INTO published_conflicts(id) VALUES(?) ON CONFLICT DO NOTHING",
+                [id.to_string()],
+            )?;
             if let Some(group) = group {
                 db.execute(
                     "UPDATE residency SET conflict=1,protected=1 WHERE group_id=?",
@@ -202,6 +206,7 @@ fn apply_record(db: &Connection, archive: &str, record: ArchiveRecord) -> AppRes
             db.execute("INSERT INTO metadata_cache(digest,extractor,metadata) VALUES(?,?,?) ON CONFLICT(digest,extractor) DO NOTHING",params![result.digest.as_str(),result.extractor,encode(&result)?])?;
         }
         ArchiveRecord::ProjectionPlanned { plan } => {
+            db.execute("INSERT INTO nas_projections(sidecar,version,applied) VALUES(?,?,0) ON CONFLICT(sidecar) DO UPDATE SET version=excluded.version,applied=0",params![plan.sidecar.to_string(),plan.version.to_string()])?;
             let sidecar = plan.sidecar.to_string();
             let (location, owner): (String, String) = db.query_row(
                 "SELECT path,owner FROM sidecars WHERE id=?",
@@ -318,6 +323,10 @@ fn apply_record(db: &Connection, archive: &str, record: ArchiveRecord) -> AppRes
                 return Err(AppError::integrity("sidecar identity reused"));
             }
             db.execute("INSERT INTO sidecars(id,group_id,path,owner) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",params![id.to_string(),expected.0,path.as_str(),owner])?;
+            db.execute(
+                "INSERT INTO published_sidecars(id) VALUES(?) ON CONFLICT DO NOTHING",
+                [id.to_string()],
+            )?;
         }
         ArchiveRecord::VersionAdded { version, operation } => {
             let old: Option<(String, String, String, String)> = db
@@ -439,6 +448,10 @@ fn apply_record(db: &Connection, archive: &str, record: ArchiveRecord) -> AppRes
                     group.map(|g| g.to_string()),
                     encode(&heads)?
                 ],
+            )?;
+            db.execute(
+                "INSERT INTO published_conflicts(id) VALUES(?) ON CONFLICT DO NOTHING",
+                [id.to_string()],
             )?;
             if let Some(group) = group {
                 db.execute(

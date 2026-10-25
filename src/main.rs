@@ -2,6 +2,16 @@ use clap::Parser;
 fn main() {
     if std::env::args_os()
         .nth(1)
+        .is_some_and(|arg| arg == "--local-worker")
+    {
+        if let Err(error) = photo_sorter::transfer::run_local_worker() {
+            eprintln!("{error}");
+            std::process::exit(5);
+        }
+        return;
+    }
+    if std::env::args_os()
+        .nth(1)
         .is_some_and(|arg| arg == "--nas-worker")
     {
         if let Err(error) = photo_sorter::transfer::run_worker() {

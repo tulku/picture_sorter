@@ -31,9 +31,38 @@ pub struct AssetInfo {
     pub checksum: String,
     pub exif_info: Option<ExifInfo>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ExifInfo {
     pub rating: Option<i8>,
+    pub rating_observed: bool,
+}
+impl<'de> Deserialize<'de> for ExifInfo {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("expected EXIF object"))?;
+        match object.get("rating") {
+            None => Ok(Self {
+                rating: None,
+                rating_observed: false,
+            }),
+            Some(value) => Ok(Self {
+                rating: serde_json::from_value(value.clone()).map_err(serde::de::Error::custom)?,
+                rating_observed: true,
+            }),
+        }
+    }
+}
+impl Serialize for ExifInfo {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(usize::from(self.rating_observed)))?;
+        if self.rating_observed {
+            map.serialize_entry("rating", &self.rating)?;
+        }
+        map.end()
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -156,16 +185,7 @@ impl ImmichClient {
         &self.origin
     }
     pub fn rating(&self, id: uuid::Uuid) -> AppResult<RatingObservation> {
-        let asset = self.asset(id)?;
-        let Some(exif) = asset.exif_info else {
-            return Ok(RatingObservation::Unobserved);
-        };
-        Ok(match exif.rating {
-            None => RatingObservation::Stars(Rating::try_from(0)?),
-            Some(n @ 1..=5) => RatingObservation::Stars(Rating::try_from(n as u8)?),
-            Some(-1) => RatingObservation::Rejected,
-            Some(n) => RatingObservation::Unsupported(format!("unsupported Immich rating {n}")),
-        })
+        super::ratings::remote_rating(&self.asset(id)?)
     }
 }
 pub fn parse_photo_url(value: &str, server: &Url) -> AppResult<uuid::Uuid> {

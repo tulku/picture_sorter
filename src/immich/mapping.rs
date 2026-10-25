@@ -7,7 +7,8 @@ use crate::{
 use rusqlite::{OptionalExtension, params};
 use std::path::{Component, Path, PathBuf};
 use url::Url;
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrefixMapping {
     pub source: PathBuf,
     pub target: Option<ArchivePath>,
@@ -96,7 +97,7 @@ pub struct PinResult {
 }
 pub struct PinCoordinator<'a> {
     pub catalog: &'a mut Catalog,
-    pub client: Option<&'a ImmichClient>,
+    pub client: Option<&'a dyn ImmichAccess>,
     pub origin: Url,
     pub mappings: &'a [PrefixMapping],
 }

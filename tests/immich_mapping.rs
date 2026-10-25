@@ -486,3 +486,15 @@ fn stalled_http_times_out_without_credentials_in_error() {
     assert!(!error.message.contains("isolated-fixture-key"));
     thread.join().unwrap();
 }
+#[test]
+fn missing_rating_field_is_unobserved_not_zero() {
+    let r = support::TestRig::new();
+    let mut value: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/immich/asset.json")).unwrap();
+    value["exifInfo"].as_object_mut().unwrap().remove("rating");
+    let asset = uuid::Uuid::parse_str(value["id"].as_str().unwrap()).unwrap();
+    let (origin, _requests, handle) = support::http::serve(200, value.to_string(), vec![]);
+    let client = ImmichClient::new(origin, &key(&r)).unwrap();
+    assert_eq!(client.rating(asset).unwrap(), RatingObservation::Unobserved);
+    handle.join().unwrap();
+}

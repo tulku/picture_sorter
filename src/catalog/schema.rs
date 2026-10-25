@@ -33,6 +33,7 @@ CREATE TABLE observations(path TEXT PRIMARY KEY,digest TEXT,size INTEGER,absent_
 PRAGMA user_version=1;
 "#;
 pub const IMPORT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS import_scans(job TEXT PRIMARY KEY REFERENCES jobs(id),complete INTEGER NOT NULL DEFAULT 0,skipped INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS import_items(id TEXT PRIMARY KEY,parent TEXT NOT NULL REFERENCES jobs(id),source_root TEXT NOT NULL,source_path TEXT NOT NULL,digest TEXT NOT NULL,size INTEGER NOT NULL,role TEXT NOT NULL,group_id TEXT,destination TEXT NOT NULL,state TEXT NOT NULL,local_ready INTEGER NOT NULL DEFAULT 0,archived INTEGER NOT NULL DEFAULT 0,warning INTEGER NOT NULL DEFAULT 0,UNIQUE(parent,source_path,digest));
 CREATE TABLE IF NOT EXISTS upload_plans(item TEXT PRIMARY KEY,plan TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS writer_sequences(writer TEXT PRIMARY KEY,sequence INTEGER NOT NULL);
@@ -52,6 +53,12 @@ CREATE TABLE IF NOT EXISTS pending_shared_records(operation TEXT PRIMARY KEY,rec
 "#;
 pub const RATING_AUTHORITY_SCHEMA: &str = "CREATE TABLE rating_authorities(group_id TEXT PRIMARY KEY REFERENCES groups(id),server TEXT NOT NULL,asset TEXT NOT NULL,FOREIGN KEY(server,asset) REFERENCES mappings(server,asset));";
 pub const BOOTSTRAP_SCHEMA: &str = r#"
+CREATE TABLE publication_revisions(source TEXT NOT NULL,revision INTEGER NOT NULL,operation TEXT NOT NULL UNIQUE,PRIMARY KEY(source,revision));
+CREATE TABLE publication_failures(source TEXT PRIMARY KEY,next_attempt INTEGER NOT NULL,failures INTEGER NOT NULL,reason TEXT NOT NULL);
+CREATE TABLE nas_projections(sidecar TEXT PRIMARY KEY REFERENCES sidecars(id),version TEXT NOT NULL REFERENCES versions(id),applied INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE published_sidecars(id TEXT PRIMARY KEY REFERENCES sidecars(id));
+CREATE TABLE published_conflicts(id TEXT PRIMARY KEY REFERENCES conflicts(id));
+CREATE TABLE sidecar_diagnostics(sidecar TEXT PRIMARY KEY REFERENCES sidecars(id),reason TEXT NOT NULL);
 CREATE TABLE job_results(job TEXT PRIMARY KEY REFERENCES jobs(id),result TEXT NOT NULL);
 CREATE TABLE publication_plans(operation TEXT PRIMARY KEY,plan TEXT NOT NULL);
 CREATE TABLE bootstrap_scans(job TEXT PRIMARY KEY REFERENCES jobs(id),request TEXT NOT NULL,report TEXT NOT NULL,pending TEXT);

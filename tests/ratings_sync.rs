@@ -414,3 +414,94 @@ fn unknown_initial_values_conflict() {
     assert_eq!(report.conflicts, 1);
     assert!(server.state.writes.lock().unwrap().is_empty());
 }
+#[test]
+fn prepared_rating_never_sends_after_group_conflict() {
+    let r = support::TestRig::new();
+    let server = support::http::RatingServer::new();
+    let (mut c, client, group) = setup(&r, &server);
+    let client = client.with_rating_policy(RatingWriteMode::BestEffort, evidence(&server));
+    let id = c
+        .prepare_rating_write(
+            group,
+            server.asset,
+            stars(0),
+            Rating::try_from(3).unwrap(),
+            OperationId::new(),
+            &server.origin,
+        )
+        .unwrap();
+    c.set_protection(group, false, true).unwrap();
+    let report = RatingSynchronizer {
+        catalog: &mut c,
+        client: &client,
+    }
+    .advance(id)
+    .unwrap();
+    assert!(report.waiting);
+    assert!(server.state.writes.lock().unwrap().is_empty());
+}
+#[test]
+fn newer_unsent_local_rating_supersedes_old_prepared_intent() {
+    let r = support::TestRig::new();
+    let server = support::http::RatingServer::new();
+    let (mut c, client, group) = setup(&r, &server);
+    let client = client.with_rating_policy(RatingWriteMode::BestEffort, evidence(&server));
+    let old = c
+        .prepare_rating_write(
+            group,
+            server.asset,
+            stars(0),
+            Rating::try_from(3).unwrap(),
+            OperationId::new(),
+            &server.origin,
+        )
+        .unwrap();
+    let new = c
+        .prepare_rating_write(
+            group,
+            server.asset,
+            stars(0),
+            Rating::try_from(5).unwrap(),
+            OperationId::new(),
+            &server.origin,
+        )
+        .unwrap();
+    let report = RatingSynchronizer {
+        catalog: &mut c,
+        client: &client,
+    }
+    .advance(old)
+    .unwrap();
+    assert!(!report.confirmed);
+    assert!(server.state.writes.lock().unwrap().is_empty());
+    assert!(
+        RatingSynchronizer {
+            catalog: &mut c,
+            client: &client
+        }
+        .advance(new)
+        .unwrap()
+        .confirmed
+    );
+    assert_eq!(*server.state.writes.lock().unwrap(), vec![Some(5)]);
+}
+#[test]
+fn reindexed_asset_cannot_supply_stars_to_old_mapping() {
+    let r = support::TestRig::new();
+    let server = support::http::RatingServer::new();
+    let (mut c, client, _group) = setup(&r, &server);
+    *server.state.checksum.lock().unwrap() = "changed-upstream-checksum".into();
+    let report = RatingSynchronizer {
+        catalog: &mut c,
+        client: &client,
+    }
+    .poll(RatingScope {
+        state_root: r.state,
+        editor_version: "1.6.6".into(),
+        after: None,
+        limit: 128,
+    })
+    .unwrap();
+    assert_eq!(report.observed, 0);
+    assert_eq!(report.conflicts, 1);
+}

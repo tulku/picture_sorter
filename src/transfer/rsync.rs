@@ -27,6 +27,7 @@ pub struct TransferSpec {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferReceipt {
+    pub transferred_bytes: u64,
     pub job: JobId,
     pub generation: u64,
     pub digest: Digest,
@@ -194,11 +195,86 @@ impl TransferEngine {
         dest.validate_identity()?;
         source.validate_identity()?;
         Ok(TransferReceipt {
+            transferred_bytes: size,
             job: spec.job,
             generation: spec.generation,
             digest,
             size,
             staged_path: spec.staged_path.clone(),
         })
+    }
+}
+pub fn publish_local(
+    root: &RootHandle,
+    receipt: &TransferReceipt,
+    destination: &ArchivePath,
+) -> AppResult<()> {
+    root.require_local()?;
+    if receipt.staged_path != staging_path(receipt.job, receipt.generation) {
+        return Err(AppError::integrity(
+            "local receipt staging ownership mismatch",
+        ));
+    }
+    if let Some((parent, _)) = destination.as_str().rsplit_once('/') {
+        root.mkdir_all(&ArchivePath::parse(parent)?)?;
+    }
+    if root.case_collision(destination)? {
+        return Err(AppError::new(
+            ErrorCode::Conflict,
+            "local case collision; bytes preserved",
+        ));
+    }
+    if crate::fs::publish_noreplace(root, &receipt.staged_path, destination)?
+        == crate::fs::PublishOutcome::Exists
+    {
+        let mut existing = root.open_relative(destination, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+        if digest_file(&mut existing)? != (receipt.digest.clone(), receipt.size) {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "different local bytes exist at destination; preserved",
+            ));
+        }
+    }
+    Ok(())
+}
+impl TransferEngine {
+    pub fn local_transfer(
+        spec: &TransferSpec,
+        destination: &ArchivePath,
+    ) -> AppResult<TransferReceipt> {
+        let dest = RootHandle::open(&spec.destination_root, RootPolicy::Local)?;
+        if let Some((parent, _)) = destination.as_str().rsplit_once('/') {
+            dest.mkdir_all(&ArchivePath::parse(parent)?)?;
+        }
+        if dest.case_collision(destination)? {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "local case collision; bytes preserved",
+            ));
+        }
+        match dest.open_relative(destination, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+            Ok(mut file) => {
+                if digest_file(&mut file)? != (spec.expected_digest.clone(), spec.expected_size) {
+                    return Err(AppError::new(
+                        ErrorCode::Conflict,
+                        "different local bytes at destination; preserved",
+                    ));
+                }
+                return Ok(TransferReceipt {
+                    transferred_bytes: 0,
+                    job: spec.job,
+                    generation: spec.generation,
+                    digest: spec.expected_digest.clone(),
+                    size: spec.expected_size,
+                    staged_path: spec.staged_path.clone(),
+                });
+            }
+            Err(e) if e.errno == Some(libc::ENOENT) => {}
+            Err(e) => return Err(e),
+        }
+        let source = RootHandle::open(&spec.source.root, RootPolicy::Local)?;
+        let receipt = Self::stage_confined(spec, &source, &dest)?;
+        publish_local(&dest, &receipt, destination)?;
+        Ok(receipt)
     }
 }

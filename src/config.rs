@@ -23,6 +23,8 @@ pub struct Config {
     pub json_ceiling: u64,
     pub import_timezone: String,
     pub immich: Option<ImmichConfig>,
+    pub immich_path_mappings: Vec<crate::immich::PrefixMapping>,
+    pub rapidraw_version: String,
     pub capability_evidence: Vec<PathBuf>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +54,8 @@ impl Default for Config {
             json_ceiling: 67_108_864,
             import_timezone: "UTC".into(),
             immich: None,
+            immich_path_mappings: vec![],
+            rapidraw_version: "1.6.6".into(),
             capability_evidence: vec![],
         }
     }

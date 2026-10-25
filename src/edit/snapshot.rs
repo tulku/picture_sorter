@@ -103,6 +103,7 @@ impl<'a> Snapshotter<'a> {
             }
         };
         let (body, invalid) = match &payload {
+            SnapshotPayload::Stored(stored) => (stored.body(), false),
             SnapshotPayload::Content(bytes) => (
                 VersionBody::Content {
                     digest: Digest::of(bytes),

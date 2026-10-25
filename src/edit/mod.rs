@@ -12,3 +12,6 @@ mod refresh;
 pub use refresh::*;
 mod rapidraw;
 pub use rapidraw::*;
+mod coherent;
+pub(crate) use coherent::capture_local;
+pub use coherent::{SnapshotReceipt, SnapshotStamp, StoredSnapshot, snapshot_path};
