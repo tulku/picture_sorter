@@ -257,8 +257,13 @@ impl MetadataExtractor for ExifToolExtractor {
                     .map(|v| (*v).clone())
                     .unwrap_or(serde_json::Value::Null),
             );
-            if matched.len() != 1 || metadata.raw.get("Error").is_some() || !status.success() {
-                metadata.error = Some("ExifTool failed or omitted source result".into());
+            if matched.len() != 1
+                || metadata.raw.get("Error").is_some()
+                || !status.success()
+                || metadata.capture_day.is_none()
+            {
+                metadata.error =
+                    Some("ExifTool failed, omitted source result, or has no capture date".into());
             }
             result.push(metadata);
         }
