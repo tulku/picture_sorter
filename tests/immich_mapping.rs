@@ -63,6 +63,7 @@ fn userinfo_or_redirect_no_secret_leak() {
 }
 fn asset(id: uuid::Uuid, path: &str) -> AssetInfo {
     AssetInfo {
+        is_favorite: None,
         id,
         kind: "IMAGE".into(),
         original_path: path.into(),

@@ -7,7 +7,16 @@ use crate::{
 use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct PickProbeDocuments {
+    pub picked: ArchivePath,
+    pub cleared: ArchivePath,
+    pub rejected: ArchivePath,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EditorProbeRequest {
+    #[serde(default)]
+    pub pick: Option<PickProbeDocuments>,
     pub isolated_root: PathBuf,
     pub version: String,
     pub before: ArchivePath,
@@ -79,6 +88,32 @@ pub fn qualify_rapidraw(request: EditorProbeRequest) -> AppResult<CapabilityRepo
             let pass = document.rating == RatingObservation::Stars(Rating::try_from(rating)?)
                 && document.non_rating() == base.non_rating();
             results.push(ProbeResult {name:name.into(),outcome:if pass {ProbeOutcome::Pass}else {ProbeOutcome::Fail},detail:"Exact non-rating fields, unknown fields and masks compared with the supplied baseline".into()});
+        }
+        if let Some(pick) = &request.pick {
+            for (name, path, flag) in [
+                ("save_pick", &pick.picked, crate::edit::PickFlag::Pick),
+                ("clear_pick", &pick.cleared, crate::edit::PickFlag::Neutral),
+                (
+                    "reject_priority",
+                    &pick.rejected,
+                    crate::edit::PickFlag::Reject,
+                ),
+            ] {
+                let document = adapter.inspect(&root.read(path, 64 * 1024 * 1024)?)?;
+                let pass = document.flag == flag
+                    && document.non_flag() == base.non_flag()
+                    && (flag != crate::edit::PickFlag::Reject
+                        || adapter.with_favorite(&document, true)? == document.source_bytes());
+                results.push(ProbeResult {
+                    name: name.into(),
+                    outcome: if pass {
+                        ProbeOutcome::Pass
+                    } else {
+                        ProbeOutcome::Fail
+                    },
+                    detail: "Native flags and all non-flag fields compared with baseline".into(),
+                });
+            }
         }
         let reset =
             adapter.inspect(&root.read(&request.regenerated_after_reset, 64 * 1024 * 1024)?)?;
@@ -180,5 +215,22 @@ impl EditorRuntimeIdentity {
                 version: &self.version,
                 fingerprint: &self.fingerprint,
             })
+    }
+    pub fn pick_decision(&self, config: &crate::config::Config) -> CapabilityDecision {
+        if config.rapidraw_version != self.version
+            || config.rapidraw_binary.as_ref() != Some(&self.binary)
+            || binary_stamp(&self.binary).ok() != Some(self.stamp)
+        {
+            return CapabilityDecision {
+                allowed: false,
+                reason: "editor executable identity changed; restart and requalify".into(),
+            };
+        }
+        super::load_registry(config).unwrap_or_default().allows(
+            OperationKind::EditorPickTransform {
+                version: &self.version,
+                fingerprint: &self.fingerprint,
+            },
+        )
     }
 }

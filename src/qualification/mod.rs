@@ -57,6 +57,15 @@ pub enum OperationKind<'a> {
         fingerprint: &'a Digest,
         mode: &'a crate::archive::PublicationMode,
     },
+    EditorPickTransform {
+        version: &'a str,
+        fingerprint: &'a Digest,
+    },
+    FavoriteWrite {
+        origin: &'a Url,
+        asset: uuid::Uuid,
+        version: &'a str,
+    },
     RatingWrite {
         origin: &'a Url,
         asset: uuid::Uuid,
@@ -77,12 +86,55 @@ pub fn rating_fingerprint(origin: &Url, version: &str) -> Digest {
         .as_bytes(),
     )
 }
+pub fn favorite_fingerprint(origin: &Url, version: &str) -> Digest {
+    Digest::of(
+        format!(
+            "immich-favorites-v1:{}:{version}",
+            origin.origin().ascii_serialization()
+        )
+        .as_bytes(),
+    )
+}
 impl CapabilityRegistry {
     pub fn new(reports: Vec<CapabilityReport>) -> Self {
         Self { reports }
     }
     pub fn allows(&self, operation: OperationKind<'_>) -> CapabilityDecision {
-        let (origin, asset, version) = match operation {
+        let (origin, asset, version, favorite) = match operation {
+            OperationKind::EditorPickTransform {
+                version,
+                fingerprint,
+            } => {
+                let allowed = self
+                    .allows(OperationKind::EditorTransform {
+                        version,
+                        fingerprint,
+                    })
+                    .allowed
+                    && self.reports.iter().any(|r| {
+                        r.schema_version == 1
+                            && r.capability == "rapidraw-transform"
+                            && r.tested_version == version
+                            && &r.config_fingerprint == fingerprint
+                            && matches!(r.scope, ProbeScope::EditorRuntime)
+                            && ["save_pick", "clear_pick", "reject_priority"]
+                                .iter()
+                                .all(|name| {
+                                    r.results.iter().any(|p| {
+                                        p.name == *name && matches!(p.outcome, ProbeOutcome::Pass)
+                                    })
+                                })
+                    });
+                return CapabilityDecision {
+                    allowed,
+                    reason: "native Pick runtime evidence required".into(),
+                };
+            }
+            OperationKind::FavoriteWrite {
+                origin,
+                asset,
+                version,
+            } => (origin, asset, version, true),
             OperationKind::EditorTransform {
                 version,
                 fingerprint,
@@ -123,17 +175,26 @@ impl CapabilityRegistry {
                 origin,
                 asset,
                 version,
-            } => (origin, asset, version),
+            } => (origin, asset, version, false),
             OperationKind::ArchiveWrite {
                 mount_identity,
                 fingerprint,
                 mode,
             } => return self.archive_decision(mount_identity, fingerprint, mode),
         };
-        let fingerprint = rating_fingerprint(origin, version);
+        let fingerprint = if favorite {
+            favorite_fingerprint(origin, version)
+        } else {
+            rating_fingerprint(origin, version)
+        };
         for report in &self.reports {
             if report.schema_version != 1
-                || report.capability != "immich-ratings"
+                || report.capability
+                    != if favorite {
+                        "immich-favorites"
+                    } else {
+                        "immich-ratings"
+                    }
                 || report.tested_version != version
                 || report.config_fingerprint != fingerprint
                 || report.results.is_empty()
@@ -320,10 +381,18 @@ pub fn report_qualified(request: &QualificationRequest, report: &CapabilityRepor
         QualificationRequest::Nas(r) => r,
         QualificationRequest::Immich(r) => {
             return CapabilityRegistry::new(vec![report.clone()])
-                .allows(OperationKind::RatingWrite {
-                    origin: &r.origin,
-                    asset: r.asset,
-                    version: &report.tested_version,
+                .allows(if r.favorites {
+                    OperationKind::FavoriteWrite {
+                        origin: &r.origin,
+                        asset: r.asset,
+                        version: &report.tested_version,
+                    }
+                } else {
+                    OperationKind::RatingWrite {
+                        origin: &r.origin,
+                        asset: r.asset,
+                        version: &report.tested_version,
+                    }
                 })
                 .allowed;
         }

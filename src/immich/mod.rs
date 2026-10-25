@@ -19,11 +19,23 @@ pub trait ImmichAccess {
     }
     fn outbound_enabled(&self) -> bool;
     fn set_rating(&self, write: RatingWrite) -> crate::error::AppResult<WriteOutcome>;
+    fn set_favorite(&self, _write: FavoriteWrite) -> crate::error::AppResult<FavoriteOutcome> {
+        Err(crate::error::AppError::new(
+            crate::error::ErrorCode::Unsupported,
+            "favorite writes unavailable",
+        ))
+    }
+    fn favorite_progress(&self, _asset: uuid::Uuid) -> FavoriteProgress {
+        FavoriteProgress::None
+    }
     fn write_progress(&self, _asset: uuid::Uuid) -> WriteProgress {
         WriteProgress::None
     }
 }
 impl ImmichAccess for ImmichClient {
+    fn set_favorite(&self, write: FavoriteWrite) -> crate::error::AppResult<FavoriteOutcome> {
+        self.set_favorite(write)
+    }
     fn origin(&self) -> &url::Url {
         self.origin()
     }
@@ -37,3 +49,6 @@ impl ImmichAccess for ImmichClient {
         self.set_rating(write)
     }
 }
+
+mod favorite_api;
+pub use favorite_api::*;

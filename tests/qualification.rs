@@ -264,6 +264,7 @@ fn editor_probe_compares_native_saves_and_detects_lost_unknown_fields() {
     )
     .unwrap();
     let request = EditorProbeRequest {
+        pick: None,
         isolated_root: scratch.clone(),
         version: "1.6.6".into(),
         before: ArchivePath::parse("before.json").unwrap(),
@@ -308,6 +309,7 @@ fn isolated_immich_probe_round_trips_and_restores_without_certifying_other_asset
     std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
     *server.state.rating.lock().unwrap() = Some(2);
     let request = ImmichProbeRequest {
+        favorites: false,
         origin: server.origin.clone(),
         key_file: key,
         asset: server.asset,
@@ -559,6 +561,7 @@ fn uncertain_isolated_asset_probe_never_blindly_retries_or_restores() {
     *server.state.rating.lock().unwrap() = Some(2);
     server.state.drop_put.store(true, Ordering::SeqCst);
     let report = qualify_immich(ImmichProbeRequest {
+        favorites: false,
         origin: server.origin.clone(),
         key_file: key,
         asset: server.asset,
@@ -655,4 +658,66 @@ fn different_machine_ids_on_one_kernel_boot_are_not_two_nas_clients() {
             .any(|r| r.name == "peer_handoff" && matches!(r.outcome, ProbeOutcome::Inconclusive))
     );
     assert!(!directory.join("peer.json").exists());
+}
+#[test]
+fn pick_transform_requires_native_flag_evidence_independent_of_stars() {
+    let r = support::TestRig::new();
+    let scratch = r._temp.path().join("pick-editor");
+    std::fs::create_dir(&scratch).unwrap();
+    let base = serde_json::json!({"version":1,"rating":0,"adjustments":{"masks":[1]},"future":9});
+    for (name, flag) in [("pick", "pick"), ("reject", "reject")] {
+        let mut value = base.clone();
+        value["flag"] = flag.into();
+        std::fs::write(scratch.join(name), serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    for (name, n) in [("base", 0), ("three", 3), ("five", 5)] {
+        let mut value = base.clone();
+        value["rating"] = n.into();
+        std::fs::write(scratch.join(name), serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    std::fs::write(
+        scratch.join("reset"),
+        include_bytes!("fixtures/rapidraw/default.json"),
+    )
+    .unwrap();
+    let binary = scratch.join("editor");
+    std::fs::write(&binary, b"fixture executable identity").unwrap();
+    let path = |s| ArchivePath::parse(s).unwrap();
+    let mut req = EditorProbeRequest {
+        isolated_root: scratch.clone(),
+        version: "1.6.6".into(),
+        before: path("base"),
+        three: path("three"),
+        five: path("five"),
+        zero: path("base"),
+        reopened: path("base"),
+        regenerated_after_reset: path("reset"),
+        runtime_binary: Some(binary),
+        runtime_saves_attested: true,
+        pick: None,
+    };
+    let report = qualify_rapidraw(req.clone()).unwrap();
+    let decision = |report: CapabilityReport| {
+        CapabilityRegistry::new(vec![report.clone()])
+            .allows(OperationKind::EditorPickTransform {
+                version: "1.6.6",
+                fingerprint: &report.config_fingerprint,
+            })
+            .allowed
+    };
+    assert!(!decision(report));
+    req.pick = Some(PickProbeDocuments {
+        picked: path("pick"),
+        cleared: path("base"),
+        rejected: path("reject"),
+    });
+    assert!(decision(qualify_rapidraw(req.clone()).unwrap()));
+    let mut corrupted = base;
+    corrupted["rating"] = 5.into();
+    std::fs::write(
+        scratch.join("base"),
+        serde_json::to_vec(&corrupted).unwrap(),
+    )
+    .unwrap();
+    assert!(!decision(qualify_rapidraw(req).unwrap()));
 }

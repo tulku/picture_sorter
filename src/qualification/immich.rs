@@ -12,6 +12,8 @@ pub struct ImmichProbeRequest {
     pub asset: uuid::Uuid,
     pub isolated_asset_confirmed: bool,
     pub fixture: bool,
+    #[serde(default)]
+    pub favorites: bool,
 }
 pub fn qualify_immich(request: ImmichProbeRequest) -> AppResult<CapabilityReport> {
     if !request.isolated_asset_confirmed || request.asset.is_nil() {
@@ -29,6 +31,9 @@ pub fn qualify_immich(request: ImmichProbeRequest) -> AppResult<CapabilityReport
         return Err(AppError::invalid(
             "fixture evidence requires an IP loopback origin",
         ));
+    }
+    if request.favorites {
+        return qualify_favorites(request);
     }
     let mut report=CapabilityReport {schema_version:1,capability:"immich-ratings".into(),backend_or_application:if request.fixture {"immich-fixture"}else {"immich"}.into(),tested_version:TESTED_VERSION.into(),mount_identity:None,config_fingerprint:rating_fingerprint(&request.origin,TESTED_VERSION),scope:if request.fixture {ProbeScope::FixtureAsset {origin:request.origin.to_string(),asset:request.asset}}else {ProbeScope::IsolatedRuntime {origin:request.origin.to_string(),asset:request.asset}},results:vec![],limitations:vec!["Immich has no conditional rating update; a concurrent user change can race a PUT. Only the explicitly isolated asset is mutated by this probe.".into()]};
     let execute = || -> AppResult<Vec<ProbeResult>> {
@@ -94,6 +99,94 @@ pub fn qualify_immich(request: ImmichProbeRequest) -> AppResult<CapabilityReport
             jpeg_checksum: initial.checksum,
         })?;
         results.push(ProbeResult {name:"restore_original".into(),outcome:if matches!(restored,WriteOutcome::Confirmed) {ProbeOutcome::Pass}else {ProbeOutcome::Fail},detail:"Restoration uses the last confirmed probe value as its precondition; non-CAS race remains".into()});
+        Ok(results)
+    };
+    report.results = match execute() {
+        Ok(results) => results,
+        Err(error) => vec![ProbeResult {
+            name: "runtime_probe".into(),
+            outcome: ProbeOutcome::Fail,
+            detail: error.to_string(),
+        }],
+    };
+    Ok(report)
+}
+
+fn qualify_favorites(request: ImmichProbeRequest) -> AppResult<CapabilityReport> {
+    if !request.isolated_asset_confirmed || request.asset.is_nil() {
+        return Err(AppError::invalid(
+            "probe requires an explicit isolated test asset and mutation confirmation",
+        ));
+    }
+    if request.fixture
+        && !match request.origin.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        }
+    {
+        return Err(AppError::invalid(
+            "fixture evidence requires an IP loopback origin",
+        ));
+    }
+    let mut report=CapabilityReport {schema_version:1,capability:"immich-favorites".into(),backend_or_application:if request.fixture {"immich-fixture"}else {"immich"}.into(),tested_version:TESTED_VERSION.into(),mount_identity:None,config_fingerprint:favorite_fingerprint(&request.origin,TESTED_VERSION),scope:if request.fixture {ProbeScope::FixtureAsset {origin:request.origin.to_string(),asset:request.asset}}else {ProbeScope::IsolatedRuntime {origin:request.origin.to_string(),asset:request.asset}},results:vec![],limitations:vec!["Immich has no conditional rating update; a concurrent user change can race a PUT. Only the explicitly isolated asset is mutated by this probe.".into()]};
+    let execute = || -> AppResult<Vec<ProbeResult>> {
+        let client = ImmichClient::new(request.origin.clone(), &request.key_file)?;
+        if client.server_info()?.version != TESTED_VERSION {
+            return Err(AppError::invalid(
+                "server version does not match the pinned profile",
+            ));
+        }
+        let initial = client.asset(request.asset)?;
+        if initial.kind != "IMAGE"
+            || !matches!(initial.original_mime_type.as_deref(), Some("image/jpeg"))
+        {
+            return Err(AppError::invalid(
+                "isolated probe asset must be a JPEG image",
+            ));
+        }
+        let original = initial
+            .is_favorite
+            .ok_or_else(|| AppError::invalid("favorite is unobserved"))?;
+        let mut expected = original;
+        let mut results = vec![ProbeResult {
+            name: "supported_schema".into(),
+            outcome: ProbeOutcome::Pass,
+            detail: "Pinned server and explicit JPEG identity observed".into(),
+        }];
+        for desired in [!original, original] {
+            let outcome = client.probe_favorite(FavoriteWrite {
+                asset: request.asset,
+                expected,
+                desired,
+                jpeg_checksum: initial.checksum.clone(),
+            })?;
+            if !matches!(outcome, FavoriteOutcome::Confirmed) {
+                results.push(ProbeResult {
+                    name: format!("favorite_{desired}"),
+                    outcome: ProbeOutcome::Fail,
+                    detail:
+                        "Uncertain or conflicting result; no blind retry or restoration attempted"
+                            .into(),
+                });
+                return Ok(results);
+            }
+            expected = desired;
+            results.push(ProbeResult {
+                name: format!("favorite_{desired}"),
+                outcome: ProbeOutcome::Pass,
+                detail:
+                    "Write or already-equal value confirmed by GET with unchanged JPEG checksum"
+                        .into(),
+            });
+        }
+        let restored = client.probe_favorite(FavoriteWrite {
+            asset: request.asset,
+            expected,
+            desired: original,
+            jpeg_checksum: initial.checksum,
+        })?;
+        results.push(ProbeResult {name:"restore_original".into(),outcome:if matches!(restored,FavoriteOutcome::Confirmed) {ProbeOutcome::Pass}else {ProbeOutcome::Fail},detail:"Restoration uses the last confirmed probe value as its precondition; non-CAS race remains".into()});
         Ok(results)
     };
     report.results = match execute() {

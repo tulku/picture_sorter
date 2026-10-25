@@ -45,6 +45,8 @@ pub fn serve(
 #[derive(Clone)]
 pub struct RatingServerState {
     pub checksum: std::sync::Arc<std::sync::Mutex<String>>,
+    pub favorite: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+    pub favorite_writes: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
     pub rating: std::sync::Arc<std::sync::Mutex<Option<i8>>>,
     pub version: std::sync::Arc<std::sync::Mutex<String>>,
     pub writes: std::sync::Arc<std::sync::Mutex<Vec<Option<i8>>>>,
@@ -72,6 +74,8 @@ impl RatingServer {
         let state = RatingServerState {
             checksum: Arc::new(Mutex::new("AAAAAAAAAAAAAAAAAAAAAAAAAAA=".into())),
             rating: Arc::new(Mutex::new(None)),
+            favorite: Arc::new(Mutex::new(Some(false))),
+            favorite_writes: Arc::new(Mutex::new(Vec::new())),
             version: Arc::new(Mutex::new("3.3.5".into())),
             writes: Arc::new(Mutex::new(Vec::new())),
             write_status: Arc::new(std::sync::atomic::AtomicU16::new(200)),
@@ -131,9 +135,17 @@ impl RatingServer {
                         }
 
                         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                        let rating = value["rating"].as_i64().map(|n| n as i8);
-                        *worker_state.rating.lock().unwrap() = rating;
-                        worker_state.writes.lock().unwrap().push(rating);
+                        assert_eq!(value.as_object().unwrap().len(), 1);
+                        if let Some(favorite) = value.get("isFavorite") {
+                            let favorite = favorite.as_bool().unwrap();
+                            *worker_state.favorite.lock().unwrap() = Some(favorite);
+                            worker_state.favorite_writes.lock().unwrap().push(favorite);
+                        } else {
+                            assert!(value.get("rating").is_some());
+                            let rating = value["rating"].as_i64().map(|n| n as i8);
+                            *worker_state.rating.lock().unwrap() = rating;
+                            worker_state.writes.lock().unwrap().push(rating);
+                        }
                         if worker_state.drop_put.swap(false, Ordering::SeqCst) {
                             continue;
                         }
@@ -146,6 +158,11 @@ impl RatingServer {
                         serde_json::json!(*worker_state.checksum.lock().unwrap());
                     asset_value["exifInfo"]["rating"] =
                         serde_json::json!(*worker_state.rating.lock().unwrap());
+                    if let Some(favorite) = *worker_state.favorite.lock().unwrap() {
+                        asset_value["isFavorite"] = serde_json::json!(favorite);
+                    } else {
+                        asset_value.as_object_mut().unwrap().remove("isFavorite");
+                    }
                     asset_value
                 };
                 let body = serde_json::to_string(&response).unwrap();
