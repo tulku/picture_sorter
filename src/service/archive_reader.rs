@@ -381,7 +381,7 @@ impl ArchiveReader {
                 let readiness = match &mut active.mode {
                     Mode::Sync => {
                         engine.catalog.drain_pending(128)?;
-                        engine.catalog.publication_readiness()?
+                        engine.catalog.journal_readiness()?
                     }
                     Mode::Verify { catalog, .. } | Mode::Rebuild { catalog, .. } => {
                         while catalog.drain_pending(128)? > 0 {}
@@ -454,6 +454,7 @@ impl ArchiveReader {
                 }
                 if end {
                     catalog.db.execute("UPDATE residency SET pin=0,protected=1,ready_revision=NULL,metadata_current=0",[])?;
+                    catalog.block_record("rebuild-incomplete","fresh shared replay and retained local reconciliation required before publication or eviction")?;
                     let path = ArchivePath::parse("recovery.json")?;
                     let bytes = serde_json::to_vec(report)?;
                     match root.write_new(&path, &bytes) {

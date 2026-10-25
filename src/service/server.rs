@@ -517,6 +517,8 @@ impl Runtime {
                 status.worker["publication_reason"] =
                     serde_json::to_value(&self.shared_publisher.reason)?;
                 status.watcher = serde_json::to_value(&self.observation.status)?;
+                status.watcher["physical_verification_reason"] =
+                    serde_json::to_value(&self.startup.reason)?;
                 data(serde_json::to_value(status)?)
             }
             Command::Import { source, strict } => {
@@ -875,8 +877,15 @@ impl Runtime {
         ) {
             self.observation.status.reason = Some(error.to_string());
         }
+        if timing.reconcile {
+            self.engine.catalog.queue_physical_checks()?;
+        }
         self.startup
             .advance(&mut self.engine, &mut self.maintenance)?;
+        self.engine.catalog.finalize_rebuild(
+            self.reader.completed_syncs > 0,
+            self.observation.status.startup_complete,
+        )?;
         self.worker.timeout(Duration::from_secs(5));
         if (self.reader.busy()
             || (self.control.is_none()

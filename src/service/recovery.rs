@@ -19,9 +19,9 @@ impl ServiceRecovery {
             [],
             |r| r.get(0),
         )?;
+        catalog.queue_physical_checks()?;
         let tx = catalog.db.transaction()?;
-        tx.execute("INSERT INTO startup_checks(placement,group_id,path,digest,size) SELECT p.id,p.group_id,p.path,p.digest,b.size FROM placements p JOIN blobs b ON b.digest=p.digest WHERE p.local_ready=1 ON CONFLICT DO NOTHING", [])?;
-        tx.execute("UPDATE placements SET local_ready=0", [])?;
+
         tx.execute("DELETE FROM pin_checks", [])?;
         tx.execute("DELETE FROM pin_sync_epochs", [])?;
         tx.commit()?;
@@ -36,6 +36,8 @@ impl ServiceRecovery {
 
 #[derive(Default)]
 pub(crate) struct StartupVerifier {
+    pub reason: Option<String>,
+    retry_at: crate::domain::Timestamp,
     active: Option<(
         crate::transfer::WorkerTicket,
         Vec<crate::catalog::VerifyObject>,
@@ -56,12 +58,33 @@ impl StartupVerifier {
                     return Ok(());
                 }
                 WorkerState::Completed(NasReply::Integrity(report)) => {
+                    let mut groups = std::collections::BTreeSet::new();
                     let tx = engine.catalog.db.transaction()?;
                     for object in objects {
-                        if !report.findings.iter().any(|f| f.path == object.path) {
-                            tx.execute("UPDATE placements SET local_ready=1 WHERE id IN(SELECT placement FROM startup_checks WHERE path=? AND digest=?) AND path=? AND digest=?", params![object.path.as_str(), object.digest.as_str(), object.path.as_str(), object.digest.as_str()])?;
+                        let mut query=tx.prepare("SELECT DISTINCT p.group_id FROM placements p JOIN startup_checks s ON s.placement=p.id WHERE s.path=? AND s.digest=?")?;
+                        for row in query.query_map(
+                            params![object.path.as_str(), object.digest.as_str()],
+                            |r| r.get::<_, String>(0),
+                        )? {
+                            groups.insert(row?);
+                        }
+                        drop(query);
+                        if let Some(finding) = report
+                            .findings
+                            .iter()
+                            .find(|finding| finding.path == object.path)
+                        {
+                            tx.execute(
+                                "UPDATE placements SET local_ready=0 WHERE path=? AND digest=?",
+                                params![object.path.as_str(), object.digest.as_str()],
+                            )?;
+                            tx.execute("INSERT INTO physical_findings(path,group_id,digest,size,status,reason) SELECT s.path,p.group_id,s.digest,s.size,?,? FROM startup_checks s JOIN placements p ON p.id=s.placement WHERE s.path=? AND s.digest=? ON CONFLICT(path) DO UPDATE SET group_id=excluded.group_id,digest=excluded.digest,size=excluded.size,status=excluded.status,reason=excluded.reason",params![format!("{:?}",finding.status),finding.reason,object.path.as_str(),object.digest.as_str()])?;
                         } else {
-                            tx.execute("UPDATE residency SET protected=1 WHERE group_id IN(SELECT group_id FROM startup_checks WHERE path=?)", [object.path.as_str()])?;
+                            tx.execute("UPDATE placements SET local_ready=1 WHERE id IN(SELECT placement FROM startup_checks WHERE path=? AND digest=?) AND path=? AND digest=?",params![object.path.as_str(),object.digest.as_str(),object.path.as_str(),object.digest.as_str()])?;
+                            tx.execute(
+                                "DELETE FROM physical_findings WHERE path=? AND digest=?",
+                                params![object.path.as_str(), object.digest.as_str()],
+                            )?;
                         }
                         tx.execute(
                             "DELETE FROM startup_checks WHERE path=? AND digest=?",
@@ -69,8 +92,18 @@ impl StartupVerifier {
                         )?;
                     }
                     tx.commit()?;
+                    for group in groups {
+                        engine
+                            .catalog
+                            .refresh_protection(serde_json::from_value(group.into())?)?;
+                    }
+                    self.reason = None;
                 }
-                WorkerState::Failed(error) => return Err(error),
+                WorkerState::Failed(error) => {
+                    self.reason = Some(error.to_string());
+                    self.retry_at = crate::domain::SystemClock::default().now() + 2;
+                    return Ok(());
+                }
                 _ => {
                     return Err(crate::error::AppError::integrity(
                         "unexpected startup verification reply",
@@ -78,7 +111,7 @@ impl StartupVerifier {
                 }
             }
         }
-        if !worker.available()? {
+        if crate::domain::SystemClock::default().now() < self.retry_at || !worker.available()? {
             return Ok(());
         }
         let mut query = engine.catalog.db.prepare(
@@ -110,5 +143,49 @@ impl StartupVerifier {
             self.active = Some((ticket, objects));
         }
         Ok(())
+    }
+}
+
+impl Catalog {
+    pub fn queue_physical_checks(&mut self) -> AppResult<()> {
+        let tx = self.db.transaction()?;
+        tx.execute("INSERT INTO startup_checks(placement,group_id,path,digest,size) SELECT p.id,p.group_id,p.path,p.digest,b.size FROM placements p JOIN blobs b ON b.digest=p.digest WHERE p.local_ready=1 OR p.archived=1 ON CONFLICT DO NOTHING",[])?;
+        tx.execute(
+            "UPDATE placements SET local_ready=0 WHERE id IN(SELECT placement FROM startup_checks)",
+            [],
+        )?;
+        tx.execute("UPDATE residency SET ready_revision=NULL,protected=1 WHERE group_id IN(SELECT group_id FROM startup_checks)",[])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn finalize_rebuild(
+        &mut self,
+        replay_current: bool,
+        local_complete: bool,
+    ) -> AppResult<bool> {
+        if !replay_current
+            || !local_complete
+            || !matches!(
+                self.journal_readiness()?,
+                crate::catalog::PublicationReadiness::Ready
+            )
+        {
+            return Ok(false);
+        }
+        let incomplete:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM startup_checks) OR EXISTS(SELECT 1 FROM capture_requests WHERE done=0) OR EXISTS(SELECT 1 FROM observations WHERE readable=0)",[],|r|r.get(0))?;
+        if incomplete {
+            return Ok(false);
+        }
+        let tx = self.db.transaction()?;
+        let cleared = tx.execute(
+            "DELETE FROM blocked_records WHERE id='rebuild-incomplete'",
+            [],
+        )?;
+        if cleared > 0 {
+            use crate::domain::Clock;
+            tx.execute("INSERT INTO recovery_finalizations(id,completed_at) VALUES('rebuild-incomplete',?) ON CONFLICT(id) DO UPDATE SET completed_at=excluded.completed_at",[crate::domain::SystemClock::default().now()])?;
+        }
+        tx.commit()?;
+        Ok(cleared > 0)
     }
 }

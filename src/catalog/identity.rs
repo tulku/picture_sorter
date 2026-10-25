@@ -144,6 +144,7 @@ pub(crate) fn merge(
             "import_items",
             "group_facts",
             "startup_checks",
+            "physical_findings",
         ] {
             db.execute(
                 &format!("UPDATE {table} SET group_id=? WHERE group_id=?"),

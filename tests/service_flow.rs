@@ -870,3 +870,148 @@ fn oversized_saved_opaque_content_archives_coherently_without_local_snapshot_dup
     assert_eq!(std::fs::read(&live).unwrap(), changed);
     assert_eq!(unsafe { libc::kill(observer, libc::SIGCONT) }, 0);
 }
+#[test]
+fn periodic_local_proofs_detect_missing_and_changed_originals_without_refetch() {
+    let service = ServiceFixture::with_config(|config, _| {
+        config.reconcile_seconds = 1;
+    });
+    assert!(service.cli(&["archive", "init"]).status.success());
+    std::fs::write(service.r.source.join("A.ORF"), b"raw").unwrap();
+    assert!(
+        service
+            .cli(&[
+                "import",
+                service.r.source.to_str().unwrap(),
+                "--wait-for",
+                "archived"
+            ])
+            .status
+            .success()
+    );
+    let status = service.status();
+    let group = status["groups"][0]["group"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let path = status["groups"][0]["group"]["members"][0]["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    std::fs::remove_file(service.r.local.join(&path)).unwrap();
+    let deadline = Instant::now();
+    loop {
+        let status = service.status();
+        let group = status["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["group"]["id"].as_str() == Some(&group))
+            .unwrap();
+        if group["readiness"]["originals_ready"] == false {
+            break;
+        }
+        assert!(
+            deadline.elapsed() < Duration::from_secs(5),
+            "periodic verification left a missing file ready"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert!(!service.r.local.join(&path).exists());
+    std::fs::write(service.r.local.join(&path), b"bad").unwrap();
+    let deadline = Instant::now();
+    loop {
+        let status = service.status();
+        let group = status["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["group"]["id"].as_str() == Some(&group))
+            .unwrap();
+        if group["physical_findings"]
+            .as_array()
+            .is_some_and(|findings| {
+                findings
+                    .iter()
+                    .any(|finding| finding["status"] == "Corrupt")
+            })
+        {
+            assert_eq!(group["protection"]["pending"], true);
+            break;
+        }
+        assert!(
+            deadline.elapsed() < Duration::from_secs(5),
+            "changed local bytes were not reported/protected"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert_eq!(std::fs::read(service.r.local.join(&path)).unwrap(), b"bad");
+    assert_eq!(
+        std::fs::read(service.r.archive.join(&path)).unwrap(),
+        b"raw"
+    );
+}
+#[test]
+fn rebuilt_profile_finishes_real_readonly_catchup_and_physical_reconciliation() {
+    let mut service = ServiceFixture::new();
+    assert!(service.cli(&["archive", "init"]).status.success());
+    std::fs::write(service.r.source.join("A.ORF"), b"retained raw").unwrap();
+    assert!(
+        service
+            .cli(&[
+                "import",
+                service.r.source.to_str().unwrap(),
+                "--wait-for",
+                "archived"
+            ])
+            .status
+            .success()
+    );
+    let replacement = service.r._temp.path().join("replacement-state");
+    std::fs::create_dir(&replacement).unwrap();
+    let out = service.cli(&["catalog", "rebuild", replacement.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let writer: WriterId =
+        serde_json::from_value(response["outcome"]["detail"]["writer"].clone()).unwrap();
+    let mut config = photo_sorter::config::Config::load(&service.profile).unwrap();
+    let old_writer = config.writer_id;
+    service.stop();
+    config.state_root = replacement.clone();
+    config.writer_id = writer;
+    std::fs::write(&service.profile, toml::to_string(&config).unwrap()).unwrap();
+    service.restart();
+    let deadline = Instant::now();
+    loop {
+        let db = rusqlite::Connection::open_with_flags(
+            replacement.join("catalog.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let complete:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM recovery_finalizations WHERE id='rebuild-incomplete') AND NOT EXISTS(SELECT 1 FROM blocked_records WHERE id='rebuild-incomplete')",[],|r|r.get(0)).unwrap();
+        if complete {
+            break;
+        }
+        assert!(
+            deadline.elapsed() < Duration::from_secs(8),
+            "rebuild never finished actual reconciliation: {}",
+            service.status()
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let status = service.status();
+    assert_eq!(status["groups"][0]["readiness"]["originals_ready"], true);
+    assert_eq!(status["writer_id"], serde_json::to_value(writer).unwrap());
+    assert_ne!(writer, old_writer);
+    let marker: photo_sorter::archive::ArchiveMarker = serde_json::from_slice(
+        &std::fs::read(service.r.archive.join(".photo-sorter/archive.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        marker.writer_id, old_writer,
+        "read-only reconciliation cannot silently take publication ownership"
+    );
+}

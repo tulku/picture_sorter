@@ -140,9 +140,15 @@ impl Catalog {
         Ok(ApplyOutcome::Applied)
     }
     pub fn publication_readiness(&self) -> AppResult<PublicationReadiness> {
+        self.shared_readiness(true)
+    }
+    pub fn journal_readiness(&self) -> AppResult<PublicationReadiness> {
+        self.shared_readiness(false)
+    }
+    fn shared_readiness(&self, include_rebuild_block: bool) -> AppResult<PublicationReadiness> {
         let mut reasons = Vec::new();
-        let mut q=self.db.prepare("SELECT reason FROM blocked_records UNION ALL SELECT 'missing dependency or unapplied record: '||id FROM commits WHERE applied=0")?;
-        for r in q.query_map([], |r| r.get::<_, String>(0))? {
+        let mut q=self.db.prepare("SELECT reason FROM blocked_records WHERE ? OR id<>'rebuild-incomplete' UNION ALL SELECT 'missing dependency or unapplied record: '||id FROM commits WHERE applied=0")?;
+        for r in q.query_map([include_rebuild_block], |r| r.get::<_, String>(0))? {
             reasons.push(r?);
         }
         Ok(if reasons.is_empty() {

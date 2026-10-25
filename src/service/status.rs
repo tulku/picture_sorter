@@ -85,7 +85,9 @@ impl StatusSnapshot {
             .map(|group| {
                 let readiness = catalog.readiness(group.id)?;
                 let protection = catalog.protection(group.id)?;
-                Ok(serde_json::json!({"group":group,"readiness":readiness,"protection":protection}))
+                let mut query=catalog.db.prepare("SELECT path,status,reason FROM physical_findings WHERE group_id=? ORDER BY path LIMIT 128")?;
+                let findings=query.query_map([group.id.to_string()],|r|Ok(serde_json::json!({"path":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"reason":r.get::<_,String>(2)?})))?.collect::<Result<Vec<_>,_>>()?;
+                Ok(serde_json::json!({"group":group,"readiness":readiness,"protection":protection,"physical_findings":findings}))
             })
             .collect::<AppResult<Vec<_>>>()?;
         let space=SpaceSnapshot{budget:engine.config.budget,reserve:engine.config.reserve,filesystem_free:available_bytes(local)?,exclusive_total,resident,metadata,staging:local_used.saturating_sub(resident),pinned:subset("r.pin=1")?,protected:subset("r.protected=1 OR r.conflict=1")?,evictable:subset("r.pin=0 AND r.protected=0 AND r.conflict=0")?,remaining_reservations:catalog.remaining_reservations(crate::storage::FilesystemId(local.device()))?,subset_note:"resident, staging and metadata describe occupancy; pinned/protected/evictable are overlapping resident subsets and must not be added to the exclusive total; eligibility is rechecked before deletion".into()};

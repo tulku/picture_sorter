@@ -529,3 +529,32 @@ fn coordinator_rejection_releases_confirmed_archive_session() {
     assert_eq!(std::fs::read(r.source.join("A.JPG")).unwrap(), b"jpeg");
     assert_eq!(engine.report(job).unwrap().archive_committed, 0);
 }
+#[test]
+fn recovery_block_clears_only_after_fresh_replay_and_complete_local_reconciliation() {
+    let r = TestRig::new();
+    let state = RootHandle::open(&r.state, RootPolicy::Local).unwrap();
+    let mut catalog = Catalog::open(&state).unwrap();
+    catalog
+        .block_record("rebuild-incomplete", "local reconciliation pending")
+        .unwrap();
+    assert!(!catalog.finalize_rebuild(false, true).unwrap());
+    assert!(!catalog.finalize_rebuild(true, false).unwrap());
+    catalog
+        .block_record("bad-shared-record", "unknown required operation")
+        .unwrap();
+    assert!(!catalog.finalize_rebuild(true, true).unwrap());
+    assert!(matches!(
+        catalog.publication_readiness().unwrap(),
+        PublicationReadiness::Blocked(_)
+    ));
+    let other = r._temp.path().join("clean-state");
+    std::fs::create_dir(&other).unwrap();
+    let mut clean = Catalog::open(&RootHandle::open(&other, RootPolicy::Local).unwrap()).unwrap();
+    clean.block_record("rebuild-incomplete", "pending").unwrap();
+    assert!(clean.finalize_rebuild(true, true).unwrap());
+    assert!(matches!(
+        clean.publication_readiness().unwrap(),
+        PublicationReadiness::Ready
+    ));
+    assert!(!clean.finalize_rebuild(true, true).unwrap());
+}
