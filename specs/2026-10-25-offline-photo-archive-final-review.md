@@ -16,3 +16,26 @@ Reviewer: fresh gpt-6-astra, high, read-only, no subagents. Range de1cffa6..134a
 - I11 Important: unconditional25-second foreground cutoff returns before requested milestone and drops refresh permission despite healthy long progress. server.rs:416, service/client.rs:28. Continue healthy waits, retain explicit unavailable/disconnect semantics, test >25-second progress.
 
 Repro helpers: /tmp/photo-review-probes.py and /tmp/photo-review-extra-probes.py; generated roots /tmp/photo-final-review-*. No personal roots/apps/credentials used. Reviewer did not rerun full suite or deployed qualification.
+
+## Required fix pass
+
+Implementer disposition, not a second independent review. All findings retain their accepted effect-based grades. No Minor findings were deferred and Declined to judge remains empty. Final implementation commit and final validation gates are recorded in the execution ledger.
+
+| Finding | Implemented correction | Regression evidence |
+|---|---|---|
+| C1 | Held physical mount coordinates reject exact/nested root aliases before marker creation, staging or publication; scratch isolation uses the same guard. | Real private bind-namespace worker regression. |
+| I1 | Readers and publishers persist enumeration blockers; only a complete successful namespace read can clear them. Readiness summaries cannot create self-sustaining unrelated findings. | Unexpected directory blocks actual clean; corrected enumeration recovers. |
+| I2 | Local audits use durable expected-residency receipts and root-scoped diagnostics; intentional eviction differs from unexpected loss. | Verify after clean succeeds; wrong local bytes remain protected despite good NAS audit; corrected exact bytes recover. |
+| I3 | Bounded worker audits cover local originals/history/observed projections and fresh-replayed NAS originals/history/current Content/Reset projections. | Current NAS projection corruption is detected without repair; real handler verification and saved-history flows. |
+| I4 | Strong stable reuse is enforced in the actual worker, with reuse-only authorization and no fallback allocation. Full owner reservation charges are excluded correctly on readmission. | Five repeat offline imports transfer no new bytes; vanished zero-byte-admitted destination cannot trigger unreserved copying. |
+| I5 | Bulk verification, occupancy and foreground application run through leased workers. Fresh epoch/age-bound admission and conservative reservation ceilings protect concurrent allocations. Application acknowledgments are short atomic transactions. | Fresh/stale/owner-charge proofs, paused-worker cancellation/status, actual worker metrics, injected acknowledgment failure and complete service flows. |
+| I6 | Durable stage-only mode fetches canonical immutable metadata, completes without a foreground editor assertion and supports no-wait. | Two real generated clients fetch saved history without RAW or live sidecar creation. |
+| I7 | Kernel peer liveness and coordinator authorization are checked at every worker file boundary; cancellation and loss of the socket prevent later effects. Affected-group captures serialize while unrelated saves proceed. | Socket-pair revocation without dropping local guard; actual worker refresh; group capture queue regression. |
+| I8 | Durable cursors cover every eligible group across catalog pages; pending physical checks are awaited. Applied receipts and real CLI continuation keep large results bounded. | Resident group beyond first128;130-receipt CLI pagination with no omissions/duplicates; durable actual worker receipt. |
+| I9 | Ordinary publication and typed head choices share owned-projection eligibility, including virtual native metadata/RAW XMP and excluding external JPEG XMP/hidden paths. | Virtual metadata choice creates projection; actual canonical NAS projection selection flow. |
+| I10 | Per-group oldest intents are selected fairly, retaining in-flight ownership and uncertain per-group ordering. | Blocked-first-group scheduler regression and actual later5-star loopback PUT/readback while retired server receives no writes. |
+| I11 | Valid foreground requests have no arbitrary server/client duration cutoff; incomplete requests retain their protection. | Actual32-second pending request, independent responsive status and positive same-worker resume. |
+
+Deployment qualification remains unrun for the actual NAS/mount, a second independent NAS client, installed editor native-save/reopen behavior, deployed Immich credentials/API/assets and existing Syncthing configuration. Fixture evidence does not enable those production capabilities. No personal data, deployed settings or installed services were mutated.
+
+Final implementer closure:8b1e75010c16f8ea831ad296a2869a6a41a261a1. All12 accepted findings addressed.349 automated tests passed with0 failures/ignored; strict Clippy, formatting/diff checks, release build, expanded isolated release CLI smoke and generated unit verification passed. No second independent re-review was requested or represented. Deferred minors:none. See the execution ledger for exact logs, watched RED→GREEN evidence and deployment qualifications remaining unrun.
