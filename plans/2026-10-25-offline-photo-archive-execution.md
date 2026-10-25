@@ -25,3 +25,7 @@ No unresolved cross-task specification conflicts found.
 
 Tooling: system rustup shim cannot execute generic Linux toolchain on NixOS. Found existing Nix Rust 1.99.0 components and merged sysroot; /tmp/photo-archive-env selects them without altering installed tools. Baseline cargo test --lib --offline: 20 passed.
 Task 01: in progress; BASE de1cffa; brief read. Dependency fetch pending.
+Task 01 RED: cargo test --test foundation --offline failed on absent config/domain/legacy binary; full output /tmp/photo-t01-red.log. GREEN: cargo test --test foundation --lib --offline, 24 passed; cargo test --all-targets --offline passed (legacy binary also tested). Nix toolchain selection lives only in /tmp/photo-archive-env. New CLI remains provisional until T19.
+Task 01: complete (commits de1cffa..6da9382; tests cargo test --all-targets --offline passed).
+Task 02: complete (commits 6da9382..1f059d9; RED absent fs module /tmp/photo-t02-red.log; GREEN cargo test --test filesystem --offline 5 passed; cargo test --all-targets --offline passed). Local primitive evidence only, no NAS qualification.
+Task 03: in progress; BASE 1f059d9; brief read; RED tests/catalog.rs absent catalog API.
