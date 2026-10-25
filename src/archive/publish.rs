@@ -284,3 +284,32 @@ pub fn history_path(digest: &Digest) -> AppResult<ArchivePath> {
     let hex = &digest.as_str()[7..];
     path(&format!(".photo-sorter/versions/{}/{}", &hex[..2], hex))
 }
+impl ArchiveStore {
+    pub fn store_history(&self, staged: &ArchivePath, digest: &Digest, size: u64) -> AppResult<()> {
+        self.validate()?;
+        if !staged.as_str().starts_with(".photo-sorter/staging/") {
+            return Err(AppError::invalid("history must come from hidden staging"));
+        }
+        let target = history_path(digest)?;
+        let mut source = self
+            .root
+            .open_relative(staged, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+        if digest_file(&mut source)? != (digest.clone(), size) {
+            return Err(AppError::integrity("history snapshot digest mismatch"));
+        }
+        let parent = target
+            .as_str()
+            .rsplit_once('/')
+            .ok_or_else(|| AppError::invalid("history parent missing"))?
+            .0;
+        self.root.mkdir_all(&path(parent)?)?;
+        if publish_noreplace(&self.root, staged, &target)? == PublishOutcome::Exists {
+            let mut existing = self.root.open_relative(&target, libc::O_RDONLY, 0)?;
+            if digest_file(&mut existing)? != (digest.clone(), size) {
+                return Err(AppError::integrity("corrupt immutable history exists"));
+            }
+        }
+        self.validate()?;
+        Ok(())
+    }
+}

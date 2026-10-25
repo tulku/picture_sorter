@@ -13,3 +13,45 @@ pub fn available_bytes(root: &RootHandle) -> AppResult<u64> {
         .checked_mul(st.f_frsize)
         .ok_or_else(|| AppError::invalid("free-space count overflow"))
 }
+pub fn occupied_bytes(root: &RootHandle) -> AppResult<u64> {
+    use std::os::fd::AsRawFd;
+    let mut stack = vec![(
+        std::fs::File::open(format!("/proc/self/fd/{}", root.fd()))?,
+        String::new(),
+    )];
+    let mut total = 0u64;
+    let mut seen = std::collections::HashSet::new();
+    while let Some((dir, prefix)) = stack.pop() {
+        for entry in std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| AppError::invalid("non-UTF-8 managed filename"))?;
+            let path = super::ArchivePath::parse(&format!("{prefix}{name}"))?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                stack.push((
+                    root.open_relative(&path, libc::O_RDONLY | libc::O_DIRECTORY, 0)?,
+                    format!("{}/", path.as_str()),
+                ));
+            } else if kind.is_file() {
+                let m = root
+                    .open_relative(&path, libc::O_RDONLY | libc::O_NONBLOCK, 0)?
+                    .metadata()?;
+                use std::os::unix::fs::MetadataExt;
+                if seen.insert((m.dev(), m.ino())) {
+                    total = total
+                        .checked_add(m.len())
+                        .ok_or_else(|| AppError::invalid("occupancy overflow"))?;
+                }
+            } else {
+                return Err(AppError::invalid(
+                    "symlink or special file in managed root; preserve and resolve before admission",
+                ));
+            }
+        }
+    }
+    root.validate_identity()?;
+    Ok(total)
+}

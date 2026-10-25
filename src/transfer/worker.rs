@@ -23,6 +23,19 @@ pub enum NasCommand {
         root: PathBuf,
     },
     Stage(TransferSpec),
+    StageArchive {
+        archive: crate::domain::ArchiveId,
+        writer: crate::domain::WriterId,
+        spec: TransferSpec,
+    },
+    StoreHistory {
+        root: PathBuf,
+        archive: crate::domain::ArchiveId,
+        writer: crate::domain::WriterId,
+        staged: crate::domain::ArchivePath,
+        digest: crate::domain::Digest,
+        size: u64,
+    },
     Initialize {
         root: PathBuf,
         request: InitArchive,
@@ -322,6 +335,50 @@ struct ArchiveRuntime {
 impl ArchiveRuntime {
     fn execute(&mut self, command: NasCommand) -> AppResult<NasReply> {
         match command {
+            NasCommand::StageArchive {
+                archive,
+                writer,
+                spec,
+            } => {
+                use std::os::unix::fs::MetadataExt;
+                let device = std::fs::metadata(&spec.destination_root)?.dev();
+                let store = ArchiveStore::open(
+                    RootHandle::open(
+                        &spec.destination_root,
+                        RootPolicy::Archive {
+                            expected_device: device,
+                        },
+                    )?,
+                    archive,
+                    writer,
+                )?;
+                let result = TransferEngine::stage(&spec)?;
+                store.validate()?;
+                Ok(NasReply::Staged(result))
+            }
+            NasCommand::StoreHistory {
+                root,
+                archive,
+                writer,
+                staged,
+                digest,
+                size,
+            } => {
+                use std::os::unix::fs::MetadataExt;
+                let device = std::fs::metadata(&root)?.dev();
+                let store = ArchiveStore::open(
+                    RootHandle::open(
+                        &root,
+                        RootPolicy::Archive {
+                            expected_device: device,
+                        },
+                    )?,
+                    archive,
+                    writer,
+                )?;
+                store.store_history(&staged, &digest, size)?;
+                Ok(NasReply::Done)
+            }
             NasCommand::Initialize { root, request } => {
                 let device = std::fs::metadata(&root).map(|m| {
                     use std::os::unix::fs::MetadataExt;

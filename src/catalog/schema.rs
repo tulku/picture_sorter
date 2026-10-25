@@ -30,3 +30,10 @@ CREATE TABLE blocked_records(id TEXT PRIMARY KEY,reason TEXT NOT NULL);
 CREATE TABLE observations(path TEXT PRIMARY KEY,digest TEXT,size INTEGER,absent_since INTEGER,readable INTEGER NOT NULL DEFAULT 1,tool_digest TEXT);
 PRAGMA user_version=1;
 "#;
+pub const IMPORT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS import_items(id TEXT PRIMARY KEY,parent TEXT NOT NULL REFERENCES jobs(id),source_root TEXT NOT NULL,source_path TEXT NOT NULL,digest TEXT NOT NULL,size INTEGER NOT NULL,role TEXT NOT NULL,group_id TEXT,destination TEXT NOT NULL,state TEXT NOT NULL,local_ready INTEGER NOT NULL DEFAULT 0,archived INTEGER NOT NULL DEFAULT 0,warning INTEGER NOT NULL DEFAULT 0,UNIQUE(parent,source_path,digest));
+CREATE TABLE IF NOT EXISTS upload_plans(item TEXT PRIMARY KEY,plan TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS writer_sequences(writer TEXT PRIMARY KEY,sequence INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS import_stats(job TEXT PRIMARY KEY REFERENCES jobs(id),selected INTEGER NOT NULL DEFAULT 0,recognized INTEGER NOT NULL DEFAULT 0,exif_calls INTEGER NOT NULL DEFAULT 0,transfer_bytes INTEGER NOT NULL DEFAULT 0,hash_bytes INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS group_facts(context TEXT NOT NULL,stem TEXT NOT NULL,camera TEXT NOT NULL,capture TEXT NOT NULL,group_id TEXT NOT NULL REFERENCES groups(id),PRIMARY KEY(context,stem,camera,capture));
+"#;

@@ -12,12 +12,14 @@ pub struct PairFacts {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PairEvidence {
+    ObservedPlacement { path: ArchivePath, digest: Digest },
     Compared { left: PairFacts, right: PairFacts },
     UserSelected { reason: String },
 }
 impl PairEvidence {
     pub fn validate(&self) -> AppResult<()> {
         let valid = match self {
+            Self::ObservedPlacement { .. } => true,
             Self::Compared { left, right } => {
                 left == right
                     && !left.context.is_empty()
@@ -85,6 +87,26 @@ pub(crate) fn merge(
         .collect::<AppResult<BTreeSet<_>>>()?;
     if canonical_ids.is_empty() {
         return Err(AppError::invalid("merge needs groups"));
+    }
+    if let PairEvidence::ObservedPlacement { path, digest } = evidence {
+        for id in &canonical_ids {
+            let count: u64 = db.query_row(
+                "SELECT count(*) FROM members WHERE group_id=?",
+                [id.to_string()],
+                |r| r.get(0),
+            )?;
+            let owns: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM members WHERE group_id=? AND path=? AND digest=?)",
+                params![id.to_string(), path.as_str(), digest.as_str()],
+                |r| r.get(0),
+            )?;
+            if count != 0 && !owns {
+                return Err(AppError::new(
+                    ErrorCode::Conflict,
+                    "placement identity cannot associate an unrelated nonempty group",
+                ));
+            }
+        }
     }
     let mut published = Vec::new();
     for id in &canonical_ids {
@@ -343,5 +365,22 @@ impl Catalog {
             params![pinned, conflict, id.to_string()],
         )?;
         Ok(())
+    }
+}
+impl Catalog {
+    pub fn group_batch(&self, after: Option<GroupId>, limit: usize) -> AppResult<Vec<Group>> {
+        if limit == 0 || limit > 128 {
+            return Err(AppError::invalid("group page must be 1..128"));
+        }
+        let mut query=self.db.prepare("SELECT id FROM groups WHERE id>? AND id NOT IN(SELECT alias FROM aliases) ORDER BY id LIMIT ?")?;
+        let ids = query
+            .query_map(
+                params![after.map(|id| id.to_string()).unwrap_or_default(), limit],
+                |r| r.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| self.group(decode(format!("\"{id}\""))?))
+            .collect()
     }
 }

@@ -1,6 +1,6 @@
 mod jobs;
 mod models;
-mod schema;
+pub(crate) mod schema;
 mod vfs;
 use crate::{
     domain::ArchivePath,
@@ -54,6 +54,7 @@ impl Catalog {
             }
             let tx = db.transaction()?;
             tx.execute_batch(schema::SCHEMA)?;
+            tx.execute_batch(schema::IMPORT_SCHEMA)?;
             tx.commit()?;
         }
         db.pragma_update(None, "journal_mode", "WAL")?;
