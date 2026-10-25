@@ -1,0 +1,15 @@
+[Unit]
+Description=Offline photo archive coordinator
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/photo_sorter --config @PROFILE@ service run
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

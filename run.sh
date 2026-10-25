@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")"
 
-src="/run/media/tulku/OM SYSTEM/"
-dst="/mnt/common/Camera/OM1-II/"
-
-if [[ ! -d "$src" ]]; then
-  echo "Camera not mounted: $src" >&2
-  exit 1
+if [[ $# -lt 2 ]]; then
+  echo "Usage: $0 /absolute/profile.toml /mounted/camera/path [import options]" >&2
+  exit 2
 fi
-if [[ ! -d "$dst" ]]; then
-  echo "Destination missing: $dst" >&2
-  exit 1
+profile=$1
+card=$2
+shift 2
+if [[ ! -f "$profile" ]]; then
+  echo "Explicit profile missing: $profile; initialize and review it first." >&2
+  exit 2
 fi
-
-cargo run --release -- --incremental "$src" "$dst"
-#cargo run --release -- --override "$src" "$dst"
+if [[ ! -d "$card" ]]; then
+  echo "Camera directory missing: $card" >&2
+  exit 3
+fi
+exec "${PHOTO_SORTER_BIN:-photo_sorter}" --config "$profile" import "$card" "$@"
