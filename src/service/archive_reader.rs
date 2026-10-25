@@ -13,6 +13,7 @@ use rusqlite::{OptionalExtension, params};
 pub(crate) struct ArchiveReader {
     active: Option<Active>,
     pub last_success: Option<Timestamp>,
+    pub completed_syncs: u64,
     pub reason: Option<String>,
     pub requested: bool,
     retry_at: Timestamp,
@@ -63,6 +64,18 @@ struct RebuildIntent {
     writer: WriterId,
 }
 impl ArchiveReader {
+    pub fn request_fresh_sync(&mut self) -> u64 {
+        self.requested = true;
+        self.retry_at = 0;
+        self.reason = None;
+        self.completed_syncs
+            + 1
+            + u64::from(
+                self.active
+                    .as_ref()
+                    .is_some_and(|a| matches!(a.mode, Mode::Sync)),
+            )
+    }
     pub fn busy(&self) -> bool {
         self.active.is_some()
     }
@@ -392,9 +405,14 @@ impl ArchiveReader {
                     Mode::Sync => {
                         if active.report.findings.is_empty() {
                             self.last_success = Some(now);
+                            self.completed_syncs += 1;
                             self.reason = None;
                         }
-                        self.retry_at = now + engine.config.poll_seconds;
+                        self.retry_at = if self.requested {
+                            now
+                        } else {
+                            now + engine.config.poll_seconds
+                        };
                         return Ok(());
                     }
                     Mode::Verify { .. } => {

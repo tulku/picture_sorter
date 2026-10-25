@@ -997,6 +997,29 @@ impl Runtime {
         }
         Ok(())
     }
+    fn pin_shared_fresh(&mut self, job: JobId) -> AppResult<bool> {
+        let required: Option<u64> = self
+            .engine
+            .catalog
+            .db
+            .query_row(
+                "SELECT required FROM pin_sync_epochs WHERE job=?",
+                [job.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let required = if let Some(required) = required {
+            required
+        } else {
+            let required = self.reader.request_fresh_sync();
+            self.engine.catalog.db.execute(
+                "INSERT INTO pin_sync_epochs(job,required) VALUES(?,?)",
+                params![job.to_string(), required],
+            )?;
+            required
+        };
+        Ok(self.reader.completed_syncs >= required)
+    }
     fn advance(&mut self, record: &JobRecord) -> AppResult<()> {
         let job = record.id;
         let config = self.engine.config.clone();
@@ -1052,6 +1075,7 @@ impl Runtime {
                 self.result(job, report)?;
             }
             JobKind::Pin { .. } => {
+                let fresh = self.pin_shared_fresh(job)?;
                 let readiness = self.fetch.advance(
                     &mut self.engine.catalog,
                     &config,
@@ -1060,12 +1084,15 @@ impl Runtime {
                     job,
                 )?;
                 self.result(job, &readiness)?;
-                if self.fetch.verified(job)
+                if fresh
+                    && self.fetch.verified(job)
                     && readiness.originals_ready
                     && readiness.metadata_current
                 {
                     self.complete(job)?;
-                } else if self.fetch.verified(job) && readiness.originals_ready {
+                } else if !fresh && self.reader.reason.is_some() {
+                    self.wait(job,JobState::WaitingNas,"originals remain usable; latest metadata waits for a fresh shared namespace read".into())?;
+                } else if fresh && self.fetch.verified(job) && readiness.originals_ready {
                     self.wait(job,JobState::WaitingApplication,"originals are resident; retained sidecars require foreground refresh --editor-closed".into())?;
                 }
             }
@@ -1121,6 +1148,7 @@ impl Runtime {
                         }
                     }
                 }
+                let fresh = self.pin_shared_fresh(job)?;
                 let readiness = self.fetch.advance(
                     &mut self.engine.catalog,
                     &config,
@@ -1129,12 +1157,15 @@ impl Runtime {
                     job,
                 )?;
                 self.result(job, &readiness)?;
-                if self.fetch.verified(job)
+                if fresh
+                    && self.fetch.verified(job)
                     && readiness.originals_ready
                     && readiness.metadata_current
                 {
                     self.complete(job)?;
-                } else if self.fetch.verified(job) && readiness.originals_ready {
+                } else if !fresh && self.reader.reason.is_some() {
+                    self.wait(job,JobState::WaitingNas,"originals remain usable; latest metadata waits for a fresh shared namespace read".into())?;
+                } else if fresh && self.fetch.verified(job) && readiness.originals_ready {
                     self.wait(job,JobState::WaitingApplication,"originals are resident; use foreground refresh --editor-closed for pending metadata".into())?;
                 }
             }

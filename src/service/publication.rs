@@ -421,6 +421,21 @@ fn prepare(engine: &mut ImportCoordinator, candidate: &Candidate) -> AppResult<V
             )?;
             records = serde_json::from_str(&text)?;
             for record in records.clone() {
+                if let ArchiveRecord::MappingRecorded {
+                    path,
+                    digest,
+                    group,
+                    ..
+                } = &record
+                {
+                    let archived:bool=engine.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM placements WHERE group_id=? AND path=? AND digest=? AND archived=1)",params![group.to_string(),path.as_str(),digest.as_str()],|r|r.get(0))?;
+                    if !archived {
+                        return Err(AppError::new(
+                            ErrorCode::Unavailable,
+                            "shared mapping waits for exact original archival evidence",
+                        ));
+                    }
+                }
                 if let ArchiveRecord::AmbiguityResolved { request } = record {
                     let conflict = engine
                         .catalog

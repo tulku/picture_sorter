@@ -23,6 +23,7 @@ impl ServiceRecovery {
         tx.execute("INSERT INTO startup_checks(placement,group_id,path,digest,size) SELECT p.id,p.group_id,p.path,p.digest,b.size FROM placements p JOIN blobs b ON b.digest=p.digest WHERE p.local_ready=1 ON CONFLICT DO NOTHING", [])?;
         tx.execute("UPDATE placements SET local_ready=0", [])?;
         tx.execute("DELETE FROM pin_checks", [])?;
+        tx.execute("DELETE FROM pin_sync_epochs", [])?;
         tx.commit()?;
         catalog.db.execute("UPDATE residency SET ready_revision=NULL,metadata_current=0,protected=1 WHERE group_id IN(SELECT group_id FROM startup_checks)",[])?;
         Ok(RecoveryReport {

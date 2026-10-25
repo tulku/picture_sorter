@@ -616,3 +616,35 @@ fn source_companion_has_verified_owner_and_orphan_has_resolvable_conflict() {
             .any(|c| c["kind"] == "orphan_sidecar")
     );
 }
+#[test]
+fn cached_pin_requires_fresh_shared_namespace_before_latest_ready() {
+    let service = ServiceFixture::new();
+    assert!(service.cli(&["archive", "init"]).status.success());
+    std::fs::write(service.r.source.join("A.JPG"), b"jpeg").unwrap();
+    assert!(
+        service
+            .cli(&[
+                "import",
+                service.r.source.to_str().unwrap(),
+                "--wait-for",
+                "archived"
+            ])
+            .status
+            .success()
+    );
+    let status = service.status();
+    let group = status["groups"][0]["group"]["id"].as_str().unwrap();
+    std::fs::rename(&service.r.archive, service.r._temp.path().join("offline")).unwrap();
+    let out = service.cli(&["pin", group]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        service.status()["groups"][0]["readiness"]["originals_ready"]
+            .as_bool()
+            .unwrap()
+    );
+}

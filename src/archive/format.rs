@@ -81,6 +81,8 @@ pub enum ArchiveRecord {
         version: VersionId,
     },
     MappingRecorded {
+        remote_checksum: String,
+        external_path: String,
         server: String,
         asset: uuid::Uuid,
         library: Option<uuid::Uuid>,

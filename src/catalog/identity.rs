@@ -141,11 +141,60 @@ pub(crate) fn merge(
             "conflicts",
             "rating_observations",
             "rating_intents",
+            "import_items",
+            "group_facts",
+            "startup_checks",
         ] {
             db.execute(
                 &format!("UPDATE {table} SET group_id=? WHERE group_id=?"),
                 params![winner, old],
             )?;
+        }
+        for table in ["rating_baselines", "rating_authorities"] {
+            let old_row:Option<String>=db.query_row(&format!("SELECT json_object({}) FROM {table} WHERE group_id=?",if table=="rating_baselines" {"'common',common,'applied_local',applied_local,'pending',pending,'pending_version',pending_version,'source_version',source_version,'remote_observation',remote_observation"} else {"'server',server,'asset',asset"}),[&old],|r|r.get(0)).optional()?;
+            if let Some(payload) = old_row {
+                let exists: bool = db.query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE group_id=?)"),
+                    [&winner],
+                    |r| r.get(0),
+                )?;
+                if !exists {
+                    db.execute(
+                        &format!("UPDATE {table} SET group_id=? WHERE group_id=?"),
+                        params![winner, old],
+                    )?;
+                } else {
+                    db.execute("INSERT INTO merged_rating_evidence(group_id,original_group,kind,payload) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",params![winner,old,table,payload])?;
+                    if table == "rating_baselines" {
+                        let current:String=db.query_row("SELECT json_object('common',common,'applied_local',applied_local,'pending',pending,'pending_version',pending_version,'source_version',source_version,'remote_observation',remote_observation) FROM rating_baselines WHERE group_id=?",[&winner],|r|r.get(0))?;
+                        if current != payload {
+                            db.execute("INSERT INTO merged_rating_evidence(group_id,original_group,kind,payload) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",params![winner,winner,table,current])?;
+                            db.execute("INSERT INTO conflicts(id,kind,group_id,details) VALUES(?,'rating',?,?)",params![ConflictId::new().to_string(),winner,encode(&serde_json::json!({"reason":"associated groups have different rating baselines","retained":[winner,old]}))?])?;
+                            db.execute(
+                                "UPDATE residency SET conflict=1,protected=1 WHERE group_id=?",
+                                [&winner],
+                            )?;
+                            db.execute("DELETE FROM rating_baselines WHERE group_id=?", [&winner])?;
+                        }
+                    }
+                    if table == "rating_authorities" {
+                        let previous: serde_json::Value = serde_json::from_str(&payload)?;
+                        let current: (String, String) = db.query_row(
+                            "SELECT server,asset FROM rating_authorities WHERE group_id=?",
+                            [&winner],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )?;
+                        if previous["server"] != current.0 || previous["asset"] != current.1 {
+                            let details = serde_json::json!({"server":current.0,"assets":[current.1,previous["asset"]],"other_server":previous["server"]});
+                            db.execute("INSERT INTO conflicts(id,kind,group_id,details) VALUES(?,'rating_authority',?,?)",params![ConflictId::new().to_string(),winner,encode(&details)?])?;
+                            db.execute(
+                                "UPDATE residency SET conflict=1,protected=1 WHERE group_id=?",
+                                [&winner],
+                            )?;
+                        }
+                    }
+                }
+            }
         }
         db.execute("UPDATE residency SET pin=max(pin,(SELECT pin FROM residency WHERE group_id=?)),protected=max(protected,(SELECT protected FROM residency WHERE group_id=?)),conflict=max(conflict,(SELECT conflict FROM residency WHERE group_id=?)),metadata_current=0,ready_revision=NULL WHERE group_id=?",params![old,old,old,winner])?;
         let left: Option<String> = db.query_row(
@@ -161,6 +210,14 @@ pub(crate) fn merge(
             db.execute(
                 "UPDATE residency SET conflict=1 WHERE group_id=?",
                 [&winner],
+            )?;
+            db.execute(
+                "INSERT INTO conflicts(id,kind,group_id,details) VALUES(?,'primary_raw',?,?)",
+                params![
+                    ConflictId::new().to_string(),
+                    winner,
+                    encode(&serde_json::json!({"candidates":[left,right]}))?
+                ],
             )?;
             db.execute("UPDATE groups SET primary_raw=NULL WHERE id=?", [&winner])?;
         } else if left.is_none() {
@@ -411,5 +468,55 @@ impl Catalog {
             .next()
             .map(|id| decode(format!("\"{id}\"")))
             .transpose()
+    }
+}
+#[cfg(test)]
+mod rating_merge_tests {
+    use super::*;
+    #[test]
+    fn merge_transfers_losing_rating_baseline_and_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::fs::RootHandle::open(dir.path(), crate::fs::RootPolicy::Local).unwrap();
+        let mut catalog = Catalog::open(&root).unwrap();
+        let a = catalog.create_group(true).unwrap();
+        let b = catalog.create_group(true).unwrap();
+        let winner = a.min(b);
+        let loser = a.max(b);
+        let asset = uuid::Uuid::new_v4().to_string();
+        catalog.db.execute("INSERT INTO mappings(server,asset,path,group_id) VALUES('https://fixture.example',?,'a.JPG',?)",params![asset,loser.to_string()]).unwrap();
+        catalog.db.execute("INSERT INTO rating_authorities(group_id,server,asset) VALUES(?,'https://fixture.example',?)",params![loser.to_string(),asset]).unwrap();
+        catalog.db.execute("INSERT INTO rating_baselines(group_id,common,applied_local,pending) VALUES(?,'3','3',5)",[loser.to_string()]).unwrap();
+        assert_eq!(
+            catalog
+                .merge_groups(
+                    &[a, b],
+                    PairEvidence::UserSelected {
+                        reason: "isolated merge".into()
+                    }
+                )
+                .unwrap(),
+            winner
+        );
+        let pending: Option<u8> = catalog
+            .db
+            .query_row(
+                "SELECT pending FROM rating_baselines WHERE group_id=?",
+                [winner.to_string()],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        assert_eq!(pending, Some(5));
+        let chosen: Option<String> = catalog
+            .db
+            .query_row(
+                "SELECT asset FROM rating_authorities WHERE group_id=?",
+                [winner.to_string()],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(chosen, Some(asset));
     }
 }

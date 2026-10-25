@@ -195,7 +195,13 @@ impl Inventory {
                 self.skip("hidden entry excluded");
                 continue;
             }
-            let path = path_from_os(std::ffi::OsStr::new(&format!("{prefix}{name}")))?;
+            let path = match path_from_os(std::ffi::OsStr::new(&format!("{prefix}{name}"))) {
+                Ok(path) => path,
+                Err(_) => {
+                    self.skip("non-portable filename; rename before import");
+                    continue;
+                }
+            };
             let kind = entry.file_type()?;
             if kind.is_dir() {
                 let dir = self

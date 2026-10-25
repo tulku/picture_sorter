@@ -137,6 +137,22 @@ impl Catalog {
         }
         let member = &candidates[0];
         self.db.execute("INSERT INTO mappings(server,asset,library,path,digest,group_id,remote_checksum,external_path) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(server,asset) DO NOTHING",params![origin.origin().ascii_serialization(),asset.id.to_string(),asset.library_id.map(|id|id.to_string()),member.path.as_str(),member.digest.as_str(),group.to_string(),asset.checksum,asset.original_path])?;
+        let records = vec![crate::archive::ArchiveRecord::MappingRecorded {
+            server: origin.origin().ascii_serialization(),
+            asset: asset.id,
+            library: asset.library_id,
+            path: member.path.clone(),
+            digest: member.digest.clone(),
+            group,
+            remote_checksum: asset.checksum.clone(),
+            external_path: asset.original_path.clone(),
+        }];
+        let encoded = serde_json::to_string(&records)?;
+        let digest = blake3::hash(encoded.as_bytes());
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(&digest.as_bytes()[..16]);
+        let operation = OperationId(uuid::Uuid::from_bytes(bytes));
+        self.db.execute("INSERT INTO pending_shared_records(operation,records) VALUES(?,?) ON CONFLICT DO NOTHING",params![operation.to_string(),encoded])?;
 
         Ok(())
     }
@@ -282,5 +298,49 @@ impl Catalog {
         }
         tx.commit()?;
         Ok(())
+    }
+}
+#[cfg(test)]
+mod reconstruction_tests {
+    use super::*;
+    #[test]
+    fn verified_asset_binding_queues_full_shared_identity_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::fs::RootHandle::open(dir.path(), crate::fs::RootPolicy::Local).unwrap();
+        let mut catalog = Catalog::open(&root).unwrap();
+        let group = catalog.create_group(true).unwrap();
+        let member = OriginalMember {
+            path: ArchivePath::parse("a.JPG").unwrap(),
+            digest: Digest::of(b"jpeg"),
+            size: 4,
+            role: MediaRole::Jpeg,
+        };
+        catalog
+            .attach_member(
+                group,
+                member,
+                PairEvidence::ObservedPlacement {
+                    path: ArchivePath::parse("a.JPG").unwrap(),
+                    digest: Digest::of(b"jpeg"),
+                },
+            )
+            .unwrap();
+        let asset: AssetInfo =
+            serde_json::from_str(include_str!("../../tests/fixtures/immich/asset.json")).unwrap();
+        let origin = Url::parse("https://fixture.example").unwrap();
+        catalog.bind_asset(&origin, &asset, group).unwrap();
+        catalog.bind_asset(&origin, &asset, group).unwrap();
+        let rows: Vec<String> = catalog
+            .db
+            .prepare("SELECT records FROM pending_shared_records")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let records: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+        assert_eq!(records[0]["external_path"], asset.original_path);
+        assert_eq!(records[0]["remote_checksum"], asset.checksum);
     }
 }

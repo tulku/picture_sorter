@@ -185,3 +185,20 @@ fn actual_exiftool_literal_path_error_is_captured() {
     assert!(results[0].error.is_some());
     assert_eq!(results[0].digest, Digest::of(b"invalid raw fixture"));
 }
+#[test]
+fn nonportable_source_name_does_not_stop_independent_import() {
+    let r = support::TestRig::new();
+    std::fs::write(r.source.join("bad:name.JPG"), b"preserve").unwrap();
+    std::fs::write(r.source.join("good.JPG"), b"good").unwrap();
+    let mut inventory = photo_sorter::import::Inventory::open(
+        photo_sorter::fs::RootHandle::open(&r.source, photo_sorter::fs::RootPolicy::Local).unwrap(),
+    )
+    .unwrap();
+    let entries = inventory.next_batch(128).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(inventory.skipped, 1);
+    assert_eq!(
+        std::fs::read(r.source.join("bad:name.JPG")).unwrap(),
+        b"preserve"
+    );
+}

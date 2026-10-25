@@ -1,6 +1,14 @@
 use super::*;
 use crate::{archive::*, domain::*};
 use rusqlite::{OptionalExtension, params};
+type SharedAssetBinding = (
+    Option<String>,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+);
 #[derive(Debug, PartialEq, Eq)]
 pub enum ApplyOutcome {
     Applied,
@@ -488,6 +496,8 @@ fn apply_record(
             if db.execute("UPDATE conflicts SET resolved=1,revision=revision+1 WHERE id=? AND revision=? AND resolved=0",params![id.to_string(),expected_revision])?!=1{return Err(AppError::integrity("resolution precondition mismatch"));}
         }
         ArchiveRecord::MappingRecorded {
+            remote_checksum,
+            external_path,
             server,
             asset,
             library,
@@ -500,7 +510,21 @@ fn apply_record(
             if !matches {
                 return Err(AppError::integrity("mapping identity mismatch"));
             }
-            db.execute("INSERT INTO mappings(server,asset,library,path,digest,group_id) VALUES(?,?,?,?,?,?)",params![server,asset.to_string(),library.map(|l|l.to_string()),path.as_str(),digest.as_str(),group.to_string()])?;
+            let old:Option<SharedAssetBinding>=db.query_row("SELECT library,path,digest,group_id,remote_checksum,external_path FROM mappings WHERE server=? AND asset=?",params![server,asset.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+            let expected = (
+                library.map(|l| l.to_string()),
+                path.as_str().to_owned(),
+                Some(digest.as_str().to_owned()),
+                group.to_string(),
+                remote_checksum.clone(),
+                external_path.clone(),
+            );
+            if old.is_some_and(|old| old != expected) {
+                return Err(AppError::integrity(
+                    "shared asset binding differs from retained identity",
+                ));
+            }
+            db.execute("INSERT INTO mappings(server,asset,library,path,digest,group_id,remote_checksum,external_path) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",params![server,asset.to_string(),expected.0,path.as_str(),digest.as_str(),group.to_string(),remote_checksum,external_path])?;
         }
         ArchiveRecord::RatingObserved {
             operation,

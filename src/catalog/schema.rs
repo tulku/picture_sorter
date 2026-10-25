@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS import_stats(job TEXT PRIMARY KEY REFERENCES jobs(id)
 CREATE TABLE IF NOT EXISTS group_facts(context TEXT NOT NULL,stem TEXT NOT NULL,camera TEXT NOT NULL,capture TEXT NOT NULL,group_id TEXT NOT NULL REFERENCES groups(id),PRIMARY KEY(context,stem,camera,capture));
 "#;
 pub const EDIT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS pin_sync_epochs(job TEXT PRIMARY KEY,required INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS pin_attempts(job TEXT PRIMARY KEY,spec TEXT NOT NULL,reservation TEXT NOT NULL,target TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pin_checks(job TEXT NOT NULL,path TEXT NOT NULL,digest TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(job,path,digest));
 CREATE TABLE IF NOT EXISTS startup_checks(placement TEXT PRIMARY KEY,group_id TEXT NOT NULL,path TEXT NOT NULL,digest TEXT NOT NULL,size INTEGER NOT NULL);
@@ -50,6 +51,7 @@ CREATE TABLE IF NOT EXISTS snapshot_intents(operation TEXT PRIMARY KEY,version T
 CREATE TABLE IF NOT EXISTS pending_resolutions(conflict TEXT PRIMARY KEY,version TEXT NOT NULL,expected_heads TEXT NOT NULL);
 "#;
 pub const RATING_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS merged_rating_evidence(group_id TEXT NOT NULL,original_group TEXT NOT NULL,kind TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(group_id,original_group,kind));
 CREATE TABLE IF NOT EXISTS rating_baselines(group_id TEXT PRIMARY KEY REFERENCES groups(id),common TEXT NOT NULL,applied_local TEXT NOT NULL,pending INTEGER,pending_version TEXT,source_version TEXT,remote_observation TEXT);
 CREATE TABLE IF NOT EXISTS rating_remote_state(server TEXT NOT NULL,asset TEXT NOT NULL,value TEXT NOT NULL,observation TEXT NOT NULL,PRIMARY KEY(server,asset));
 CREATE TABLE IF NOT EXISTS rating_operations(key TEXT PRIMARY KEY,operation TEXT NOT NULL UNIQUE);
