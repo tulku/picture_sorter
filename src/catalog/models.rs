@@ -4,6 +4,10 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum JobKind {
+    SnapshotCapture {
+        context: serde_json::Value,
+        direct: bool,
+    },
     LocalTransfer {
         parent: JobId,
         item: JobId,
@@ -102,6 +106,7 @@ pub struct JobRecord {
 #[derive(Debug, Clone)]
 pub enum JobTransition {
     Start,
+    Resume,
     Wait(JobState, String),
     Ingested,
     Archived,

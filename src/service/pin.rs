@@ -15,6 +15,8 @@ struct Target {
     revision: MembershipRevision,
     member: OriginalMember,
     metadata: bool,
+    #[serde(default)]
+    metadata_live: bool,
 }
 struct Active {
     job: JobId,
@@ -147,6 +149,12 @@ impl PinDriver {
                 {
                     if report.findings.is_empty() {
                         acknowledge(catalog, job, &active.target)?;
+                    } else if active.target.metadata_live {
+                        catalog.db.execute("INSERT INTO pin_live_failures(job,digest) VALUES(?,?) ON CONFLICT DO NOTHING",params![job.to_string(),active.target.member.digest.as_str()])?;
+                        catalog.db.execute(
+                            "UPDATE residency SET metadata_current=0,protected=1 WHERE group_id=?",
+                            [group.to_string()],
+                        )?;
                     } else if report
                         .findings
                         .iter()
@@ -274,6 +282,7 @@ impl PinDriver {
                     revision: current.membership_revision,
                     member,
                     metadata: false,
+                    metadata_live: false,
                 });
                 break;
             }
@@ -282,18 +291,28 @@ impl PinDriver {
             let bodies = catalog.pin_metadata_bodies(job, group, current.membership_revision)?;
             for body in bodies {
                 if let VersionBody::Content { digest, size } = body {
-                    let member = OriginalMember {
+                    let mut member = OriginalMember {
                         path: crate::edit::snapshot_path(&digest)?,
                         digest,
                         size,
                         role: MediaRole::OtherStill,
                     };
                     if !checked(catalog, job, &member, current.membership_revision)? {
+                        let live: Option<String> = if !metadata_only {
+                            catalog.db.query_row("SELECT s.path FROM sidecars s JOIN local_heads l ON l.sidecar=s.id JOIN heads h ON h.sidecar=s.id AND h.version=l.version JOIN versions v ON v.id=h.version JOIN projections p ON p.sidecar=s.id AND p.pending=0 JOIN history_receipts r ON r.digest=json_extract(v.body,'$.Content.digest') AND r.archive=? WHERE s.group_id=? AND json_extract(v.body,'$.Content.digest')=? AND NOT EXISTS(SELECT 1 FROM pin_live_failures f WHERE f.job=? AND f.digest=r.digest) ORDER BY s.id LIMIT 1",params![bound_archive(config)?.to_string(),group.to_string(),member.digest.as_str(),job.to_string()],|r|r.get(0)).optional()?
+                        } else {
+                            None
+                        };
+                        let metadata_live = live.is_some();
+                        if let Some(path) = live {
+                            member.path = ArchivePath::parse(&path)?;
+                        }
                         target = Some(Target {
                             group,
                             revision: current.membership_revision,
                             member,
                             metadata: true,
+                            metadata_live,
                         });
                         break;
                     }
@@ -330,7 +349,7 @@ fn bound_archive(config: &Config) -> AppResult<ArchiveId> {
         .ok_or_else(|| AppError::new(ErrorCode::Unavailable, "archive is unbound"))
 }
 fn target_root<'a>(config: &'a Config, target: &Target) -> &'a std::path::Path {
-    if target.metadata {
+    if target.metadata && !target.metadata_live {
         &config.state_root
     } else {
         &config.working_root
@@ -367,16 +386,21 @@ fn acknowledge(catalog: &mut Catalog, job: JobId, target: &Target) -> AppResult<
             "pin membership changed; checked bytes retained",
         ));
     }
-    if target.metadata {
+    if target.metadata && !target.metadata_live {
         catalog.db.execute("INSERT INTO snapshots(digest,path,size,archived) VALUES(?,?,?,1) ON CONFLICT(digest) DO UPDATE SET archived=1",params![target.member.digest.as_str(),target.member.path.as_str(),target.member.size])?;
-    } else {
+    } else if !target.metadata {
         catalog.record_materialization(target.group, &target.member, true)?;
     }
     catalog.db.execute(
         "INSERT INTO pin_checks(job,path,digest,revision) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",
         params![
             job.to_string(),
-            target.member.path.as_str(),
+            if target.metadata_live {
+                crate::edit::snapshot_path(&target.member.digest)?
+            } else {
+                target.member.path.clone()
+            }
+            .as_str(),
             target.member.digest.as_str(),
             target.revision.0
         ],
@@ -395,19 +419,22 @@ fn prepare_attempt(
     let occupied = occupied_bytes(&local)?
         .checked_add(state_occupied_bytes(&state)?)
         .ok_or_else(|| AppError::invalid("occupancy overflow"))?;
-    let decision = admit(&AdmissionInput {
-        budget: config.budget,
-        occupied,
-        reserved: catalog.remaining_reservations(FilesystemId(root.device()))?,
-        available: available_bytes(root)?,
-        reserve: config.reserve,
-        required: target.member.size,
-        existing: 0,
-        partial: 0,
-        overhead: 0,
-        nas_available: false,
-        allow_direct: false,
-    });
+    let decision = admit_with_budget_reservations(
+        &AdmissionInput {
+            budget: config.budget,
+            occupied,
+            reserved: catalog.remaining_reservations(FilesystemId(root.device()))?,
+            available: available_bytes(root)?,
+            reserve: config.reserve,
+            required: target.member.size,
+            existing: 0,
+            partial: 0,
+            overhead: 0,
+            nas_available: false,
+            allow_direct: false,
+        },
+        catalog.total_remaining_reservations()?,
+    );
     let AdmissionDecision::Local { additional_bytes } = decision else {
         return Err(AppError::new(
             ErrorCode::Capacity,
@@ -489,19 +516,25 @@ fn readmit_attempt(catalog: &mut Catalog, config: &Config, attempt: &Attempt) ->
     let occupied = occupied_bytes(&local)?
         .checked_add(state_occupied_bytes(&state)?)
         .ok_or_else(|| AppError::invalid("occupancy overflow"))?;
-    let decision = admit(&AdmissionInput {
-        budget: config.budget,
-        occupied,
-        reserved,
-        available: available_bytes(&root)?,
-        reserve: config.reserve,
-        required: attempt.spec.expected_size,
-        existing: 0,
-        partial: partial_size(attempt)?,
-        overhead: 0,
-        nas_available: false,
-        allow_direct: false,
-    });
+    let decision = admit_with_budget_reservations(
+        &AdmissionInput {
+            budget: config.budget,
+            occupied,
+            reserved,
+            available: available_bytes(&root)?,
+            reserve: config.reserve,
+            required: attempt.spec.expected_size,
+            existing: 0,
+            partial: partial_size(attempt)?,
+            overhead: 0,
+            nas_available: false,
+            allow_direct: false,
+        },
+        catalog
+            .total_remaining_reservations()?
+            .checked_sub(own)
+            .ok_or_else(|| AppError::integrity("budget reservation mismatch"))?,
+    );
     if let AdmissionDecision::Local { additional_bytes } = decision {
         catalog.update_reservation(attempt.reservation, additional_bytes)
     } else {
@@ -591,6 +624,7 @@ mod admission_tests {
                 role: MediaRole::Raw,
             },
             metadata: false,
+            metadata_live: false,
         };
         let attempt = prepare_attempt(&mut catalog, &config, job, &target)
             .unwrap()

@@ -772,3 +772,101 @@ fn unchanged_owned_source_companion_reuses_archived_history_without_new_commit()
         "an unchanged owned companion must reuse exact committed version evidence"
     );
 }
+#[test]
+fn oversized_saved_opaque_content_archives_coherently_without_local_snapshot_duplication() {
+    let service = ServiceFixture::with_config(|config, _| {
+        config.budget = 4 * 1024 * 1024;
+    });
+    assert!(service.cli(&["archive", "init"]).status.success());
+    std::fs::write(service.r.source.join("A.ORF"), b"raw").unwrap();
+    let out = service.cli(&[
+        "import",
+        service.r.source.to_str().unwrap(),
+        "--wait-for",
+        "archived",
+    ]);
+    assert!(out.status.success());
+    let path = service.status()["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["group"]["members"].as_array().unwrap())
+        .find(|m| m["path"].as_str().unwrap().ends_with("A.ORF"))
+        .unwrap()["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let bytes = vec![42; 3 * 1024 * 1024];
+    let digest = Digest::of(&bytes);
+    let live = service.r.local.join(format!("{path}.orig"));
+    std::fs::write(&live, &bytes).unwrap();
+    let history = service.r.archive.join(
+        photo_sorter::archive::history_path(&digest)
+            .unwrap()
+            .as_str(),
+    );
+    let deadline = Instant::now();
+    while !history.exists() {
+        assert!(
+            deadline.elapsed() < Duration::from_secs(15),
+            "opaque history did not archive: {}",
+            service.status()
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let deadline = Instant::now();
+    while !service.r.archive.join(format!("{path}.orig")).exists() {
+        assert!(
+            deadline.elapsed() < Duration::from_secs(10),
+            "history was not journaled/projected: {}",
+            service.status()
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert_eq!(std::fs::read(history).unwrap(), bytes);
+    assert_eq!(std::fs::read(&live).unwrap(), bytes);
+    assert!(
+        !service
+            .r
+            .state
+            .join(photo_sorter::edit::snapshot_path(&digest).unwrap().as_str())
+            .exists(),
+        "budget admission must use direct history rather than duplicate a large saved file locally"
+    );
+    let status = service.status();
+    let group = status["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| {
+            g["group"]["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["path"].as_str() == Some(&path))
+        })
+        .unwrap()["group"]["id"]
+        .as_str()
+        .unwrap();
+    let pin = service.cli(&["pin", group]);
+    assert!(
+        pin.status.success(),
+        "already-applied direct history should satisfy pin after strong live-byte verification: {}",
+        String::from_utf8_lossy(&pin.stdout)
+    );
+    let observer = service.status()["worker"]["observation_pid"]
+        .as_i64()
+        .unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(observer, libc::SIGSTOP) }, 0);
+    let changed = vec![43; bytes.len()];
+    std::fs::write(&live, &changed).unwrap();
+    let pin = service.cli(&["pin", group]);
+    assert_eq!(
+        pin.status.code(),
+        Some(3),
+        "changed live bytes cannot satisfy ready without explicit refresh: {}",
+        String::from_utf8_lossy(&pin.stdout)
+    );
+    assert_eq!(std::fs::read(&live).unwrap(), changed);
+    assert_eq!(unsafe { libc::kill(observer, libc::SIGCONT) }, 0);
+}

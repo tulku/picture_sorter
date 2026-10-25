@@ -117,7 +117,7 @@ pub(crate) fn merge_sidecar(
 pub(crate) fn advance(
     catalog: &mut Catalog,
     root: &RootHandle,
-    version: &str,
+    config: &crate::config::Config,
     after: &mut Option<SidecarId>,
 ) -> AppResult<()> {
     let next:Option<(String,Option<String>)>=catalog.db.query_row("SELECT s.id,s.group_id FROM sidecars s WHERE s.owner='rapidraw-base' AND s.id>? AND (SELECT count(*) FROM heads h WHERE h.sidecar=s.id)=2 AND NOT EXISTS(SELECT 1 FROM sidecar_diagnostics d WHERE d.sidecar=s.id) ORDER BY s.id LIMIT 1",[after.map(|id|id.to_string()).unwrap_or_default()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
@@ -127,6 +127,18 @@ pub(crate) fn advance(
     };
     let sidecar: SidecarId = serde_json::from_value(sidecar.into())?;
     *after = Some(sidecar);
+    let version = &config.rapidraw_version;
+    let heads = catalog.heads(sidecar)?;
+    let signature = format!("{version}:{}", serde_json::to_string(&heads)?);
+    let attempted: bool = catalog.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM metadata_merge_attempts WHERE sidecar=? AND signature=?)",
+        params![sidecar.to_string(), signature],
+        |r| r.get(0),
+    )?;
+    if attempted {
+        return Ok(());
+    }
+    ensure_merge_capacity(catalog, config, root, sidecar)?;
     match merge_sidecar(catalog, root, sidecar, version) {
         Ok(_) => Ok(()),
         Err(error) if error.errno == Some(libc::ENOENT) => {
@@ -150,6 +162,49 @@ pub(crate) fn advance(
         }
         Err(error) if matches!(error.code, ErrorCode::Conflict | ErrorCode::Unsupported) => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+fn ensure_merge_capacity(
+    catalog: &Catalog,
+    config: &crate::config::Config,
+    state: &RootHandle,
+    sidecar: SidecarId,
+) -> AppResult<()> {
+    use crate::storage::*;
+    let local = RootHandle::open(&config.working_root, crate::fs::RootPolicy::Local)?;
+    let mut required = 0;
+    for head in catalog.heads(sidecar)? {
+        if let VersionBody::Content { size, .. } = catalog.version(head)?.body {
+            required = required.max(size);
+        }
+    }
+    let occupied = crate::fs::occupied_bytes(&local)?
+        .checked_add(crate::fs::state_occupied_bytes(state)?)
+        .ok_or_else(|| AppError::invalid("derived snapshot occupancy overflow"))?;
+    let decision = admit_with_budget_reservations(
+        &AdmissionInput {
+            budget: config.budget,
+            occupied,
+            reserved: catalog.remaining_reservations(FilesystemId(state.device()))?,
+            available: crate::fs::available_bytes(state)?,
+            reserve: config.reserve,
+            required,
+            existing: 0,
+            partial: 0,
+            overhead: 64 * 1024,
+            nas_available: false,
+            allow_direct: false,
+        },
+        catalog.total_remaining_reservations()?,
+    );
+    if matches!(decision, AdmissionDecision::Local { .. }) {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            ErrorCode::Capacity,
+            "derived metadata waits for admitted snapshot capacity; both source histories retained",
+        ))
     }
 }
 
@@ -219,6 +274,16 @@ mod tests {
                 )
                 .unwrap();
         }
+        let local = temp.path().join("local");
+        std::fs::create_dir(&local).unwrap();
+        let mut config = crate::config::Config::new(
+            local,
+            temp.path().to_path_buf(),
+            temp.path().join("archive"),
+        );
+        config.budget = 1;
+        config.reserve = 0;
+        assert!(super::ensure_merge_capacity(&catalog, &config, &root, sidecar).is_err());
         let version = super::merge_sidecar(&mut catalog, &root, sidecar, "1.6.6")
             .unwrap()
             .unwrap();

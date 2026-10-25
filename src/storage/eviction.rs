@@ -198,6 +198,7 @@ impl Catalog {
             [group.to_string()],
             |r| r.get(0),
         )?;
+        self.db.execute("UPDATE residency SET metadata_current=NOT EXISTS(SELECT 1 FROM sidecars s LEFT JOIN projections p ON p.sidecar=s.id LEFT JOIN local_heads l ON l.sidecar=s.id WHERE s.group_id=? AND s.owner<>'jpeg-xmp-external' AND (p.pending=1 OR p.sidecar IS NULL OR l.version IS NULL OR l.dirty=1 OR (SELECT count(*) FROM heads h WHERE h.sidecar=s.id)<>1 OR NOT EXISTS(SELECT 1 FROM heads h WHERE h.sidecar=s.id AND h.version=l.version))) WHERE group_id=?",params![group.to_string(),group.to_string()])?;
         self.db.execute(
             "UPDATE residency SET protected=? WHERE group_id=?",
             params![originals || edits, group.to_string()],

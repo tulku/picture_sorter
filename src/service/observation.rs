@@ -80,6 +80,9 @@ impl ObservationDriver {
             self.enqueue_absences(&engine.catalog)?;
         }
         if let Some((ticket, phase)) = self.active.take() {
+            if let Phase::Capture { context, .. } = &phase {
+                reconcile_capture_reservation(&mut engine.catalog, state, context)?;
+            }
             let reply = match self.worker.poll(ticket)? {
                 WorkerState::Active | WorkerState::TimedOutStillAlive => {
                     self.active = Some((ticket, phase));
@@ -95,6 +98,7 @@ impl ObservationDriver {
                     {
                         self.unreadable(&mut engine.catalog, &context.owner, &error.to_string())?;
                         if *recovering {
+                            fail_capture(&mut engine.catalog, context, &error.to_string())?;
                             engine.catalog.db.execute(
                                 "UPDATE capture_requests SET done=1 WHERE operation=?",
                                 [context.operation.to_string()],
@@ -146,6 +150,7 @@ impl ObservationDriver {
                         "UPDATE capture_requests SET done=1 WHERE operation=?",
                         [context.operation.to_string()],
                     )?;
+                    finish_capture(&mut engine.catalog, &context)?;
                     context.cleanup(state)?;
                 }
                 (Phase::Events, NasReply::LocalEvents(events)) => {
@@ -189,7 +194,7 @@ impl ObservationDriver {
             .catalog
             .db
             .query_row(
-                "SELECT context FROM capture_requests WHERE done=0 ORDER BY rowid LIMIT 1",
+                "SELECT context FROM capture_requests WHERE done=0 AND direct=0 ORDER BY rowid LIMIT 1",
                 [],
                 |r| r.get(0),
             )
@@ -215,20 +220,76 @@ impl ObservationDriver {
                 Phase::Watch,
             )
         } else if let Some(owner) = self.queue.pop_front() {
+            let pending:bool=engine.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM capture_requests WHERE done=0 AND json_extract(context,'$.owner.id')=?)",[owner.id.to_string()],|r|r.get(0))?;
+            if pending {
+                return Ok(());
+            }
+            let size = match local.metadata_relative(&owner.path) {
+                Ok(metadata) => metadata.stx_size,
+                Err(e) if e.errno == Some(libc::ENOENT) => 0,
+                Err(e) => {
+                    self.unreadable(&mut engine.catalog, &owner, &e.to_string())?;
+                    return Ok(());
+                }
+            };
+            let occupied = crate::fs::occupied_bytes(local)?
+                .checked_add(crate::fs::state_occupied_bytes(state)?)
+                .ok_or_else(|| AppError::invalid("snapshot occupancy overflow"))?;
+            let admitted = crate::storage::admit_with_budget_reservations(
+                &crate::storage::AdmissionInput {
+                    budget: engine.config.budget,
+                    occupied,
+                    reserved: engine
+                        .catalog
+                        .remaining_reservations(crate::storage::FilesystemId(state.device()))?,
+                    available: crate::fs::available_bytes(state)?,
+                    reserve: engine.config.reserve,
+                    required: size,
+                    existing: 0,
+                    partial: 0,
+                    overhead: 16 * 1024,
+                    nas_available: false,
+                    allow_direct: false,
+                },
+                engine.catalog.total_remaining_reservations()?,
+            );
+            let direct =
+                size > 0 && !matches!(admitted, crate::storage::AdmissionDecision::Local { .. });
             let previous = engine.catalog.local_head(owner.id)?;
             let context = CaptureContext {
                 operation: OperationId::new(),
                 owner,
                 previous,
             };
-            engine.catalog.db.execute(
-                "INSERT INTO capture_requests(operation,context) VALUES(?,?)",
-                params![
-                    context.operation.to_string(),
-                    serde_json::to_string(&context)?
-                ],
-            )?;
+            let job = engine.catalog.enqueue(DurableRequest {
+                operation_id: context.operation,
+                kind: JobKind::SnapshotCapture {
+                    context: serde_json::to_value(&context)?,
+                    direct,
+                },
+            })?;
+            let reservation = if !direct {
+                Some(engine.catalog.reserve(
+                    job,
+                    crate::storage::FilesystemId(state.device()),
+                    size,
+                )?)
+            } else {
+                None
+            };
+            engine.catalog.db.execute("INSERT INTO capture_requests(operation,context,direct,job,reservation,reserved_size) VALUES(?,?,?,?,?,?)",params![context.operation.to_string(),serde_json::to_string(&context)?,direct,job.to_string(),reservation.map(|id|id.to_string()),size])?;
             context.persist(state)?;
+            if direct {
+                self.status.reason=Some("saved bytes remain live and protected; direct archive history capture awaits qualified NAS worker".into());
+                if let Some(group) = context.owner.group {
+                    engine.catalog.db.execute(
+                        "UPDATE residency SET protected=1 WHERE group_id=?",
+                        [group.to_string()],
+                    )?;
+                }
+                return Ok(());
+            }
+            engine.catalog.transition(job, 0, JobTransition::Start)?;
             (
                 NasCommand::CaptureOwned {
                     local: engine.config.working_root.clone(),
@@ -287,6 +348,38 @@ impl ObservationDriver {
         let ticket = self.worker.submit(command)?;
         self.active = Some((ticket, phase));
         Ok(())
+    }
+    pub(crate) fn record_archived(
+        &mut self,
+        engine: &mut ImportCoordinator,
+        local: &RootHandle,
+        state: &RootHandle,
+        context: CaptureContext,
+        receipt: SnapshotReceipt,
+    ) -> AppResult<()> {
+        if !receipt.archive_history {
+            return Err(AppError::integrity(
+                "direct capture returned a local receipt",
+            ));
+        }
+        if receipt.source_stamp.is_none() {
+            self.known = true;
+            self.after.clear();
+        }
+        self.record(
+            engine,
+            local,
+            state,
+            &SystemClock::default(),
+            CaptureResult {
+                owner: context.owner.clone(),
+                previous: context.previous,
+                operation: context.operation,
+                receipt,
+            },
+        )?;
+        finish_capture(&mut engine.catalog, &context)?;
+        context.cleanup(state)
     }
     fn enqueue_absences(&mut self, catalog: &Catalog) -> AppResult<()> {
         if self.queue.len() >= 128 {
@@ -380,17 +473,33 @@ impl ObservationDriver {
             changed = true;
         } else {
             let still_current = previous == current && receipt.still_matches(local)?;
-            let stored = StoredSnapshot::from_receipt(receipt.clone(), state)?;
+            let stored = if receipt.archive_history {
+                None
+            } else {
+                Some(StoredSnapshot::from_receipt(receipt.clone(), state)?)
+            };
+            if receipt.archive_history {
+                let VersionBody::Content { digest, size } = &receipt.body else {
+                    return Err(AppError::integrity("archive snapshot body missing"));
+                };
+                engine.catalog.db.execute("INSERT INTO history_receipts(archive,digest,size) VALUES(?,?,?) ON CONFLICT DO NOTHING",params![engine.config.archive_id.ok_or_else(||AppError::invalid("archive snapshot without archive identity"))?.to_string(),digest.as_str(),size])?;
+            }
             if let Some(current) = current
                 && engine.catalog.version(current)?.body == receipt.body
             {
-                stored.register(state, &mut engine.catalog)?;
+                if let Some(stored) = stored {
+                    stored.register(state, &mut engine.catalog)?;
+                }
             } else {
                 let intent = SnapshotIntent {
                     sidecar: owner.id,
                     parents: previous.into_iter().collect(),
                     operation,
-                    payload: SnapshotPayload::Stored(stored),
+                    payload: if let Some(stored) = stored {
+                        SnapshotPayload::Stored(stored)
+                    } else {
+                        SnapshotPayload::Archived(ArchivedSnapshot::from_receipt(&receipt)?)
+                    },
                     origin: VersionOrigin::Observed,
                 };
                 if still_current {
@@ -419,6 +528,7 @@ impl ObservationDriver {
         if let Some(group) = owner.group
             && (changed || receipt.opaque_invalid)
         {
+            engine.catalog.refresh_protection(group)?;
             engine.catalog.db.execute(
                 "UPDATE residency SET protected=1,last_activity=? WHERE group_id=?",
                 params![clock.now(), group.to_string()],
@@ -530,4 +640,104 @@ fn discover(catalog: &mut Catalog, path: &ArchivePath) -> AppResult<SidecarOwner
         kind,
         virtual_copy,
     })
+}
+
+fn finish_capture(catalog: &mut Catalog, context: &CaptureContext) -> AppResult<()> {
+    let job: Option<String> = catalog
+        .db
+        .query_row(
+            "SELECT job FROM capture_requests WHERE operation=?",
+            [context.operation.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    catalog.db.execute(
+        "UPDATE capture_requests SET done=1 WHERE operation=?",
+        [context.operation.to_string()],
+    )?;
+    if let Some(job) = job {
+        let job: JobId = serde_json::from_value(job.into())?;
+        catalog
+            .db
+            .execute("DELETE FROM reservations WHERE job=?", [job.to_string()])?;
+        let record = catalog.job(job)?;
+        if !matches!(record.state, JobState::Complete | JobState::Cancelled) {
+            catalog.transition(
+                job,
+                record.generation,
+                if record.cancel_requested {
+                    JobTransition::ConfirmCancelled
+                } else {
+                    JobTransition::Complete
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+fn reconcile_capture_reservation(
+    catalog: &mut Catalog,
+    state: &RootHandle,
+    context: &CaptureContext,
+) -> AppResult<()> {
+    let reservation: Option<String> = catalog
+        .db
+        .query_row(
+            "SELECT reservation FROM capture_requests WHERE operation=?",
+            [context.operation.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(reservation) = reservation {
+        let id: ReservationId = serde_json::from_value(reservation.into())?;
+        let partial = ArchivePath::parse(&format!(
+            ".photo-sorter/captures/{}/payload",
+            context.operation
+        ))?;
+        let consumed = match state.metadata_relative(&partial) {
+            Ok(m) => m.stx_size,
+            Err(e) if e.errno == Some(libc::ENOENT) => 0,
+            Err(e) => return Err(e),
+        };
+        let requested: u64 = catalog.db.query_row(
+            "SELECT reserved_size FROM capture_requests WHERE reservation=?",
+            [id.to_string()],
+            |r| r.get(0),
+        )?;
+        catalog.update_reservation(id, requested.saturating_sub(consumed))?;
+    }
+    Ok(())
+}
+
+fn fail_capture(catalog: &mut Catalog, context: &CaptureContext, reason: &str) -> AppResult<()> {
+    let job: Option<String> = catalog
+        .db
+        .query_row(
+            "SELECT job FROM capture_requests WHERE operation=?",
+            [context.operation.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(job) = job {
+        let job: JobId = serde_json::from_value(job.into())?;
+        catalog
+            .db
+            .execute("DELETE FROM reservations WHERE job=?", [job.to_string()])?;
+        let record = catalog.job(job)?;
+        if !matches!(record.state, JobState::Complete | JobState::Cancelled) {
+            catalog.transition(
+                job,
+                record.generation,
+                if record.cancel_requested {
+                    JobTransition::ConfirmCancelled
+                } else {
+                    JobTransition::Wait(JobState::Failed, reason.into())
+                },
+            )?;
+        }
+    }
+    Ok(())
 }

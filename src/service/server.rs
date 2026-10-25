@@ -776,6 +776,30 @@ impl Runtime {
         Ok(None)
     }
     fn finish_control(&mut self, job: JobId, reply: NasReply) -> AppResult<()> {
+        if let NasReply::Captured(receipt) = &reply {
+            let JobKind::SnapshotCapture {
+                context,
+                direct: true,
+            } = self.engine.catalog.job(job)?.request.kind
+            else {
+                return Err(AppError::integrity(
+                    "archive capture receipt has no matching direct-capture job",
+                ));
+            };
+            let context: CaptureContext = serde_json::from_value(context)?;
+            self.observation.record_archived(
+                &mut self.engine,
+                &self.local,
+                &self.state,
+                context,
+                receipt.clone(),
+            )?;
+            self.result(
+                job,
+                serde_json::json!({"captured":receipt.body,"archive_history":true}),
+            )?;
+            return self.complete(job);
+        }
         if let NasReply::Capability(report) = reply {
             let JobKind::Qualify { request } = self.engine.catalog.job(job)?.request.kind else {
                 return Err(AppError::integrity(
@@ -918,6 +942,9 @@ impl Runtime {
                         JobKind::Qualify { .. } | JobKind::ChangeMode { .. }
                     ) {
                         JobState::Failed
+                    } else if error.code == ErrorCode::Capacity || error.errno == Some(libc::ENOSPC)
+                    {
+                        JobState::WaitingCapacity
                     } else {
                         JobState::WaitingNas
                     },
@@ -939,10 +966,13 @@ impl Runtime {
             && let Err(error) = super::metadata_merge::advance(
                 &mut self.engine.catalog,
                 &self.state,
-                &self.engine.config.rapidraw_version,
+                &self.engine.config,
                 &mut self.merge_cursor,
             )
         {
+            if error.code == ErrorCode::Capacity {
+                self.pressure_reclaim(None)?;
+            }
             self.http_reason = Some(error.to_string());
         }
         let now = clock.now();
@@ -981,6 +1011,25 @@ impl Runtime {
             }
             let was_due = self.engine.catalog.job_is_due(record.id, now)?;
             if record.cancel_requested {
+                if let JobKind::SnapshotCapture { direct, context } = &record.request.kind {
+                    let context: CaptureContext = serde_json::from_value(context.clone())?;
+                    let pending:bool=self.engine.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM capture_requests WHERE operation=? AND done=0)",[context.operation.to_string()],|r|r.get(0))?;
+                    if !direct && pending {
+                        continue;
+                    }
+                    if *direct
+                        && self
+                            .control
+                            .as_ref()
+                            .is_none_or(|control| control.job != record.id)
+                    {
+                        self.engine.catalog.db.execute(
+                            "UPDATE capture_requests SET done=1 WHERE operation=?",
+                            [context.operation.to_string()],
+                        )?;
+                        context.cleanup(&self.state)?;
+                    }
+                }
                 self.scan.cancel(record.id)?;
                 self.upload.cancel(&mut self.worker, record.id)?;
                 self.bootstrap.cancel(&mut self.worker, record.id)?;
@@ -1036,7 +1085,17 @@ impl Runtime {
                     ErrorCode::Capacity => JobState::WaitingCapacity,
                     _ => JobState::Failed,
                 };
-                self.wait(record.id, state, error.to_string())?;
+                self.wait(record.id, state.clone(), error.to_string())?;
+                if state == JobState::WaitingCapacity
+                    && matches!(
+                        record.request.kind,
+                        JobKind::Pin { .. }
+                            | JobKind::PinUrl { .. }
+                            | JobKind::MetadataFetch { .. }
+                    )
+                {
+                    self.pressure_reclaim(Some(record.id))?;
+                }
             }
             let current = self.engine.catalog.job(record.id)?;
             if was_due
@@ -1130,7 +1189,7 @@ impl Runtime {
             && self.bootstrap.active_job().is_none_or(|id| id == job)
             && self.fetch.nas_active_job().is_none_or(|id| id == job)
     }
-    fn pressure_reclaim(&mut self, parent: JobId) -> AppResult<bool> {
+    fn pressure_reclaim(&mut self, parent: Option<JobId>) -> AppResult<bool> {
         let pending:bool=self.engine.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE json_extract(request,'$.kind.type')='evict' AND json_extract(state,'$') NOT IN('Complete','Cancelled','Failed','Conflict'))",[],|r|r.get(0))?;
         let reclaim = if pending {
             true
@@ -1155,12 +1214,12 @@ impl Runtime {
         } else {
             false
         };
-        if reclaim {
+        if reclaim && let Some(parent) = parent {
             let record = self.engine.catalog.job(parent)?;
             if record.state != JobState::Running {
                 self.engine
                     .catalog
-                    .transition(parent, record.generation, JobTransition::Start)?;
+                    .transition(parent, record.generation, JobTransition::Resume)?;
             }
             self.engine
                 .catalog
@@ -1196,6 +1255,26 @@ impl Runtime {
         let job = record.id;
         let config = self.engine.config.clone();
         match &record.request.kind {
+            JobKind::SnapshotCapture { context, direct } => {
+                if *direct
+                    && self.nas_job_allowed(job)
+                    && self.control.is_none()
+                    && self.worker.available()?
+                {
+                    let context: CaptureContext = serde_json::from_value(context.clone())?;
+                    let ticket = self.worker.submit(NasCommand::CaptureHistory {
+                        root: config.archive_root.clone(),
+                        archive: config
+                            .archive_id
+                            .ok_or_else(|| AppError::invalid("profile has no archive identity"))?,
+                        writer: config.writer_id,
+                        local: config.working_root.clone(),
+                        context,
+                        ceiling: config.json_ceiling,
+                    })?;
+                    self.control = Some(Control { job, ticket });
+                }
+            }
             JobKind::LocalTransfer { .. } => {}
             JobKind::Import { .. } => {
                 let due = self
@@ -1212,7 +1291,7 @@ impl Runtime {
                 if report.waiting > 0
                     && self.local_transfer.active_parent().is_none()
                     && self.engine.catalog.job(job)?.state == JobState::WaitingCapacity
-                    && self.pressure_reclaim(job)?
+                    && self.pressure_reclaim(Some(job))?
                 {
                     return Ok(());
                 }

@@ -16,3 +16,6 @@ mod coherent;
 pub use coherent::CaptureContext;
 pub use coherent::{SnapshotReceipt, SnapshotStamp, StoredSnapshot, snapshot_path};
 pub(crate) use coherent::{capture_local, capture_owned, recover_capture};
+
+pub use coherent::ArchivedSnapshot;
+pub(crate) use coherent::capture_history;

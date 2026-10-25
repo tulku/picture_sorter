@@ -19,6 +19,15 @@ pub enum AdmissionDecision {
     WaitingCapacity,
 }
 pub fn admit(i: &AdmissionInput) -> AdmissionDecision {
+    admit_with_budget_reservations(i, i.reserved)
+}
+pub fn admit_with_budget_reservations(
+    i: &AdmissionInput,
+    budget_reserved: u64,
+) -> AdmissionDecision {
+    if budget_reserved < i.reserved {
+        return AdmissionDecision::WaitingCapacity;
+    }
     let additional = i
         .required
         .checked_sub(i.existing)
@@ -27,7 +36,7 @@ pub fn admit(i: &AdmissionInput) -> AdmissionDecision {
     if let Some(n) = additional {
         let budget_ok = i
             .occupied
-            .checked_add(i.reserved)
+            .checked_add(budget_reserved)
             .and_then(|b| b.checked_add(n))
             .is_some_and(|b| b <= i.budget);
         let reserve_ok = n

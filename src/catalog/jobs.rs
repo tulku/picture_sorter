@@ -91,6 +91,9 @@ impl Catalog {
         let mut cancel = old.cancel_requested;
         let starting = matches!(&change, JobTransition::Start);
         match change {
+            JobTransition::Resume => {
+                state = JobState::Running;
+            }
             JobTransition::Start => {
                 generation = generation
                     .checked_add(1)

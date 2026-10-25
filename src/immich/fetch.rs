@@ -173,21 +173,29 @@ impl PinFetchDriver {
                 catalog.record_materialization(group, member, false)?;
                 continue;
             }
-            let occupied = occupied_bytes(&local)?;
-            let decision = crate::storage::admit(&crate::storage::AdmissionInput {
-                budget: config.budget,
-                occupied,
-                reserved: catalog
-                    .remaining_reservations(crate::storage::FilesystemId(local.device()))?,
-                available: available_bytes(&local)?,
-                reserve: config.reserve,
-                required: member.size,
-                existing: 0,
-                partial: 0,
-                overhead: 0,
-                nas_available: false,
-                allow_direct: false,
-            });
+            let occupied = occupied_bytes(&local)?
+                .checked_add(crate::fs::state_occupied_bytes(&RootHandle::open(
+                    &config.state_root,
+                    RootPolicy::Local,
+                )?)?)
+                .ok_or_else(|| AppError::invalid("pin occupancy overflow"))?;
+            let decision = crate::storage::admit_with_budget_reservations(
+                &crate::storage::AdmissionInput {
+                    budget: config.budget,
+                    occupied,
+                    reserved: catalog
+                        .remaining_reservations(crate::storage::FilesystemId(local.device()))?,
+                    available: available_bytes(&local)?,
+                    reserve: config.reserve,
+                    required: member.size,
+                    existing: 0,
+                    partial: 0,
+                    overhead: 0,
+                    nas_available: false,
+                    allow_direct: false,
+                },
+                catalog.total_remaining_reservations()?,
+            );
             if !matches!(decision, crate::storage::AdmissionDecision::Local { .. }) {
                 return Err(AppError::new(
                     ErrorCode::Capacity,
@@ -266,23 +274,26 @@ impl PinFetchDriver {
                 return catalog.readiness(group);
             }
             let occupied = occupied_bytes(&local)?
-                .checked_add(occupied_bytes(&state)?)
+                .checked_add(crate::fs::state_occupied_bytes(&state)?)
                 .ok_or_else(|| AppError::invalid("occupancy overflow"))?;
             if !matches!(
-                crate::storage::admit(&crate::storage::AdmissionInput {
-                    budget: config.budget,
-                    occupied,
-                    reserved: catalog
-                        .remaining_reservations(crate::storage::FilesystemId(state.device()))?,
-                    available: available_bytes(&state)?,
-                    reserve: config.reserve,
-                    required: size,
-                    existing: 0,
-                    partial: 0,
-                    overhead: 0,
-                    nas_available: false,
-                    allow_direct: false
-                }),
+                crate::storage::admit_with_budget_reservations(
+                    &crate::storage::AdmissionInput {
+                        budget: config.budget,
+                        occupied,
+                        reserved: catalog
+                            .remaining_reservations(crate::storage::FilesystemId(state.device()))?,
+                        available: available_bytes(&state)?,
+                        reserve: config.reserve,
+                        required: size,
+                        existing: 0,
+                        partial: 0,
+                        overhead: 0,
+                        nas_available: false,
+                        allow_direct: false
+                    },
+                    catalog.total_remaining_reservations()?
+                ),
                 crate::storage::AdmissionDecision::Local { .. }
             ) {
                 return Err(AppError::new(

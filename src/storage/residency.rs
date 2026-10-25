@@ -93,6 +93,16 @@ impl Catalog {
         )?;
         Ok(id)
     }
+    pub fn total_remaining_reservations(&self) -> AppResult<u64> {
+        let mut query = self.db.prepare("SELECT remaining FROM reservations")?;
+        let mut sum = 0u64;
+        for row in query.query_map([], |r| r.get::<_, u64>(0))? {
+            sum = sum
+                .checked_add(row?)
+                .ok_or_else(|| AppError::invalid("budget reservation overflow"))?;
+        }
+        Ok(sum)
+    }
     pub fn remaining_reservations(&self, filesystem: FilesystemId) -> AppResult<u64> {
         let mut q = self
             .db

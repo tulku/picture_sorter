@@ -131,7 +131,13 @@ impl ImportCoordinator {
                 additional_bytes: 0,
             }
         } else {
-            admit(&input)
+            admit_with_budget_reservations(
+                &input,
+                self.catalog
+                    .total_remaining_reservations()?
+                    .checked_sub(existing.as_ref().map_or(0, |r| r.1))
+                    .ok_or_else(|| AppError::integrity("budget reservation mismatch"))?,
+            )
         };
         let AdmissionDecision::Local { additional_bytes } = decision else {
             self.catalog.transition(job,record.generation,JobTransition::Wait(JobState::WaitingCapacity,"local budget or filesystem reserve unavailable; source retained while direct archive publication is considered".into()))?;

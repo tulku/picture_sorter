@@ -89,6 +89,7 @@ impl SharedPublisher {
             };
             let (phase, command) = if let Candidate::Version(version) = candidate {
                 match engine.catalog.version(version)?.body {
+                    VersionBody::Content {ref digest,size} if engine.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM history_receipts WHERE archive=? AND digest=? AND size=?)",params![archive.to_string(),digest.as_str(),size],|r|r.get::<_,bool>(0))? =>(Phase::Begin,begin(&config)?),
                     VersionBody::Content { digest, size } => {
                         let source = crate::edit::snapshot_path(&digest)?;
                         (

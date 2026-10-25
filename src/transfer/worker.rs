@@ -19,6 +19,14 @@ use std::{
 const MAX_LINE: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasCommand {
+    CaptureHistory {
+        root: PathBuf,
+        archive: crate::domain::ArchiveId,
+        writer: crate::domain::WriterId,
+        local: PathBuf,
+        context: crate::edit::CaptureContext,
+        ceiling: u64,
+    },
     ChangeMode {
         root: PathBuf,
         archive: crate::domain::ArchiveId,
@@ -651,6 +659,21 @@ impl ArchiveRuntime {
             self.last_decision = Some(store.write_decision());
         }
         match command {
+            NasCommand::CaptureHistory {
+                root,
+                archive,
+                writer,
+                local,
+                context,
+                ceiling,
+            } => {
+                let store = self.open_store(&root, archive, writer)?;
+                store.require_writable()?;
+                let local = RootHandle::open(&local, RootPolicy::Local)?;
+                let receipt = crate::edit::capture_history(&local, &store.root, &context, ceiling)?;
+                store.validate()?;
+                Ok(NasReply::Captured(receipt))
+            }
             NasCommand::ChangeMode {
                 root,
                 archive,

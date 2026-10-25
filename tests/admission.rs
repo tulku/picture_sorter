@@ -174,3 +174,22 @@ fn old_request_retry_does_not_reverse_later_unpin() {
     assert_eq!(c.request_pin(group, operation).unwrap(), old);
     assert!(!c.protection(group).unwrap().pinned);
 }
+#[test]
+fn reservations_on_other_filesystems_consume_budget_but_not_destination_free_space() {
+    let mut i = input();
+    i.required = 30;
+    i.reserved = 0;
+    assert_eq!(
+        admit_with_budget_reservations(&i, 20),
+        AdmissionDecision::WaitingCapacity
+    );
+    i.occupied = 0;
+    i.required = 10;
+    i.available = 20;
+    assert_eq!(
+        admit_with_budget_reservations(&i, 50),
+        AdmissionDecision::Local {
+            additional_bytes: 10
+        }
+    );
+}

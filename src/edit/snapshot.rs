@@ -121,6 +121,7 @@ impl<'a> Snapshotter<'a> {
                 },
                 owner.kind == SidecarKind::RapidRaw,
             ),
+            SnapshotPayload::Archived(stored) => (stored.body(), true),
             SnapshotPayload::Reset => return Err(AppError::integrity("unexpected content reset")),
         };
         self.catalog.db.execute("INSERT INTO observations(path,digest,size,absent_since,readable) VALUES(?,?,?,NULL,1) ON CONFLICT(path) DO UPDATE SET digest=excluded.digest,size=excluded.size,absent_since=NULL,readable=1",params![owner.path.as_str(),match &body{VersionBody::Content{digest,..}=>digest.as_str(),_=>""},before.len()])?;

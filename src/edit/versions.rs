@@ -7,6 +7,7 @@ use crate::{
 use rusqlite::{OptionalExtension, params};
 #[derive(Debug, Clone)]
 pub enum SnapshotPayload {
+    Archived(super::ArchivedSnapshot),
     Stored(super::StoredSnapshot),
     Content(Vec<u8>),
     File {
@@ -85,6 +86,7 @@ impl<'a> VersionStore<'a> {
             .db
             .execute_batch(crate::catalog::schema::EDIT_SCHEMA)?;
         let body = match &intent.payload {
+            SnapshotPayload::Archived(stored) => stored.body(),
             SnapshotPayload::Stored(stored) => stored.body(),
             SnapshotPayload::Content(bytes) => VersionBody::Content {
                 digest: Digest::of(bytes),

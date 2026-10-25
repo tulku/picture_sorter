@@ -33,6 +33,8 @@ impl SnapshotStamp {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotReceipt {
+    #[serde(default)]
+    pub archive_history: bool,
     pub path: ArchivePath,
     pub body: VersionBody,
     pub snapshot: Option<ArchivePath>,
@@ -148,6 +150,7 @@ fn capture_with_stage(
             }
             local.validate_identity()?;
             return Ok(SnapshotReceipt {
+                archive_history: false,
                 path: path.clone(),
                 body: VersionBody::Reset,
                 snapshot: None,
@@ -181,6 +184,15 @@ fn capture_with_stage(
         let n = source.read(&mut buffer)?;
         if n == 0 {
             break;
+        }
+        if size
+            .checked_add(n as u64)
+            .is_none_or(|next| next > before.len())
+        {
+            return Err(AppError::new(
+                ErrorCode::SourceChanged,
+                "sidecar grew beyond its admitted snapshot size; partial retained",
+            ));
         }
         destination.write_all(&buffer[..n])?;
         crate::metrics::hash_bytes(n as u64);
@@ -226,6 +238,7 @@ fn capture_with_stage(
             .metadata()?,
     ));
     Ok(SnapshotReceipt {
+        archive_history: false,
         path: path.clone(),
         body: VersionBody::Content { digest, size },
         snapshot: Some(target),
@@ -314,7 +327,7 @@ pub(crate) fn capture_owned(
 pub(crate) fn recover_capture(
     state: &RootHandle,
     context: &CaptureContext,
-    ceiling: u64,
+    _ceiling: u64,
 ) -> AppResult<SnapshotReceipt> {
     context.persist(state)?;
     match state.read(&capture_path(context.operation, "receipt.json")?, 65536) {
@@ -333,25 +346,396 @@ pub(crate) fn recover_capture(
         }
         Err(e) if e.errno == Some(libc::ENOENT) => {
             let payload = capture_path(context.operation, "payload")?;
-            let mut receipt = capture_with_stage(
-                state,
-                state,
-                &payload,
-                super::SidecarKind::Opaque,
-                ceiling,
-                None,
-            )?;
-            if receipt.body == VersionBody::Reset {
-                return Err(AppError::new(
-                    ErrorCode::NotFound,
-                    "capture stopped before retaining payload",
-                ));
+            let mut source = state.open_relative(&payload, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+            let metadata = source.metadata()?;
+            if !metadata.is_file() {
+                return Err(AppError::integrity("owned capture payload is not regular"));
             }
-            receipt.path = context.owner.path.clone();
-            receipt.source_stamp = None;
-            receipt.opaque_invalid = true;
-            Ok(receipt)
+            let (digest, size) = digest_file(&mut source)?;
+            let target = snapshot_path(&digest)?;
+            state.mkdir_all(&ArchivePath::parse(".photo-sorter/snapshots")?)?;
+            link_noreplace(state, &payload, &target)?;
+            let mut stored = state.open_relative(&target, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+            if digest_file(&mut stored)? != (digest.clone(), size) {
+                return Err(AppError::integrity("recovered capture payload differs"));
+            }
+            Ok(SnapshotReceipt {
+                archive_history: false,
+                path: context.owner.path.clone(),
+                body: VersionBody::Content { digest, size },
+                snapshot: Some(target),
+                stamp: Some(SnapshotStamp::of(&stored.metadata()?)),
+                source_stamp: None,
+                state_device: state.device(),
+                state_inode: state.inode(),
+                opaque_invalid: true,
+            })
         }
         Err(e) => Err(e),
+    }
+}
+pub(crate) fn capture_history(
+    local: &RootHandle,
+    archive: &RootHandle,
+    context: &CaptureContext,
+    ceiling: u64,
+) -> AppResult<SnapshotReceipt> {
+    local.require_local()?;
+    validate_sidecar_path(&context.owner.path)?;
+    archive.validate_identity()?;
+    let directory = ArchivePath::parse(&format!(
+        ".photo-sorter/staging/history-capture-{}",
+        context.operation
+    ))?;
+    archive.mkdir_all(&directory)?;
+    let entry = |name: &str| ArchivePath::parse(&format!("{}/{name}", directory.as_str()));
+    let intent = serde_json::to_vec(context)?;
+    match archive.write_new(&entry("intent.json")?, &intent) {
+        Ok(()) => {}
+        Err(e)
+            if e.errno == Some(libc::EEXIST)
+                && archive.read(&entry("intent.json")?, 65536)? == intent => {}
+        Err(e) => return Err(e),
+    }
+    match archive.read(&entry("receipt.json")?, 65536) {
+        Ok(bytes) => {
+            let receipt: SnapshotReceipt = serde_json::from_slice(&bytes)?;
+            validate_history_receipt(archive, context, &receipt)?;
+            cleanup_history_partial(archive, context, &receipt)?;
+            return Ok(receipt);
+        }
+        Err(e) if e.errno == Some(libc::ENOENT) => {}
+        Err(e) => return Err(e),
+    }
+    let payload = crate::transfer::staging_path(JobId(context.operation.0), 1);
+    let prepared = entry("prepared.json")?;
+    let mut receipt = match archive.read(&prepared, 65536) {
+        Ok(bytes) => serde_json::from_slice::<SnapshotReceipt>(&bytes)?,
+        Err(error) if error.errno == Some(libc::ENOENT) => {
+            let previous = archive.open_relative(&payload, libc::O_RDONLY | libc::O_NONBLOCK, 0);
+            let (digest, size, source_stamp, opaque_invalid) = match previous {
+                Ok(mut partial) => {
+                    if !partial.metadata()?.is_file() {
+                        return Err(AppError::integrity("owned history partial is not regular"));
+                    }
+                    let (digest, size) = digest_file(&mut partial)?;
+                    (digest, size, None, true)
+                }
+                Err(error) if error.errno == Some(libc::ENOENT) => {
+                    let mut source = local.open_relative(
+                        &context.owner.path,
+                        libc::O_RDONLY | libc::O_NONBLOCK,
+                        0,
+                    )?;
+                    let before = source.metadata()?;
+                    if !before.is_file() {
+                        return Err(AppError::invalid("saved sidecar is not regular"));
+                    }
+                    let (digest, size) = digest_file(&mut source)?;
+                    if size != before.len()
+                        || SnapshotStamp::of(&before) != SnapshotStamp::of(&source.metadata()?)
+                    {
+                        return Err(AppError::new(
+                            ErrorCode::SourceChanged,
+                            "saved sidecar changed before direct transfer",
+                        ));
+                    }
+                    let spec = crate::transfer::TransferSpec {
+                        job: JobId(context.operation.0),
+                        generation: 1,
+                        source: crate::transfer::SourceLocation {
+                            root: local.path().to_path_buf(),
+                            path: context.owner.path.clone(),
+                        },
+                        destination_root: archive.path().to_path_buf(),
+                        staged_path: payload.clone(),
+                        expected_digest: digest.clone(),
+                        expected_size: size,
+                    };
+                    let history = crate::archive::history_path(&digest)?;
+                    match archive.open_relative(&history, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+                        Ok(mut existing) => {
+                            if digest_file(&mut existing)? != (digest.clone(), size) {
+                                return Err(AppError::integrity(
+                                    "existing direct history has unknown bytes; preserved",
+                                ));
+                            }
+                        }
+                        Err(e) if e.errno == Some(libc::ENOENT) => {
+                            if available_bytes(archive)? < before.len() {
+                                return Err(AppError::new(
+                                    ErrorCode::Capacity,
+                                    "archive lacks space for direct saved history",
+                                ));
+                            }
+                            crate::transfer::TransferEngine::stage_confined(&spec, local, archive)?;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    let mut second = local.open_relative(
+                        &context.owner.path,
+                        libc::O_RDONLY | libc::O_NONBLOCK,
+                        0,
+                    )?;
+                    if digest_file(&mut second)? != (digest.clone(), size)
+                        || SnapshotStamp::of(&before) != SnapshotStamp::of(&source.metadata()?)
+                        || SnapshotStamp::of(&before) != SnapshotStamp::of(&second.metadata()?)
+                    {
+                        return Err(AppError::new(
+                            ErrorCode::SourceChanged,
+                            "saved sidecar changed during direct capture; owned partial retained",
+                        ));
+                    }
+                    let document = match archive.metadata_relative(&payload) {
+                        Ok(_) => &payload,
+                        Err(e) if e.errno == Some(libc::ENOENT) => &history,
+                        Err(e) => return Err(e),
+                    };
+                    let invalid = context.owner.kind == SidecarKind::RapidRaw
+                        && (size > ceiling
+                            || serde_json::from_slice::<serde_json::Value>(
+                                &archive.read(document, ceiling)?,
+                            )
+                            .ok()
+                            .is_none_or(|v| !v.is_object()));
+                    (digest, size, Some(SnapshotStamp::of(&before)), invalid)
+                }
+                Err(error) => return Err(error),
+            };
+            let receipt = SnapshotReceipt {
+                path: context.owner.path.clone(),
+                body: VersionBody::Content {
+                    digest: digest.clone(),
+                    size,
+                },
+                snapshot: Some(crate::archive::history_path(&digest)?),
+                stamp: None,
+                source_stamp,
+                state_device: archive.device(),
+                state_inode: archive.inode(),
+                opaque_invalid,
+                archive_history: true,
+            };
+            archive.write_new(&prepared, &serde_json::to_vec(&receipt)?)?;
+            receipt
+        }
+        Err(error) => return Err(error),
+    };
+    if receipt.path != context.owner.path
+        || !receipt.archive_history
+        || receipt.state_device != archive.device()
+        || receipt.state_inode != archive.inode()
+    {
+        return Err(AppError::integrity(
+            "prepared history receipt identity mismatch",
+        ));
+    }
+    let VersionBody::Content { digest, .. } = &receipt.body else {
+        return Err(AppError::integrity(
+            "direct saved history must contain bytes",
+        ));
+    };
+    let target = crate::archive::history_path(digest)?;
+    archive.mkdir_all(&ArchivePath::parse(
+        target
+            .as_str()
+            .rsplit_once('/')
+            .ok_or_else(|| AppError::invalid("history parent"))?
+            .0,
+    )?)?;
+    match publish_noreplace(archive, &payload, &target) {
+        Ok(_) => {}
+        Err(error) if error.errno == Some(libc::ENOENT) => {}
+        Err(error) => return Err(error),
+    }
+    receipt.snapshot = Some(target);
+    validate_history_receipt(archive, context, &receipt)?;
+    archive.write_new(&entry("receipt.json")?, &serde_json::to_vec(&receipt)?)?;
+    cleanup_history_partial(archive, context, &receipt)?;
+    local.validate_identity()?;
+    Ok(receipt)
+}
+fn cleanup_history_partial(
+    archive: &RootHandle,
+    context: &CaptureContext,
+    receipt: &SnapshotReceipt,
+) -> AppResult<()> {
+    let path = crate::transfer::staging_path(JobId(context.operation.0), 1);
+    let mut file = match archive.open_relative(&path, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+        Ok(file) => file,
+        Err(e) if e.errno == Some(libc::ENOENT) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let VersionBody::Content { digest, size } = &receipt.body else {
+        return Err(AppError::integrity(
+            "history cleanup requires exact content",
+        ));
+    };
+    if digest_file(&mut file)? != (digest.clone(), *size) {
+        return Err(AppError::integrity(
+            "unexpected direct history partial retained",
+        ));
+    }
+    archive.unlink(&path, false)
+}
+fn validate_history_receipt(
+    archive: &RootHandle,
+    context: &CaptureContext,
+    receipt: &SnapshotReceipt,
+) -> AppResult<()> {
+    let VersionBody::Content { digest, size } = &receipt.body else {
+        return Err(AppError::integrity("history receipt must contain bytes"));
+    };
+    if receipt.path != context.owner.path
+        || !receipt.archive_history
+        || receipt.state_device != archive.device()
+        || receipt.state_inode != archive.inode()
+        || receipt.snapshot.as_ref() != Some(&crate::archive::history_path(digest)?)
+    {
+        return Err(AppError::integrity("direct history receipt scope mismatch"));
+    }
+    let mut file = archive.open_relative(
+        &crate::archive::history_path(digest)?,
+        libc::O_RDONLY | libc::O_NONBLOCK,
+        0,
+    )?;
+    if digest_file(&mut file)? != (digest.clone(), *size) {
+        return Err(AppError::integrity(
+            "direct history object differs from its durable receipt",
+        ));
+    }
+    archive.validate_identity()
+}
+#[derive(Debug, Clone)]
+pub struct ArchivedSnapshot {
+    body: VersionBody,
+}
+impl ArchivedSnapshot {
+    pub(crate) fn from_receipt(receipt: &SnapshotReceipt) -> AppResult<Self> {
+        let VersionBody::Content { digest, .. } = &receipt.body else {
+            return Err(AppError::integrity("archived content required"));
+        };
+        if !receipt.archive_history
+            || receipt.snapshot.as_ref() != Some(&crate::archive::history_path(digest)?)
+        {
+            return Err(AppError::integrity("not an archive history receipt"));
+        }
+        Ok(Self {
+            body: receipt.body.clone(),
+        })
+    }
+    pub(crate) fn body(&self) -> VersionBody {
+        self.body.clone()
+    }
+}
+#[cfg(test)]
+mod direct_history_tests {
+    use super::*;
+    fn fixture() -> (tempfile::TempDir, RootHandle, RootHandle, CaptureContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let archive = temp.path().join("archive");
+        std::fs::create_dir(&local).unwrap();
+        std::fs::create_dir(&archive).unwrap();
+        let local = RootHandle::open(&local, RootPolicy::Local).unwrap();
+        let archive = RootHandle::open(&archive, RootPolicy::TestArchive).unwrap();
+        let context = CaptureContext {
+            operation: OperationId::new(),
+            owner: super::super::SidecarOwner {
+                id: SidecarId::new(),
+                group: None,
+                path: ArchivePath::parse("A.ORF.orig").unwrap(),
+                kind: SidecarKind::Opaque,
+                virtual_copy: None,
+            },
+            previous: None,
+        };
+        (temp, local, archive, context)
+    }
+    #[test]
+    fn direct_history_retry_uses_owned_receipt_after_live_file_changes() {
+        let (_temp, local, archive, context) = fixture();
+        local.write_new(&context.owner.path, b"captured").unwrap();
+        let receipt = capture_history(&local, &archive, &context, 1024).unwrap();
+        std::fs::write(local.path().join(context.owner.path.as_str()), b"new save").unwrap();
+        let recovered = capture_history(&local, &archive, &context, 1024).unwrap();
+        assert_eq!(receipt.body, recovered.body);
+        assert!(!recovered.still_matches(&local).unwrap());
+        assert_eq!(
+            archive
+                .read(receipt.snapshot.as_ref().unwrap(), 1024)
+                .unwrap(),
+            b"captured"
+        );
+    }
+    #[test]
+    fn interrupted_direct_prefix_remains_opaque_and_detached_without_overwriting_live_save() {
+        let (_temp, local, archive, context) = fixture();
+        local
+            .write_new(&context.owner.path, b"latest complete save")
+            .unwrap();
+        let directory = ArchivePath::parse(&format!(
+            ".photo-sorter/staging/history-capture-{}",
+            context.operation
+        ))
+        .unwrap();
+        archive.mkdir_all(&directory).unwrap();
+        archive
+            .write_new(
+                &ArchivePath::parse(&format!("{}/intent.json", directory.as_str())).unwrap(),
+                &serde_json::to_vec(&context).unwrap(),
+            )
+            .unwrap();
+        let payload = crate::transfer::staging_path(JobId(context.operation.0), 1);
+        archive
+            .mkdir_all(&ArchivePath::parse(payload.as_str().rsplit_once('/').unwrap().0).unwrap())
+            .unwrap();
+        archive.write_new(&payload, b"partial").unwrap();
+        let receipt = capture_history(&local, &archive, &context, 1024).unwrap();
+        assert!(receipt.opaque_invalid);
+        assert!(receipt.source_stamp.is_none());
+        assert_eq!(
+            receipt.body,
+            VersionBody::Content {
+                digest: Digest::of(b"partial"),
+                size: 7
+            }
+        );
+        assert_eq!(
+            local.read(&context.owner.path, 1024).unwrap(),
+            b"latest complete save"
+        );
+        assert_eq!(
+            archive
+                .read(receipt.snapshot.as_ref().unwrap(), 1024)
+                .unwrap(),
+            b"partial"
+        );
+    }
+    #[test]
+    fn unchanged_direct_native_history_reuses_exact_object_without_bulk_copy() {
+        let (_temp, local, archive, mut context) = fixture();
+        context.owner.kind = SidecarKind::RapidRaw;
+        context.owner.path = ArchivePath::parse("A.ORF.rrdata").unwrap();
+        local
+            .write_new(
+                &context.owner.path,
+                br#"{"version":1,"rating":3,"adjustments":null}"#,
+            )
+            .unwrap();
+        let first = capture_history(&local, &archive, &context, 1024).unwrap();
+        context.operation = OperationId::new();
+        let next = capture_history(&local, &archive, &context, 1024).unwrap();
+        assert_eq!(next.body, first.body);
+        assert!(!next.opaque_invalid);
+        let unused = ArchivePath::parse(&format!(
+            ".photo-sorter/staging/{}/1",
+            JobId(context.operation.0)
+        ))
+        .unwrap();
+        assert_eq!(
+            archive.metadata_relative(&unused).unwrap_err().errno,
+            Some(libc::ENOENT)
+        );
     }
 }
