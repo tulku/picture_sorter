@@ -46,6 +46,49 @@ pub struct Protection {
     pub conflict: bool,
     pub metadata_current: bool,
 }
+pub(crate) fn infer_primary_raw(db: &Connection, group: GroupId) -> AppResult<()> {
+    let unresolved:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM conflicts WHERE group_id=? AND kind='primary_raw' AND resolved=0)",[group.to_string()],|r|r.get(0))?;
+    if unresolved {
+        return Ok(());
+    }
+    let choice:Option<String>=db.query_row("SELECT c.path FROM primary_raw_choices c JOIN members m ON m.group_id=c.group_id AND m.path=c.path WHERE c.group_id=? AND m.role=?",params![group.to_string(),encode(&MediaRole::Raw)?],|r|r.get(0)).optional()?;
+    if let Some(choice) = choice {
+        db.execute(
+            "UPDATE groups SET primary_raw=? WHERE id=?",
+            params![choice, group.to_string()],
+        )?;
+        return Ok(());
+    }
+    let mut query =
+        db.prepare("SELECT path FROM members WHERE group_id=? AND role=? ORDER BY path")?;
+    let raws = query
+        .query_map(params![group.to_string(), encode(&MediaRole::Raw)?], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let orfs = raws
+        .iter()
+        .filter(|p| p.to_ascii_lowercase().ends_with(".orf"))
+        .collect::<Vec<_>>();
+    let primary = if raws.len() == 1 {
+        raws.first()
+    } else if orfs.len() == 1
+        && raws.iter().all(|p| {
+            p.to_ascii_lowercase().ends_with(".orf") || p.to_ascii_lowercase().ends_with(".ori")
+        })
+    {
+        Some(orfs[0])
+    } else {
+        None
+    };
+    if let Some(primary) = primary {
+        db.execute(
+            "UPDATE groups SET primary_raw=? WHERE id=?",
+            params![primary, group.to_string()],
+        )?;
+    }
+    Ok(())
+}
 pub(crate) fn canonical(db: &Connection, id: GroupId) -> AppResult<GroupId> {
     let mut id = id;
     let mut visited = BTreeSet::new();
@@ -151,6 +194,7 @@ pub(crate) fn merge(
                 params![winner, old],
             )?;
         }
+        db.execute("INSERT INTO primary_raw_choices(group_id,path,operation) SELECT ?,path,operation FROM primary_raw_choices WHERE group_id=? ON CONFLICT(group_id) DO NOTHING",params![winner,old])?;
         for table in ["rating_baselines", "rating_authorities"] {
             let old_row:Option<String>=db.query_row(&format!("SELECT json_object({}) FROM {table} WHERE group_id=?",if table=="rating_baselines" {"'common',common,'applied_local',applied_local,'pending',pending,'pending_version',pending_version,'source_version',source_version,'remote_observation',remote_observation"} else {"'server',server,'asset',asset"}),[&old],|r|r.get(0)).optional()?;
             if let Some(payload) = old_row {
@@ -389,6 +433,7 @@ impl Catalog {
             tx.execute("UPDATE residency SET ready_revision=NULL,metadata_current=0,protected=1 WHERE group_id=?",[id.to_string()])?;
             id
         };
+        infer_primary_raw(&tx, target)?;
         let revision = tx.query_row(
             "SELECT revision FROM groups WHERE id=?",
             [target.to_string()],
@@ -406,7 +451,7 @@ impl Catalog {
     pub fn protection(&self, id: GroupId) -> AppResult<Protection> {
         let id = self.canonical_group(id)?;
         Ok(self.db.query_row(
-            "SELECT pin,protected,conflict,metadata_current FROM residency WHERE group_id=?",
+            "SELECT pin,protected,conflict OR EXISTS(SELECT 1 FROM conflicts c,json_each(c.details,'$.groups') e WHERE c.kind='association' AND c.resolved=0 AND (e.value=residency.group_id OR EXISTS(SELECT 1 FROM aliases a WHERE a.alias=e.value AND a.canonical=residency.group_id))),metadata_current FROM residency WHERE group_id=?",
             [id.to_string()],
             |r| {
                 Ok(Protection {

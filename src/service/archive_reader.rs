@@ -600,6 +600,7 @@ fn record_finding(
     finding: IntegrityFinding,
 ) -> AppResult<()> {
     let report = IntegrityReport {
+        verified: vec![],
         checked: 0,
         findings: vec![finding.clone()],
     };

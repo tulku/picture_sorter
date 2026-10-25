@@ -238,6 +238,10 @@ fn apply_record(
                     [group.to_string()],
                 )?;
             }
+            super::conflicts::refresh_association_flags(db)?;
+        }
+        ArchiveRecord::SemanticAmbiguityResolved { request, witness } => {
+            super::conflicts::apply_semantic_resolution(db, request, witness)?
         }
         ArchiveRecord::AmbiguityResolved { request } => {
             super::conflicts::apply_resolution(db, request)?
@@ -342,6 +346,7 @@ fn apply_record(
                 )?;
             }
             let canonical = super::identity::canonical(db, group)?;
+            super::identity::infer_primary_raw(db, canonical)?;
             db.execute("INSERT INTO placements(id,group_id,path,digest,archived) VALUES(?,?,?,?,1) ON CONFLICT(path,group_id) DO UPDATE SET archived=1",params![OperationId::new().to_string(),canonical.to_string(),member.path.as_str(),member.digest.as_str()])?;
         }
         ArchiveRecord::SidecarCreated {
@@ -554,6 +559,9 @@ fn apply_record(
                 ));
             }
             db.execute("INSERT INTO mappings(server,asset,library,path,digest,group_id,remote_checksum,external_path) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",params![server,asset.to_string(),expected.0,path.as_str(),digest.as_str(),group.to_string(),remote_checksum,external_path])?;
+        }
+        ArchiveRecord::RatingConverged { evidence } => {
+            super::rating_convergence::apply(db, evidence)?
         }
         ArchiveRecord::RatingObserved {
             operation,

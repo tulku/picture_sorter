@@ -5,7 +5,7 @@ use crate::{
     fs::*,
 };
 use rusqlite::params;
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EvictionIntent {
     pub group: GroupId,
     pub revision: MembershipRevision,
@@ -58,6 +58,15 @@ impl EvictionPlanner {
     }
 }
 fn eligible(catalog: &Catalog, group: &Group, now: Timestamp, hold: u64) -> AppResult<bool> {
+    eligible_with_residency(catalog, group, now, hold, true)
+}
+fn eligible_with_residency(
+    catalog: &Catalog,
+    group: &Group,
+    now: Timestamp,
+    hold: u64,
+    require_resident: bool,
+) -> AppResult<bool> {
     if !matches!(
         catalog.publication_readiness()?,
         PublicationReadiness::Ready
@@ -69,7 +78,7 @@ fn eligible(catalog: &Catalog, group: &Group, now: Timestamp, hold: u64) -> AppR
         [group.id.to_string()],
         |r| r.get(0),
     )?;
-    if !resident {
+    if require_resident && !resident {
         return Ok(false);
     }
     let rating_pending:bool=catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM rating_intents WHERE group_id=? AND state IN('prepared','sent'))",[group.id.to_string()],|r|r.get(0))?;
@@ -92,6 +101,19 @@ fn eligible(catalog: &Catalog, group: &Group, now: Timestamp, hold: u64) -> AppR
     let dirty:bool=catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM sidecars s LEFT JOIN local_heads l ON s.id=l.sidecar LEFT JOIN projections p ON s.id=p.sidecar WHERE s.group_id=? AND (s.protected=1 OR l.dirty=1 OR p.pending=1))",[group.id.to_string()],|r|r.get(0))?;
     Ok(!bad && !dirty)
 }
+pub fn eviction_still_allowed(catalog: &Catalog, intent: &EvictionIntent) -> AppResult<bool> {
+    let group = catalog.group(intent.group)?;
+    let activity: u64 = catalog.db.query_row(
+        "SELECT last_activity FROM residency WHERE group_id=?",
+        [group.id.to_string()],
+        |r| r.get(0),
+    )?;
+    Ok(group.id == intent.group
+        && group.membership_revision == intent.revision
+        && group.members == intent.members
+        && activity == intent.eligibility_activity
+        && eligible_with_residency(catalog, &group, u64::MAX, 0, false)?)
+}
 pub struct Evictor<'a> {
     pub catalog: &'a mut Catalog,
     pub local: &'a RootHandle,
@@ -102,11 +124,26 @@ impl Evictor<'_> {
         intent: EvictionIntent,
         faults: &dyn FaultInjector,
     ) -> AppResult<EvictionReport> {
+        self.execute_inner(intent, faults, None)
+    }
+    pub fn execute_verified(
+        &mut self,
+        intent: EvictionIntent,
+        proof: &IntegrityReport,
+    ) -> AppResult<EvictionReport> {
+        self.execute_inner(intent, &NoFaults, Some(proof))
+    }
+    fn execute_inner(
+        &mut self,
+        intent: EvictionIntent,
+        faults: &dyn FaultInjector,
+        proof: Option<&IntegrityReport>,
+    ) -> AppResult<EvictionReport> {
         self.local.require_local()?;
         let group = self.catalog.group(intent.group)?;
         if group.membership_revision != intent.revision
             || group.members != intent.members
-            || !eligible(self.catalog, &group, u64::MAX, 0)?
+            || !eligible_with_residency(self.catalog, &group, u64::MAX, 0, proof.is_none())?
         {
             return Err(AppError::new(
                 ErrorCode::Conflict,
@@ -134,7 +171,7 @@ impl Evictor<'_> {
             }
             let current = self.catalog.group(group.id)?;
             if current.membership_revision != intent.revision
-                || !eligible(self.catalog, &current, u64::MAX, 0)?
+                || !eligible_with_residency(self.catalog, &current, u64::MAX, 0, proof.is_none())?
             {
                 return Err(AppError::new(
                     ErrorCode::Conflict,
@@ -149,7 +186,13 @@ impl Evictor<'_> {
             )?;
             if self.catalog.group(group.id)?.membership_revision != intent.revision
                 || activity != intent.eligibility_activity
-                || !eligible(self.catalog, &self.catalog.group(group.id)?, u64::MAX, 0)?
+                || !eligible_with_residency(
+                    self.catalog,
+                    &self.catalog.group(group.id)?,
+                    u64::MAX,
+                    0,
+                    proof.is_none(),
+                )?
             {
                 return Err(AppError::new(
                     ErrorCode::Conflict,
@@ -172,7 +215,15 @@ impl Evictor<'_> {
                     Err(e) => return Err(e),
                 };
             let mut file = file;
-            if crate::transfer::digest_file(&mut file)? != (member.digest, member.size) {
+            let current_stamp = crate::edit::SnapshotStamp::of(&file.metadata()?);
+            let verified = match proof {
+                Some(proof) => proof
+                    .verified
+                    .iter()
+                    .any(|(path, stamp)| path == &member.path && stamp == &current_stamp),
+                None => crate::transfer::digest_file(&mut file)? == (member.digest, member.size),
+            };
+            if !verified {
                 return Err(AppError::integrity("changed local original retained"));
             }
             self.local.unlink(&member.path, false)?;
@@ -192,17 +243,20 @@ impl Evictor<'_> {
 impl Catalog {
     pub fn refresh_protection(&mut self, group: GroupId) -> AppResult<()> {
         let group = self.canonical_group(group)?;
-        let originals:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM members m LEFT JOIN placements p ON p.group_id=m.group_id AND p.path=m.path AND p.digest=m.digest WHERE m.group_id=? AND (p.archived IS NULL OR p.archived=0))",[group.to_string()],|r|r.get(0))?;
-        let edits: bool = self.db.query_row(
+        refresh_group_protection(&self.db, group)
+    }
+}
+pub(crate) fn refresh_group_protection(db: &rusqlite::Connection, group: GroupId) -> AppResult<()> {
+    let originals:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM members m LEFT JOIN placements p ON p.group_id=m.group_id AND p.path=m.path AND p.digest=m.digest WHERE m.group_id=? AND (p.archived IS NULL OR p.archived=0))",[group.to_string()],|r|r.get(0))?;
+    let edits: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM sidecars s LEFT JOIN local_heads l ON l.sidecar=s.id LEFT JOIN projections p ON p.sidecar=s.id WHERE s.group_id=? AND (s.protected=1 OR l.dirty=1 OR p.pending=1 OR EXISTS(SELECT 1 FROM versions v WHERE v.sidecar=s.id AND NOT EXISTS(SELECT 1 FROM archived_versions a WHERE a.version=v.id)) OR EXISTS(SELECT 1 FROM sidecar_diagnostics d WHERE d.sidecar=s.id)))",
             [group.to_string()],
             |r| r.get(0),
         )?;
-        self.db.execute("UPDATE residency SET metadata_current=NOT EXISTS(SELECT 1 FROM sidecars s LEFT JOIN projections p ON p.sidecar=s.id LEFT JOIN local_heads l ON l.sidecar=s.id WHERE s.group_id=? AND s.owner<>'jpeg-xmp-external' AND (p.pending=1 OR p.sidecar IS NULL OR l.version IS NULL OR l.dirty=1 OR (SELECT count(*) FROM heads h WHERE h.sidecar=s.id)<>1 OR NOT EXISTS(SELECT 1 FROM heads h WHERE h.sidecar=s.id AND h.version=l.version))) WHERE group_id=?",params![group.to_string(),group.to_string()])?;
-        self.db.execute(
+    db.execute("UPDATE residency SET metadata_current=NOT EXISTS(SELECT 1 FROM sidecars s LEFT JOIN projections p ON p.sidecar=s.id LEFT JOIN local_heads l ON l.sidecar=s.id WHERE s.group_id=? AND s.owner<>'jpeg-xmp-external' AND (p.pending=1 OR p.sidecar IS NULL OR l.version IS NULL OR l.dirty=1 OR (SELECT count(*) FROM heads h WHERE h.sidecar=s.id)<>1 OR NOT EXISTS(SELECT 1 FROM heads h WHERE h.sidecar=s.id AND h.version=l.version))) WHERE group_id=?",params![group.to_string(),group.to_string()])?;
+    db.execute(
             "UPDATE residency SET protected=? WHERE group_id=?",
-            params![originals || edits || self.db.query_row("SELECT EXISTS(SELECT 1 FROM physical_findings WHERE group_id=? AND status<>'Missing') OR EXISTS(SELECT 1 FROM startup_checks WHERE group_id=?)",params![group.to_string(),group.to_string()],|r|r.get::<_,bool>(0))?, group.to_string()],
+            params![originals || edits || db.query_row("SELECT EXISTS(SELECT 1 FROM physical_findings WHERE group_id=? AND status<>'Missing') OR EXISTS(SELECT 1 FROM startup_checks WHERE group_id=?)",params![group.to_string(),group.to_string()],|r|r.get::<_,bool>(0))?, group.to_string()],
         )?;
-        Ok(())
-    }
+    Ok(())
 }

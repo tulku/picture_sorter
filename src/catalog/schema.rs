@@ -40,12 +40,17 @@ CREATE INDEX IF NOT EXISTS capture_neighborhood ON capture_facts(context,camera,
 CREATE TABLE IF NOT EXISTS sequence_members(digest TEXT NOT NULL,kind TEXT NOT NULL,anchor TEXT NOT NULL,PRIMARY KEY(digest,kind,anchor));
 CREATE TABLE IF NOT EXISTS import_scans(job TEXT PRIMARY KEY REFERENCES jobs(id),complete INTEGER NOT NULL DEFAULT 0,skipped INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS import_items(id TEXT PRIMARY KEY,parent TEXT NOT NULL REFERENCES jobs(id),source_root TEXT NOT NULL,source_path TEXT NOT NULL,digest TEXT NOT NULL,size INTEGER NOT NULL,role TEXT NOT NULL,group_id TEXT,destination TEXT NOT NULL,state TEXT NOT NULL,local_ready INTEGER NOT NULL DEFAULT 0,archived INTEGER NOT NULL DEFAULT 0,warning INTEGER NOT NULL DEFAULT 0,UNIQUE(parent,source_path,digest));
+CREATE TABLE IF NOT EXISTS retired_import_plans(item TEXT PRIMARY KEY,replacement TEXT NOT NULL,operation TEXT NOT NULL,previous TEXT NOT NULL,plan TEXT);
 CREATE TABLE IF NOT EXISTS upload_plans(item TEXT PRIMARY KEY,plan TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS writer_sequences(writer TEXT PRIMARY KEY,sequence INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS import_stats(job TEXT PRIMARY KEY REFERENCES jobs(id),selected INTEGER NOT NULL DEFAULT 0,recognized INTEGER NOT NULL DEFAULT 0,exif_calls INTEGER NOT NULL DEFAULT 0,transfer_bytes INTEGER NOT NULL DEFAULT 0,hash_bytes INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS group_facts(context TEXT NOT NULL,stem TEXT NOT NULL,camera TEXT NOT NULL,capture TEXT NOT NULL,group_id TEXT NOT NULL REFERENCES groups(id),PRIMARY KEY(context,stem,camera,capture));
 "#;
 pub const EDIT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS cleanup_requests(job TEXT PRIMARY KEY,done INTEGER NOT NULL DEFAULT 0,plan TEXT NOT NULL,scheduled INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS cleanup_children(parent TEXT NOT NULL,child TEXT NOT NULL,PRIMARY KEY(parent,child));
+CREATE TABLE IF NOT EXISTS cleanup_evictions(job TEXT PRIMARY KEY,intent TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS cleanup_receipts(kind TEXT NOT NULL,path TEXT NOT NULL,digest TEXT NOT NULL,state TEXT NOT NULL,reason TEXT,PRIMARY KEY(kind,path,digest));
 CREATE TABLE IF NOT EXISTS derived_heads(version TEXT PRIMARY KEY,sidecar TEXT NOT NULL,expected TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS metadata_merge_attempts(sidecar TEXT NOT NULL,signature TEXT NOT NULL,reason TEXT NOT NULL,PRIMARY KEY(sidecar,signature));
 CREATE TABLE IF NOT EXISTS pin_sync_epochs(job TEXT PRIMARY KEY,required INTEGER NOT NULL);
@@ -84,6 +89,7 @@ CREATE TABLE bootstrap_scans(job TEXT PRIMARY KEY REFERENCES jobs(id),request TE
 CREATE TABLE bootstrap_observations(job TEXT NOT NULL,path TEXT NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(job,path,digest));
 "#;
 pub const RESOLUTION_SCHEMA: &str = r#"
+CREATE TABLE primary_raw_choices(group_id TEXT PRIMARY KEY REFERENCES groups(id),path TEXT NOT NULL,operation TEXT NOT NULL);
 CREATE TABLE resolution_receipts(operation TEXT PRIMARY KEY,request TEXT NOT NULL);
 CREATE TABLE independent_groups(group_id TEXT PRIMARY KEY REFERENCES groups(id),operation TEXT NOT NULL);
 CREATE TABLE retained_companions(sidecar TEXT PRIMARY KEY REFERENCES sidecars(id),operation TEXT NOT NULL);

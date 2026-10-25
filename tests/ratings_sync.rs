@@ -530,3 +530,120 @@ fn outbound_rating_refuses_replaced_managed_root_even_with_matching_runtime_evid
     );
     assert!(server.state.writes.lock().unwrap().is_empty());
 }
+
+#[test]
+fn rating_conflict_evidence_is_immutable_when_later_observations_change() {
+    let rig = support::TestRig::new();
+    let mut catalog =
+        Catalog::open(&RootHandle::open(&rig.state, RootPolicy::Local).unwrap()).unwrap();
+    let group = catalog.create_group(false).unwrap();
+    let first = catalog
+        .record_rating_conflict(group, "rating", serde_json::json!({"local":3,"remote":5}))
+        .unwrap();
+    let second = catalog
+        .record_rating_conflict(group, "rating", serde_json::json!({"local":0,"remote":5}))
+        .unwrap();
+    assert_ne!(first, second);
+    assert_eq!(
+        catalog.conflict(first).unwrap().details,
+        serde_json::json!({"local":3,"remote":5})
+    );
+    assert_eq!(
+        catalog
+            .record_rating_conflict(group, "rating", serde_json::json!({"local":0,"remote":5}))
+            .unwrap(),
+        second
+    );
+}
+
+#[test]
+fn both_apps_agreement_journals_resolution_without_an_outgoing_write() {
+    use photo_sorter::archive::*;
+    let rig = support::TestRig::new();
+    let server = support::http::RatingServer::new();
+    let (mut catalog, client, group) = setup(&rig, &server);
+    let (sidecar, version) = saved_raw(&rig, &mut catalog, group);
+    let reader = rusqlite::Connection::open(rig.state.join("catalog.sqlite")).unwrap();
+    let operation: String = reader
+        .query_row(
+            "SELECT operation FROM versions WHERE id=?",
+            [version.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut records = vec![ArchiveRecord::GroupCreated { id: group }];
+    for member in catalog.group(group).unwrap().members {
+        records.push(ArchiveRecord::MemberAttached {
+            group,
+            evidence: PairEvidence::ObservedPlacement {
+                path: member.path.clone(),
+                digest: member.digest.clone(),
+            },
+            member,
+        });
+    }
+    records.extend([
+        ArchiveRecord::SidecarCreated {
+            id: sidecar,
+            group: Some(group),
+            path: ArchivePath::parse("RAW/a.ORF.rrdata").unwrap(),
+            owner: "rapidraw-base".into(),
+        },
+        ArchiveRecord::VersionAdded {
+            version: catalog.version(version).unwrap(),
+            operation: serde_json::from_value(operation.into()).unwrap(),
+        },
+        ArchiveRecord::HeadsChanged {
+            sidecar,
+            expected: vec![],
+            heads: vec![version],
+        },
+    ]);
+    let archive = ArchiveId::new();
+    catalog
+        .apply_commit(&CommitEnvelope::new(archive, WriterId::new(), 1, vec![], records).unwrap())
+        .unwrap();
+    let conflict = catalog
+        .record_rating_conflict(group, "rating", serde_json::json!({"local":3,"remote":5}))
+        .unwrap();
+    *server.state.rating.lock().unwrap() = Some(3);
+    RatingSynchronizer {
+        catalog: &mut catalog,
+        client: &client,
+    }
+    .poll(RatingScope {
+        state_root: rig.state.clone(),
+        editor_version: "1.6.6".into(),
+        after: None,
+        limit: 128,
+    })
+    .unwrap();
+    assert!(
+        !catalog.conflict(conflict).unwrap().resolved,
+        "agreement must be shared before clearing"
+    );
+    let mut query = reader
+        .prepare("SELECT records FROM pending_shared_records WHERE committed=0 ORDER BY rowid")
+        .unwrap();
+    let rows = query
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let convergence = rows
+        .into_iter()
+        .map(|s| serde_json::from_str::<Vec<ArchiveRecord>>(&s).unwrap())
+        .find(|r| {
+            r.iter()
+                .any(|r| matches!(r, ArchiveRecord::RatingConverged { .. }))
+        })
+        .expect("fresh matching observations must queue shared convergence");
+    catalog
+        .apply_commit(
+            &CommitEnvelope::new(archive, WriterId::new(), 1, vec![], convergence).unwrap(),
+        )
+        .unwrap();
+    assert!(catalog.conflict(conflict).unwrap().resolved);
+    assert!(server.state.writes.lock().unwrap().is_empty());
+    assert!(!rig.local.join("RAW/a.ORF").exists());
+}

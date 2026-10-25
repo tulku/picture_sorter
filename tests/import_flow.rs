@@ -262,3 +262,46 @@ fn split_pair_expands_pin() {
     assert!(e.catalog.protection(group.id).unwrap().pinned);
     assert!(!e.catalog.readiness(group.id).unwrap().originals_ready);
 }
+
+#[test]
+fn native_import_preserves_ambiguous_raws_as_independent_groups() {
+    let r = support::TestRig::new();
+    for (name, body) in [("a.ORF", b"raw-a"), ("a.NEF", b"raw-b")] {
+        std::fs::write(r.source.join(name), body).unwrap();
+    }
+    let mut e = engine(&r).with_extractor(Box::new(SyntheticCamera));
+    e.prepare(request(&r)).unwrap();
+    let groups = e.catalog.group_batch(None, 128).unwrap();
+    assert_eq!(groups.len(), 2);
+    assert!(groups.iter().all(|g| g.members.len() == 1));
+    assert!(
+        groups
+            .iter()
+            .all(|g| e.catalog.protection(g.id).unwrap().conflict)
+    );
+    assert!(
+        e.catalog
+            .conflicts(false)
+            .unwrap()
+            .iter()
+            .any(|c| c.kind == "association")
+    );
+}
+
+#[test]
+fn native_import_selects_orf_primary_over_ori() {
+    let r = support::TestRig::new();
+    std::fs::write(r.source.join("a.ORF"), b"raw-a").unwrap();
+    std::fs::write(r.source.join("a.ORI"), b"raw-b").unwrap();
+    let mut e = engine(&r).with_extractor(Box::new(SyntheticCamera));
+    e.prepare(request(&r)).unwrap();
+    let groups = e.catalog.group_batch(None, 128).unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].members.len(), 2);
+    assert!(
+        groups[0]
+            .primary_raw
+            .as_ref()
+            .is_some_and(|p| p.as_str().ends_with(".ORF"))
+    );
+}

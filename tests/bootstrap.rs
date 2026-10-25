@@ -301,7 +301,10 @@ fn every_ambiguity_resolution_preserves_bytes() {
         cat.canonical_group(g).unwrap(),
         cat.canonical_group(h).unwrap()
     );
-    assert!(cat.resolution_records(&request).is_err());
+    assert!(cat.resolution_records(&request).unwrap().is_empty());
+    let mut stale = request.clone();
+    stale.operation = OperationId::new();
+    assert!(cat.resolution_records(&stale).is_err());
     assert_eq!(std::fs::read(r.local.join("A.ORF")).unwrap(), b"raw");
     let variants = vec![
         ConflictResolution::ChooseHead {

@@ -56,12 +56,17 @@ impl ServiceFixture {
         }
     }
     pub fn restart(&mut self) {
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.r._temp.path().join("service-output.log"))
+            .unwrap();
         self.child = Command::new(env!("CARGO_BIN_EXE_photo_sorter"))
             .arg("--config")
             .arg(&self.profile)
             .args(["service", "run"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
             .spawn()
             .unwrap();
         let deadline = Instant::now();
@@ -70,7 +75,13 @@ impl ServiceFixture {
             if out.status.success() {
                 break;
             }
-            assert!(self.child.try_wait().unwrap().is_none());
+            let exited = self.child.try_wait().unwrap();
+            assert!(
+                exited.is_none(),
+                "fixture service exited: {exited:?}: {}",
+                std::fs::read_to_string(self.r._temp.path().join("service-output.log"))
+                    .unwrap_or_default()
+            );
             assert!(deadline.elapsed() < Duration::from_secs(5));
             std::thread::sleep(Duration::from_millis(10));
         }

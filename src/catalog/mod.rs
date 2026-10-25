@@ -144,3 +144,6 @@ pub(crate) fn backup_readonly(state: &RootHandle, dest: &Path) -> AppResult<()> 
     state.validate_identity()?;
     Ok(())
 }
+
+mod rating_convergence;
+pub use rating_convergence::*;

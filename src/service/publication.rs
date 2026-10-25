@@ -26,6 +26,7 @@ struct Active {
 }
 #[derive(Clone)]
 enum Candidate {
+    Ambiguity(ConflictId),
     Version(VersionId),
     Records(OperationId),
     Projection(SidecarId, VersionId),
@@ -371,6 +372,7 @@ impl SharedPublisher {
 }
 fn candidate_key(candidate: &Candidate) -> String {
     match candidate {
+        Candidate::Ambiguity(id) => format!("ambiguity:{id}"),
         Candidate::Version(v) => format!("version:{v}"),
         Candidate::Projection(sidecar, version) => format!("projection:{sidecar}:{version}"),
         Candidate::Records(op) => format!("records:{op}"),
@@ -395,6 +397,12 @@ fn select(catalog: &Catalog) -> AppResult<Option<Candidate>> {
         return Ok(Some(Candidate::Records(serde_json::from_str(&format!(
             "\"{op}\""
         ))?)));
+    }
+    let ambiguity:Option<String>=catalog.db.query_row("SELECT c.id FROM conflicts c WHERE c.resolved=0 AND NOT EXISTS(SELECT 1 FROM published_conflicts p WHERE p.id=c.id) AND NOT EXISTS(SELECT 1 FROM publication_failures f WHERE f.source='ambiguity:'||c.id AND f.next_attempt>?) ORDER BY c.rowid LIMIT 1",[now],|r|r.get(0)).optional()?;
+    if let Some(id) = ambiguity {
+        return Ok(Some(Candidate::Ambiguity(serde_json::from_value(
+            id.into(),
+        )?)));
     }
     let version:Option<String>=catalog.db.query_row("SELECT v.id FROM versions v JOIN sidecars s ON s.id=v.sidecar WHERE NOT EXISTS(SELECT 1 FROM archived_versions a WHERE a.version=v.id) AND NOT EXISTS(SELECT 1 FROM version_parents p WHERE p.version=v.id AND NOT EXISTS(SELECT 1 FROM archived_versions a WHERE a.version=p.parent)) AND (s.group_id IS NULL OR EXISTS(SELECT 1 FROM members m JOIN placements p ON p.group_id=m.group_id AND p.path=m.path AND p.digest=m.digest WHERE m.group_id=s.group_id AND p.archived=1 AND substr(s.path,1,length(m.path))=m.path)) AND NOT EXISTS(SELECT 1 FROM publication_failures f WHERE f.source='version:'||v.id AND f.next_attempt>?) ORDER BY v.rowid LIMIT 1",[now],|r|r.get(0)).optional()?;
     version
@@ -456,6 +464,27 @@ fn prepare(engine: &mut ImportCoordinator, candidate: &Candidate) -> AppResult<V
                 "projection repair cannot create a new commit",
             ));
         }
+        Candidate::Ambiguity(id) => {
+            let conflict = engine.catalog.conflict(*id)?;
+            if let Some(group) = conflict.group {
+                records.push(ArchiveRecord::GroupCreated { id: group });
+            }
+            if conflict.kind == "association"
+                && let Some(groups) = conflict.details.get("groups").and_then(|g| g.as_array())
+            {
+                for group in groups {
+                    records.push(ArchiveRecord::GroupCreated {
+                        id: serde_json::from_value(group.clone())?,
+                    });
+                }
+            }
+            records.push(ArchiveRecord::AmbiguityRecorded {
+                id: conflict.id,
+                kind: conflict.kind,
+                group: conflict.group,
+                details: conflict.details,
+            });
+        }
         Candidate::Records(operation) => {
             let text: String = engine.catalog.db.query_row(
                 "SELECT records FROM pending_shared_records WHERE operation=?",
@@ -464,6 +493,37 @@ fn prepare(engine: &mut ImportCoordinator, candidate: &Candidate) -> AppResult<V
             )?;
             records = serde_json::from_str(&text)?;
             for record in records.clone() {
+                if let ArchiveRecord::RatingConverged { evidence } = &record {
+                    engine.catalog.validate_rating_convergence(evidence)?;
+                    let mut prefix = Vec::new();
+                    for (id, _) in &evidence.conflicts {
+                        let shared: bool = engine.catalog.db.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM published_conflicts WHERE id=?)",
+                            [id.to_string()],
+                            |r| r.get(0),
+                        )?;
+                        if !shared {
+                            let conflict = engine.catalog.conflict(*id)?;
+                            if let Some(group) = conflict.group {
+                                prefix.push(ArchiveRecord::GroupCreated { id: group });
+                            }
+                            prefix.push(ArchiveRecord::AmbiguityRecorded {
+                                id: *id,
+                                kind: conflict.kind,
+                                group: conflict.group,
+                                details: conflict.details,
+                            });
+                        }
+                    }
+                    prefix.extend(records);
+                    records = prefix;
+                }
+
+                if let ArchiveRecord::SemanticAmbiguityResolved { request, witness } = &record {
+                    engine
+                        .catalog
+                        .validate_shared_resolution(request, witness)?;
+                }
                 if let ArchiveRecord::MappingRecorded {
                     path,
                     digest,
@@ -479,12 +539,14 @@ fn prepare(engine: &mut ImportCoordinator, candidate: &Candidate) -> AppResult<V
                         ));
                     }
                 }
-                if let ArchiveRecord::AmbiguityResolved { request } = record {
+                if let ArchiveRecord::AmbiguityResolved { request }
+                | ArchiveRecord::SemanticAmbiguityResolved { request, .. } = record
+                {
                     let conflict = engine.catalog.conflict(request.conflict)?;
                     let mut prefix = vec![];
                     for (group, _) in &request.expected_memberships {
                         if !engine.catalog.group(*group)?.members.is_empty() {
-                            let all:bool=engine.catalog.db.query_row("SELECT NOT EXISTS(SELECT 1 FROM members m WHERE group_id=? AND NOT EXISTS(SELECT 1 FROM placements p WHERE p.group_id=m.group_id AND p.path=m.path AND p.digest=m.digest AND p.archived=1))",[group.to_string()],|r|r.get(0))?;
+                            let all:bool=engine.catalog.db.query_row("SELECT NOT EXISTS(SELECT 1 FROM members m WHERE group_id=? AND NOT (?='original_collision' AND m.path=json_extract(?,'$.path') AND m.digest=json_extract(?,'$.digest')) AND NOT EXISTS(SELECT 1 FROM placements p WHERE p.group_id=m.group_id AND p.path=m.path AND p.digest=m.digest AND p.archived=1))",params![group.to_string(),conflict.kind,serde_json::to_string(&conflict.details)?,serde_json::to_string(&conflict.details)?],|r|r.get(0))?;
                             if !all {
                                 return Err(AppError::new(
                                     ErrorCode::Unavailable,
@@ -641,6 +703,15 @@ fn prepare(engine: &mut ImportCoordinator, candidate: &Candidate) -> AppResult<V
             }
         }
     }
+    for record in &records {
+        if let ArchiveRecord::ProjectionPlanned { plan } = record
+            && !projections
+                .iter()
+                .any(|p: &ProjectionPlan| p.sidecar == plan.sidecar && p.version == plan.version)
+        {
+            projections.push(plan.clone());
+        }
+    }
     let source = candidate_key(candidate);
     let previous:Option<(String,String)>=engine.catalog.db.query_row("SELECT r.operation,p.plan FROM publication_revisions r JOIN publication_plans p ON p.operation=r.operation WHERE r.source=? ORDER BY r.revision DESC LIMIT 1",[&source],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let operation = if let Some((operation, plan)) = previous {
@@ -727,7 +798,7 @@ fn acknowledge(
     let sidecar = match active.candidate {
         Candidate::Version(version) => Some(catalog.version(version)?.sidecar),
         Candidate::Projection(sidecar, _) => Some(sidecar),
-        Candidate::Records(_) => None,
+        Candidate::Records(_) | Candidate::Ambiguity(_) => None,
     };
     if let Some(sidecar) = sidecar {
         let group: Option<String> = catalog.db.query_row(

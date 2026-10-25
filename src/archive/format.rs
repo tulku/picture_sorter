@@ -39,6 +39,10 @@ pub enum ArchiveRecord {
         group: Option<GroupId>,
         details: serde_json::Value,
     },
+    SemanticAmbiguityResolved {
+        request: crate::catalog::ResolutionRequest,
+        witness: serde_json::Value,
+    },
     AmbiguityResolved {
         request: crate::catalog::ResolutionRequest,
     },
@@ -95,6 +99,9 @@ pub enum ArchiveRecord {
         path: ArchivePath,
         digest: Digest,
         group: GroupId,
+    },
+    RatingConverged {
+        evidence: crate::catalog::RatingConvergence,
     },
     RatingObserved {
         operation: OperationId,

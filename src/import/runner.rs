@@ -281,6 +281,27 @@ impl ImportCoordinator {
             }
         }
         let sequences = self.catalog.classify_import_sequences(&captures)?;
+        let mut ambiguous = std::collections::BTreeMap::new();
+        for capture in &captures {
+            let facts = capture.facts();
+            if facts.camera.is_empty() || facts.capture.is_empty() {
+                continue;
+            }
+            let mut query=self.catalog.db.prepare("SELECT payload FROM capture_facts WHERE context=? AND camera=? AND json_extract(payload,'$.stem')=? AND json_extract(payload,'$.metadata.capture')=? ORDER BY path,digest LIMIT 129")?;
+            let neighbors = query
+                .query_map(
+                    params![facts.context, facts.camera, facts.stem, facts.capture],
+                    |r| r.get::<_, String>(0),
+                )?
+                .map(|r| Ok(serde_json::from_str::<CaptureRecord>(&r?)?))
+                .collect::<AppResult<Vec<_>>>()?;
+            let pairs = pair_candidates(&neighbors);
+            if neighbors.len() > 128
+                || (neighbors.len() > 1 && pairs.iter().all(|p| p.members.len() == 1))
+            {
+                ambiguous.insert(capture.member.path.clone(), neighbors);
+            }
+        }
         for (entry, recognition) in entries.iter().zip(recognized) {
             let exists:bool=self.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM import_items WHERE parent=? AND source_path=? AND digest=?)",params![job.to_string(),entry.path.as_str(),recognition.digest.as_str()],|r|r.get(0))?;
             if exists {
@@ -298,11 +319,23 @@ impl ImportCoordinator {
                     let facts = capture.facts();
                     let existing_group: Option<String> = if !facts.camera.is_empty()
                         && !facts.capture.is_empty()
+                        && !ambiguous.contains_key(&entry.path)
                     {
                         self.catalog.db.query_row("SELECT group_id FROM group_facts WHERE context=? AND stem=? AND camera=? AND capture=?",params![facts.context,facts.stem,facts.camera,facts.capture],|r|r.get(0)).optional()?
                     } else {
                         None
                     };
+                    let existing_group = existing_group.filter(|id| {
+                        !self
+                            .catalog
+                            .db
+                            .query_row(
+                                "SELECT EXISTS(SELECT 1 FROM independent_groups WHERE group_id=?)",
+                                [id],
+                                |r| r.get::<_, bool>(0),
+                            )
+                            .unwrap_or(true)
+                    });
                     let id = match existing_group {
                         Some(id) => serde_json::from_str(&format!("\"{id}\""))?,
                         None => self.catalog.create_group(false)?,
@@ -399,6 +432,43 @@ impl ImportCoordinator {
             };
             self.catalog.db.execute("INSERT INTO import_items(id,parent,source_root,source_path,digest,size,role,group_id,destination,state,local_ready,archived,warning) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",params![child.to_string(),job.to_string(),entry.root.path().to_str().ok_or_else(||AppError::invalid("UTF-8 source root required"))?,entry.path.as_str(),recognition.digest.as_str(),entry.size,serde_json::to_string(&entry.role)?,group.map(|g|g.to_string()),destination.as_str(),state,local,archived,warning])?;
             self.catalog.db.execute("UPDATE import_stats SET selected=selected+1,recognized=recognized+?,hash_bytes=hash_bytes WHERE job=?",params![u64::from(recognized_existing),job.to_string()])?;
+        }
+        for neighbors in ambiguous.values() {
+            let mut groups = std::collections::BTreeSet::new();
+            for neighbor in neighbors {
+                let mut query = self
+                    .catalog
+                    .db
+                    .prepare("SELECT group_id FROM members WHERE digest=?")?;
+                for group in
+                    query.query_map([neighbor.member.digest.as_str()], |r| r.get::<_, String>(0))?
+                {
+                    let group: GroupId = serde_json::from_value(group?.into())?;
+                    groups.insert(self.catalog.canonical_group(group)?);
+                }
+            }
+            let independent = groups.iter().all(|group| {
+                self.catalog
+                    .db
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM independent_groups WHERE group_id=?)",
+                        [group.to_string()],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .unwrap_or(false)
+            });
+            if groups.len() > 1 && !independent {
+                let groups = groups.into_iter().collect::<Vec<_>>();
+                let details = serde_json::json!({"groups":groups,"reason":"multiple originals share capture evidence without a unique RAW/JPEG pairing"});
+                let exists:bool=self.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM conflicts WHERE kind='association' AND resolved=0 AND details=?)",[serde_json::to_string(&details)?],|r|r.get(0))?;
+                if !exists {
+                    self.catalog.record_ambiguity(
+                        "association",
+                        groups.first().copied(),
+                        details,
+                    )?;
+                }
+            }
         }
         self.report(job)
     }

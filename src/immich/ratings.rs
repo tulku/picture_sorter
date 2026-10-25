@@ -556,6 +556,30 @@ impl RatingSynchronizer<'_> {
                 remote_observation: Some(observation),
             };
             let decision = reconcile_rating(&input);
+            if let (
+                RatingObservation::Stars(local_stars),
+                RatingObservation::Stars(remote_stars),
+                Some(version),
+            ) = (&local.value, &remote, local.version)
+                && local_stars == remote_stars
+            {
+                let witnesses = self.catalog.rating_conflict_witnesses(group)?;
+                if !witnesses.is_empty() {
+                    let key = Digest::of(serde_json::to_string(&witnesses)?.as_bytes());
+                    let convergence = self.catalog.rating_operation(&format!(
+                        "converge:{group}:{version}:{observation}:{key}"
+                    ))?;
+                    self.catalog.queue_rating_convergence(
+                        convergence,
+                        group,
+                        &server,
+                        asset,
+                        version,
+                        *local_stars,
+                    )?;
+                }
+            }
+
             let operation = self.catalog.rating_operation(&format!(
                 "rating:{group}:{asset}:{:?}:{observation}",
                 local.version
@@ -851,36 +875,12 @@ impl Catalog {
         details: serde_json::Value,
     ) -> AppResult<ConflictId> {
         let group = self.canonical_group(group)?;
-        let previous: Option<(String, String)> = self
-            .db
-            .query_row(
-                "SELECT id,details FROM conflicts WHERE group_id=? AND kind=? AND resolved=0",
-                params![group.to_string(), kind],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
         let encoded = serde_json::to_string(&details)?;
-        let id = if let Some((id, old)) = previous {
-            if old != encoded {
-                self.db.execute(
-                    "UPDATE conflicts SET details=?,revision=revision+1 WHERE id=?",
-                    params![encoded, id],
-                )?;
-            }
-            serde_json::from_str(&format!("\"{id}\""))?
-        } else {
-            let id = ConflictId::new();
-            self.db.execute(
-                "INSERT INTO conflicts(id,kind,group_id,details) VALUES(?,?,?,?)",
-                params![id.to_string(), kind, group.to_string(), encoded],
-            )?;
-            id
-        };
-        self.db.execute(
-            "UPDATE residency SET conflict=1,protected=1 WHERE group_id=?",
-            [group.to_string()],
-        )?;
-        Ok(id)
+        let previous:Option<String>=self.db.query_row("SELECT id FROM conflicts WHERE group_id=? AND kind=? AND details=? AND resolved=0 ORDER BY id LIMIT 1",params![group.to_string(),kind,encoded],|r|r.get(0)).optional()?;
+        if let Some(id) = previous {
+            return Ok(serde_json::from_value(id.into())?);
+        }
+        self.record_ambiguity(kind, Some(group), details)
     }
     pub fn select_rating_authority(
         &mut self,

@@ -52,13 +52,21 @@ impl ImportCoordinator {
                 .transition(transfer, child.generation, JobTransition::Start)?;
         }
         let generation = self.catalog.job(transfer)?.generation;
-        let spec = TransferSpec {
-            job: transfer,
-            generation,
-            source: SourceLocation {
+        let retained: Option<String> = self.catalog.db.query_row("SELECT json_extract(previous,'$.destination') FROM retired_import_plans WHERE replacement=? AND json_extract(previous,'$.local_ready')=1",[item.to_string()],|r|r.get(0)).optional()?;
+        let source = match retained {
+            Some(path) => SourceLocation {
+                root: self.config.working_root.clone(),
+                path: ArchivePath::parse(&path)?,
+            },
+            None => SourceLocation {
                 root: source_root.into(),
                 path: ArchivePath::parse(&source_path)?,
             },
+        };
+        let spec = TransferSpec {
+            job: transfer,
+            generation,
+            source,
             destination_root: self.config.working_root.clone(),
             staged_path: staging_path(transfer, generation),
             expected_digest: Digest::parse(&digest)?,
@@ -235,6 +243,14 @@ impl ImportCoordinator {
         }
         let tx = self.catalog.db.transaction()?;
         tx.execute(
+            "UPDATE attempts SET state=? WHERE job=? AND generation=?",
+            params![
+                serde_json::to_string("quiescent")?,
+                attempt.spec.job.to_string(),
+                attempt.spec.generation
+            ],
+        )?;
+        tx.execute(
             "UPDATE import_items SET local_ready=1,state='ingested' WHERE id=? AND parent=?",
             params![attempt.item.to_string(), attempt.parent.to_string()],
         )?;
@@ -271,6 +287,14 @@ impl ImportCoordinator {
         error: &AppError,
     ) -> AppResult<()> {
         self.catalog.update_reservation(attempt.reservation, 0)?;
+        self.catalog.db.execute(
+            "UPDATE attempts SET state=? WHERE job=? AND generation=?",
+            params![
+                serde_json::to_string("quiescent")?,
+                attempt.spec.job.to_string(),
+                attempt.spec.generation
+            ],
+        )?;
         let record = self.catalog.job(attempt.parent)?;
         let state = match error.code {
             ErrorCode::SourceChanged => JobState::WaitingSource,

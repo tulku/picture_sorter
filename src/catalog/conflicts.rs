@@ -35,6 +35,10 @@ pub struct ConflictRecord {
     pub details: serde_json::Value,
     pub resolved: bool,
 }
+pub(crate) fn refresh_association_flags(db: &Connection) -> AppResult<()> {
+    db.execute("UPDATE residency SET conflict=1 WHERE EXISTS(SELECT 1 FROM conflicts c,json_each(c.details,'$.groups') e WHERE c.kind='association' AND c.resolved=0 AND (e.value=residency.group_id OR EXISTS(SELECT 1 FROM aliases a WHERE a.alias=e.value AND a.canonical=residency.group_id)))",[])?;
+    Ok(())
+}
 impl Catalog {
     pub fn record_ambiguity(
         &mut self,
@@ -42,8 +46,12 @@ impl Catalog {
         group: Option<GroupId>,
         details: serde_json::Value,
     ) -> AppResult<ConflictId> {
-        let id = ConflictId::new();
         let group = group.map(|g| self.canonical_group(g)).transpose()?;
+        let previous:Option<String>=self.db.query_row("SELECT id FROM conflicts WHERE kind=? AND group_id IS ? AND details=? AND resolved=0 ORDER BY id LIMIT 1",params![kind,group.map(|g|g.to_string()),encode(&details)?],|r|r.get(0)).optional()?;
+        if let Some(id) = previous {
+            return Ok(serde_json::from_value(id.into())?);
+        }
+        let id = ConflictId::new();
         let tx = self.db.transaction()?;
         tx.execute(
             "INSERT INTO conflicts(id,kind,group_id,details) VALUES(?,?,?,?)",
@@ -60,6 +68,7 @@ impl Catalog {
                 [group.to_string()],
             )?;
         }
+        refresh_association_flags(&tx)?;
         tx.commit()?;
         Ok(id)
     }
@@ -140,12 +149,181 @@ impl Catalog {
                 })
             })
     }
-    pub fn resolution_records(&self, request: &ResolutionRequest) -> AppResult<Vec<ArchiveRecord>> {
-        validate(&self.db, request)?;
-        Ok(vec![ArchiveRecord::AmbiguityResolved {
-            request: request.clone(),
-        }])
+    pub fn resolution_applied(&self, request: &ResolutionRequest) -> AppResult<bool> {
+        let prior: Option<String> = self
+            .db
+            .query_row(
+                "SELECT request FROM resolution_receipts WHERE operation=?",
+                [request.operation.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match prior {
+            Some(prior) if prior == encode(request)? => Ok(true),
+            Some(_) => Err(failure()),
+            None => Ok(false),
+        }
     }
+    pub fn resolution_records(&self, request: &ResolutionRequest) -> AppResult<Vec<ArchiveRecord>> {
+        if self.resolution_applied(request)? {
+            return Ok(vec![]);
+        }
+        validate(&self.db, request)?;
+        let mut records = vec![ArchiveRecord::SemanticAmbiguityResolved {
+            request: request.clone(),
+            witness: semantic_witness(&self.db, request)?,
+        }];
+        if let ConflictResolution::ChooseHead { version } = request.resolution {
+            let chosen = self.version(version)?;
+            let (path, owner): (String, String) = self.db.query_row(
+                "SELECT path,owner FROM sidecars WHERE id=?",
+                [chosen.sidecar.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if owner == "rapidraw-base" || owner == "preserved-source-companion" {
+                let conflict = self.conflict(request.conflict)?;
+                let previous: Option<String> = self
+                    .db
+                    .query_row(
+                        "SELECT committed FROM projections WHERE sidecar=?",
+                        [chosen.sidecar.to_string()],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let expected = if conflict.kind == "nas_projection" {
+                    serde_json::from_value(conflict.details["observed"].clone())?
+                } else {
+                    previous
+                        .map(|p| {
+                            serde_json::from_str::<crate::archive::ProjectionPlan>(&p)
+                                .map(|p| p.body)
+                        })
+                        .transpose()?
+                        .unwrap_or(VersionBody::Reset)
+                };
+                records.push(ArchiveRecord::ProjectionPlanned {
+                    plan: crate::archive::ProjectionPlan {
+                        sidecar: chosen.sidecar,
+                        path: ArchivePath::parse(&path)?,
+                        version: VersionId(request.operation.0),
+                        expected,
+                        body: chosen.body,
+                        owner,
+                    },
+                });
+            }
+        }
+        Ok(records)
+    }
+}
+pub(crate) fn semantic_witness(
+    db: &Connection,
+    request: &ResolutionRequest,
+) -> AppResult<serde_json::Value> {
+    let conflict: (String, Option<String>, String) = db.query_row(
+        "SELECT kind,group_id,details FROM conflicts WHERE id=?",
+        [request.conflict.to_string()],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let mut groups = Vec::new();
+    for (group, _) in &request.expected_memberships {
+        let canonical = super::identity::canonical(db, *group)?;
+        let primary: Option<String> = db.query_row(
+            "SELECT primary_raw FROM groups WHERE id=?",
+            [canonical.to_string()],
+            |r| r.get(0),
+        )?;
+        let mut query=db.prepare("SELECT m.path,m.digest,m.role,b.size FROM members m JOIN blobs b ON b.digest=m.digest WHERE m.group_id=? ORDER BY m.path,m.digest,m.role")?;
+        let mut members = query
+            .query_map([canonical.to_string()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, u64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if conflict.0 == "original_collision" {
+            let disputed: OriginalMember = serde_json::from_str(&conflict.2)?;
+            members.retain(|m| m.0 != disputed.path.as_str() || m.1 != disputed.digest.as_str());
+        }
+        let primary = primary.filter(|path| members.iter().any(|m| &m.0 == path));
+        groups.push(serde_json::json!({"group":canonical,"primary":primary,"members":members}));
+    }
+    Ok(
+        serde_json::json!({"kind":conflict.0,"group":conflict.1,"details":serde_json::from_str::<serde_json::Value>(&conflict.2)?,"memberships":groups}),
+    )
+}
+pub(crate) fn validate_semantic(
+    db: &Connection,
+    request: &ResolutionRequest,
+    witness: &serde_json::Value,
+) -> AppResult<ResolutionRequest> {
+    if semantic_witness(db, request)? != *witness {
+        return Err(failure());
+    }
+    let mut localized = request.clone();
+    localized.expected_revision = db.query_row(
+        "SELECT revision FROM conflicts WHERE id=?",
+        [request.conflict.to_string()],
+        |r| r.get(0),
+    )?;
+    for (group, revision) in &mut localized.expected_memberships {
+        *revision = MembershipRevision(db.query_row(
+            "SELECT revision FROM groups WHERE id=?",
+            [group.to_string()],
+            |r| r.get(0),
+        )?);
+    }
+    validate(db, &localized)?;
+    Ok(localized)
+}
+impl Catalog {
+    pub fn validate_shared_resolution(
+        &self,
+        request: &ResolutionRequest,
+        witness: &serde_json::Value,
+    ) -> AppResult<()> {
+        validate_semantic(&self.db, request, witness).map(|_| ())
+    }
+}
+pub(crate) fn apply_semantic_resolution(
+    db: &Connection,
+    request: ResolutionRequest,
+    witness: serde_json::Value,
+) -> AppResult<()> {
+    let prior: Option<String> = db
+        .query_row(
+            "SELECT request FROM resolution_receipts WHERE operation=?",
+            [request.operation.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(prior) = prior {
+        return if prior == encode(&request)? {
+            Ok(())
+        } else {
+            Err(failure())
+        };
+    }
+    let localized = validate_semantic(db, &request, &witness)?;
+    apply_resolution(db, localized)?;
+    db.execute(
+        "UPDATE associations SET evidence=? WHERE id=?",
+        params![
+            encode(&PairEvidence::UserSelected {
+                reason: encode(&request)?
+            })?,
+            request.operation.to_string()
+        ],
+    )?;
+    db.execute(
+        "UPDATE resolution_receipts SET request=? WHERE operation=?",
+        params![encode(&request)?, request.operation.to_string()],
+    )?;
+    Ok(())
 }
 struct Context {
     kind: String,
@@ -203,8 +381,14 @@ fn validate(db: &Connection, request: &ResolutionRequest) -> AppResult<Context> 
             heads.sort();
             let mut expected = request.expected_heads.clone();
             expected.sort();
-            let mut recorded: Vec<VersionId> =
-                serde_json::from_value(context.details.clone()).map_err(|_| failure())?;
+            let mut recorded: Vec<VersionId> = if context.kind == "nas_projection" {
+                vec![
+                    serde_json::from_value(context.details["version"].clone())
+                        .map_err(|_| failure())?,
+                ]
+            } else {
+                serde_json::from_value(context.details.clone()).map_err(|_| failure())?
+            };
             recorded.sort();
             if expected != heads || recorded != heads || !heads.contains(version) {
                 return Err(failure());
@@ -373,7 +557,49 @@ pub(crate) fn apply_resolution(db: &Connection, request: ResolutionRequest) -> A
         }
         ConflictResolution::ChooseDistinctPath { path } => {
             let member: OriginalMember = serde_json::from_value(context.details.clone())?;
-            db.execute("UPDATE import_items SET destination=?,state='queued' WHERE group_id=? AND destination=? AND digest=? AND state='conflict'",params![path.as_str(),context.group.map(|g|g.to_string()),member.path.as_str(),member.digest.as_str()])?;
+            let mut query = db.prepare("SELECT id FROM import_items WHERE group_id=? AND destination=? AND digest=? AND state='conflict' AND archived=0")?;
+            let items = query
+                .query_map(
+                    params![
+                        context.group.map(|g| g.to_string()),
+                        member.path.as_str(),
+                        member.digest.as_str()
+                    ],
+                    |r| r.get::<_, String>(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            for item in items {
+                let replacement = JobId::new().to_string();
+                db.execute("INSERT INTO retired_import_plans(item,replacement,operation,previous,plan) SELECT id,?,?,json_object('destination',destination,'local_ready',local_ready,'digest',digest,'size',size),(SELECT plan FROM upload_plans WHERE item=import_items.id) FROM import_items WHERE id=?",params![replacement,request.operation.to_string(),item])?;
+                db.execute("DELETE FROM upload_plans WHERE item=?", [&item])?;
+                db.execute("UPDATE import_items SET id=?,destination=?,state='queued',local_ready=0 WHERE id=?",params![replacement,path.as_str(),item])?;
+                let attached=db.execute("INSERT INTO members(archive,path,group_id,digest,role) SELECT coalesce((SELECT id FROM archives ORDER BY id LIMIT 1),'unbound'),destination,group_id,digest,? FROM import_items WHERE id=? ON CONFLICT DO NOTHING",params![encode(&member.role)?,replacement])?;
+                if attached > 0 {
+                    db.execute(
+                        "UPDATE groups SET revision=revision+1 WHERE id=?",
+                        [context.group.map(|g| g.to_string())],
+                    )?;
+                }
+            }
+            let changed = db.execute("DELETE FROM members WHERE group_id=? AND path=? AND digest=? AND NOT EXISTS(SELECT 1 FROM placements p WHERE p.path=members.path AND p.digest=members.digest AND p.archived=1)",params![context.group.map(|g|g.to_string()),member.path.as_str(),member.digest.as_str()])?;
+            db.execute(
+                "DELETE FROM placements WHERE group_id=? AND path=? AND digest=? AND archived=0",
+                params![
+                    context.group.map(|g| g.to_string()),
+                    member.path.as_str(),
+                    member.digest.as_str()
+                ],
+            )?;
+            if changed > 0 {
+                db.execute("UPDATE groups SET revision=revision+1,primary_raw=CASE WHEN primary_raw=? THEN NULL ELSE primary_raw END WHERE id=?",params![member.path.as_str(),context.group.map(|g|g.to_string())])?;
+                db.execute(
+                    "UPDATE residency SET ready_revision=NULL,protected=1 WHERE group_id=?",
+                    [context.group.map(|g| g.to_string())],
+                )?;
+            }
+            if let Some(group) = context.group {
+                super::identity::infer_primary_raw(db, group)?;
+            }
         }
         ConflictResolution::AssociateGroups { groups } => {
             super::identity::merge(
@@ -390,8 +616,9 @@ pub(crate) fn apply_resolution(db: &Connection, request: ResolutionRequest) -> A
             }
         }
         ConflictResolution::SelectPrimaryRaw { member } => {
+            db.execute("INSERT INTO primary_raw_choices(group_id,path,operation) VALUES(?,?,?) ON CONFLICT(group_id) DO UPDATE SET path=excluded.path,operation=excluded.operation",params![context.group.map(|g|g.to_string()),member.as_str(),request.operation.to_string()])?;
             db.execute(
-                "UPDATE groups SET primary_raw=? WHERE id=?",
+                "UPDATE groups SET primary_raw=?,revision=revision+1 WHERE id=?",
                 params![member.as_str(), context.group.map(|g| g.to_string())],
             )?;
         }
@@ -423,6 +650,14 @@ pub(crate) fn apply_resolution(db: &Connection, request: ResolutionRequest) -> A
             db.execute("UPDATE residency SET conflict=EXISTS(SELECT 1 FROM conflicts WHERE group_id=? AND resolved=0) WHERE group_id=?",params![group.to_string(),group.to_string()])?;
         }
     }
+    for (group, _) in &request.expected_memberships {
+        let canonical = super::identity::canonical(db, *group)?;
+        db.execute("UPDATE residency SET conflict=EXISTS(SELECT 1 FROM conflicts WHERE group_id=? AND resolved=0) WHERE group_id=?",params![canonical.to_string(),canonical.to_string()])?;
+    }
+    refresh_association_flags(db)?;
+    for (group, _) in &request.expected_memberships {
+        crate::storage::refresh_group_protection(db, super::identity::canonical(db, *group)?)?;
+    }
     db.execute(
         "INSERT INTO associations(id,evidence) VALUES(?,?) ON CONFLICT DO NOTHING",
         params![
@@ -442,6 +677,206 @@ pub(crate) fn apply_resolution(db: &Connection, request: ResolutionRequest) -> A
 mod tests {
     use super::*;
     use crate::{archive::CommitEnvelope, fs::RootPolicy};
+    #[test]
+    fn explicit_primary_raw_survives_repeated_member_observation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = RootHandle::open(temporary.path(), RootPolicy::Local).unwrap();
+        let mut catalog = Catalog::open(&root).unwrap();
+        let group = catalog.create_group(false).unwrap();
+        let mut members = Vec::new();
+        for extension in ["ORF", "ORI"] {
+            let member = OriginalMember {
+                path: ArchivePath::parse(&format!("a.{extension}")).unwrap(),
+                digest: Digest::of(extension.as_bytes()),
+                size: 3,
+                role: MediaRole::Raw,
+            };
+            catalog
+                .attach_member(
+                    group,
+                    member.clone(),
+                    PairEvidence::ObservedPlacement {
+                        path: member.path.clone(),
+                        digest: member.digest.clone(),
+                    },
+                )
+                .unwrap();
+            members.push(member);
+        }
+        let conflict = catalog
+            .record_ambiguity(
+                "primary_raw",
+                Some(group),
+                serde_json::json!({"candidates":members}),
+            )
+            .unwrap();
+        let request = ResolutionRequest {
+            operation: OperationId::new(),
+            conflict,
+            expected_revision: 0,
+            expected_heads: vec![],
+            expected_memberships: vec![(group, catalog.group(group).unwrap().membership_revision)],
+            resolution: ConflictResolution::SelectPrimaryRaw {
+                member: members[1].path.clone(),
+            },
+        };
+        apply_resolution(&catalog.db, request).unwrap();
+        catalog
+            .attach_member(
+                group,
+                members[0].clone(),
+                PairEvidence::ObservedPlacement {
+                    path: members[0].path.clone(),
+                    digest: members[0].digest.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            catalog.group(group).unwrap().primary_raw,
+            Some(members[1].path.clone())
+        );
+    }
+    #[test]
+    fn shared_resolution_uses_semantic_evidence_across_private_revisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = RootHandle::open(temp.path(), RootPolicy::Local).unwrap();
+        let mut cat = Catalog::open(&root).unwrap();
+        let group = cat.create_group(false).unwrap();
+        let conflict = cat
+            .record_ambiguity(
+                "association",
+                Some(group),
+                serde_json::json!({"groups":[group]}),
+            )
+            .unwrap();
+        let request = ResolutionRequest {
+            operation: OperationId::new(),
+            conflict,
+            expected_revision: 0,
+            expected_heads: vec![],
+            expected_memberships: vec![(group, cat.group(group).unwrap().membership_revision)],
+            resolution: ConflictResolution::KeepIndependent {
+                groups: vec![group],
+            },
+        };
+        let records = cat.resolution_records(&request).unwrap();
+        cat.db
+            .execute("UPDATE groups SET revision=revision+17", [])
+            .unwrap();
+        cat.db
+            .execute("UPDATE conflicts SET revision=revision+9", [])
+            .unwrap();
+        let commit =
+            CommitEnvelope::new(ArchiveId::new(), WriterId::new(), 1, vec![], records).unwrap();
+        cat.apply_commit(&commit).unwrap();
+        assert!(cat.conflict(conflict).unwrap().resolved);
+        let recorded: String = cat
+            .db
+            .query_row(
+                "SELECT evidence FROM associations WHERE id=?",
+                [request.operation.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let provenance: PairEvidence = decode(recorded).unwrap();
+        assert!(
+            matches!(provenance,PairEvidence::UserSelected{reason} if reason==encode(&request).unwrap())
+        );
+        cat.apply_commit(&commit).unwrap();
+        assert_eq!(
+            cat.db
+                .query_row("SELECT request FROM resolution_receipts", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            encode(&request).unwrap()
+        );
+    }
+    #[test]
+    fn distinct_path_retires_old_attempt_and_unpublished_membership() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = RootHandle::open(temp.path(), RootPolicy::Local).unwrap();
+        let mut cat = Catalog::open(&root).unwrap();
+        let group = cat.create_group(false).unwrap();
+        let member = OriginalMember {
+            path: ArchivePath::parse("old.ORF").unwrap(),
+            digest: Digest::of(b"raw"),
+            size: 3,
+            role: MediaRole::Raw,
+        };
+        cat.attach_member(
+            group,
+            member.clone(),
+            PairEvidence::ObservedPlacement {
+                path: member.path.clone(),
+                digest: member.digest.clone(),
+            },
+        )
+        .unwrap();
+        let parent = cat
+            .enqueue(DurableRequest {
+                operation_id: OperationId::new(),
+                kind: JobKind::Import {
+                    source: temp.path().into(),
+                    strict: true,
+                },
+            })
+            .unwrap();
+        let item = JobId::new();
+        cat.db.execute("INSERT INTO import_items(id,parent,source_root,source_path,digest,size,role,group_id,destination,state,local_ready) VALUES(?,?,'/fixture','raw.ORF',?,3,?,?,'old.ORF','conflict',1)",params![item.to_string(),parent.to_string(),member.digest.as_str(),encode(&crate::import::SourceRole::Original(MediaRole::Raw)).unwrap(),group.to_string()]).unwrap();
+        cat.db
+            .execute(
+                "INSERT INTO upload_plans VALUES(?,'{}')",
+                [item.to_string()],
+            )
+            .unwrap();
+        let conflict = cat
+            .record_ambiguity(
+                "original_collision",
+                Some(group),
+                serde_json::to_value(&member).unwrap(),
+            )
+            .unwrap();
+        let request = ResolutionRequest {
+            operation: OperationId::new(),
+            conflict,
+            expected_revision: 0,
+            expected_heads: vec![],
+            expected_memberships: vec![(group, cat.group(group).unwrap().membership_revision)],
+            resolution: ConflictResolution::ChooseDistinctPath {
+                path: ArchivePath::parse("new.ORF").unwrap(),
+            },
+        };
+        apply_resolution(&cat.db, request).unwrap();
+        assert_eq!(
+            cat.db
+                .query_row("SELECT count(*) FROM upload_plans", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        let (id, ready, path): (String, bool, String) = cat
+            .db
+            .query_row(
+                "SELECT id,local_ready,destination FROM import_items",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_ne!(id, item.to_string());
+        assert!(!ready);
+        assert_eq!(path, "new.ORF");
+        assert_eq!(
+            cat.group(group).unwrap().members[0].path.as_str(),
+            "new.ORF"
+        );
+        assert_eq!(
+            cat.db
+                .query_row("SELECT count(*) FROM retired_import_plans", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+    }
     #[test]
     fn all_typed_resolutions_revalidate_and_preserve_history() {
         for case in 0..10 {

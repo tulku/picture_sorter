@@ -274,6 +274,7 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         maintenance: maintenance_worker,
         startup: super::recovery::StartupVerifier::default(),
         space: super::space::SpaceMeter::default(),
+        cleanup: super::cleanup::CleanupDriver::default(),
         reader: super::archive_reader::ArchiveReader::default(),
         http_reason,
         rating_cursor: None,
@@ -437,6 +438,7 @@ struct Runtime {
     maintenance: WorkerSupervisor,
     startup: super::recovery::StartupVerifier,
     space: super::space::SpaceMeter,
+    cleanup: super::cleanup::CleanupDriver,
     reader: super::archive_reader::ArchiveReader,
     http: Option<super::http::AsyncImmich>,
     http_reason: Option<String>,
@@ -502,7 +504,7 @@ impl Runtime {
                 let mut status = StatusSnapshot::collect_page(
                     &self.engine,
                     &self.space,
-                    serde_json::json!({"pid":self.worker.pid(),"local_pid":self.local_transfer.worker.pid(),"observation_pid":self.observation.worker.pid(),"maintenance_pid":self.maintenance.pid(),"available":self.worker.available()?}),
+                    serde_json::json!({"pid":self.worker.pid(),"local_pid":self.local_transfer.worker.pid(),"observation_pid":self.observation.worker.pid(),"maintenance_pid":self.maintenance.pid(),"available":self.worker.available()?,"control_job":self.control.as_ref().map(|control|control.job)}),
                     archive_status,
                     query,
                 )?;
@@ -879,6 +881,14 @@ impl Runtime {
             self.http_reason = Some(error.to_string());
         }
 
+        if let Err(error) = self.cleanup.advance(
+            &mut self.engine,
+            &self.local,
+            &self.state,
+            &mut self.maintenance,
+        ) {
+            self.cleanup.reason = Some(error.to_string());
+        }
         self.space
             .advance(&self.engine.config, &mut self.maintenance, clock.now())?;
         if let Err(error) = self.observation.advance(
@@ -1520,23 +1530,7 @@ impl Runtime {
                 }
             }
             JobKind::Clean => {
-                let intents = EvictionPlanner::candidates_with_hold(
-                    &self.engine.catalog,
-                    SystemClock::default().now(),
-                    config.activity_hold_seconds,
-                )?;
-                let mut removed = 0;
-                for intent in intents {
-                    removed += Evictor {
-                        catalog: &mut self.engine.catalog,
-                        local: &self.local,
-                    }
-                    .execute(intent, &NoFaults)?
-                    .removed;
-                }
-                self.result(job, serde_json::json!({"originals_removed":removed}))?;
-                self.complete(job)?;
-                SnapshotGc { state: &self.state }.collect(&mut self.engine.catalog)?;
+                self.cleanup.request_clean(&mut self.engine, job)?;
             }
             JobKind::ChangeMode { request } => {
                 if self.nas_job_allowed(job)
@@ -1626,6 +1620,10 @@ impl Runtime {
                     .start_verify(&mut self.engine, &self.state, &mut self.worker, job)?
             }
             JobKind::ResolveAmbiguity { request } => {
+                if self.engine.catalog.resolution_applied(request)? {
+                    self.complete(job)?;
+                    return Ok(());
+                }
                 let records = self.engine.catalog.resolution_records(request)?;
                 self.engine.catalog.db.execute("INSERT INTO pending_shared_records(operation,records) VALUES(?,?) ON CONFLICT DO NOTHING",params![request.operation.to_string(),serde_json::to_string(&records)?])?;
                 self.wait(
@@ -1672,11 +1670,10 @@ impl Runtime {
                 members,
                 activity,
             } => {
-                Evictor {
-                    catalog: &mut self.engine.catalog,
-                    local: &self.local,
-                }
-                .execute(
+                self.cleanup.start_eviction(
+                    &mut self.engine,
+                    &mut self.maintenance,
+                    job,
                     EvictionIntent {
                         group: *group,
                         revision: *revision,
@@ -1684,7 +1681,6 @@ impl Runtime {
                         operation: record.request.operation_id,
                         eligibility_activity: *activity,
                     },
-                    &NoFaults,
                 )?;
             }
             JobKind::Resolve {

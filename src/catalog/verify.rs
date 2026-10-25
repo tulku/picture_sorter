@@ -23,6 +23,8 @@ pub struct IntegrityFinding {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IntegrityReport {
     pub checked: u64,
+    #[serde(default)]
+    pub verified: Vec<(ArchivePath, crate::edit::SnapshotStamp)>,
     pub findings: Vec<IntegrityFinding>,
 }
 pub struct IntegrityVerifier<'a> {
@@ -142,9 +144,12 @@ impl IntegrityReport {
             let failure =
                 match root.open_relative(&object.path, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
                     Ok(mut file) => {
+                        let before = crate::edit::SnapshotStamp::of(&file.metadata()?);
                         if crate::transfer::digest_file(&mut file)?
                             == (object.digest.clone(), object.size)
+                            && before == crate::edit::SnapshotStamp::of(&file.metadata()?)
                         {
+                            report.verified.push((object.path.clone(), before));
                             None
                         } else {
                             Some((IntegrityStatus::Corrupt, "digest or size mismatch"))

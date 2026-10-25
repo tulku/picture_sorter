@@ -362,6 +362,18 @@ fn online_rebuild_creates_separate_state_and_reports_lost_private_intents() {
 #[test]
 fn cancellation_waits_for_confirmed_worker_completion_and_keeps_service_alive() {
     let service = ServiceFixture::new();
+    let deadline = Instant::now();
+    loop {
+        let status = service.status();
+        if status["worker"]["available"] == true && status["archive"]["reason"].is_string() {
+            break;
+        }
+        assert!(
+            deadline.elapsed() < Duration::from_secs(5),
+            "initial read-only probe did not finish: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let pid = service.status()["worker"]["pid"].as_u64().unwrap() as i32;
     unsafe {
         libc::kill(pid, libc::SIGSTOP);
@@ -370,7 +382,7 @@ fn cancellation_waits_for_confirmed_worker_completion_and_keeps_service_alive() 
     let response: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let job = response["outcome"]["job"].as_str().unwrap();
     let dispatch = Instant::now();
-    while service.status()["worker"]["available"] != false {
+    while service.status()["worker"]["control_job"] != job {
         assert!(dispatch.elapsed() < Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -1048,4 +1060,471 @@ fn status_reports_space_audit_failure_without_walking_or_following_unknown_symli
             .is_symlink()
     );
     assert_eq!(std::fs::read(sentinel).unwrap(), b"keep");
+}
+
+#[test]
+fn clean_waits_for_local_verification_and_keeps_status_responsive() {
+    clean_with_paused_verification(false);
+}
+#[test]
+fn pin_during_cleanup_verification_invalidates_the_unlink_proof() {
+    clean_with_paused_verification(true);
+}
+fn clean_with_paused_verification(pin_during: bool) {
+    let fixture = ServiceFixture::with_config(|config, _| {
+        config.reserve = 0;
+        config.activity_hold_seconds = 0;
+    });
+    std::fs::write(fixture.r.source.join("clean.ORF"), b"generated original").unwrap();
+    assert!(fixture.cli(&["archive", "init"]).status.success());
+    assert!(
+        fixture
+            .cli(&[
+                "import",
+                fixture.r.source.to_str().unwrap(),
+                "--wait-for",
+                "archived"
+            ])
+            .status
+            .success()
+    );
+    let deadline = std::time::Instant::now();
+    let status = loop {
+        let status = fixture.status();
+        if status["groups"][0]["physical_findings"]
+            .as_array()
+            .is_some_and(|f| f.is_empty())
+            && status["space"]["evictable"].as_u64().unwrap_or(0) > 0
+        {
+            break status;
+        }
+        assert!(
+            deadline.elapsed() < std::time::Duration::from_secs(10),
+            "{status}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let original = fixture.r.local.join(
+        status["groups"][0]["group"]["members"][0]["path"]
+            .as_str()
+            .unwrap(),
+    );
+    let pid = status["worker"]["maintenance_pid"].as_i64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let output = fixture.cli(&["clean", "--no-wait"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let status = fixture.status();
+    assert!(
+        status["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["request"]["kind"]["type"] == "clean" && j["state"] != "Complete"),
+        "{status}"
+    );
+    if pin_during {
+        let group = status["groups"][0]["group"]["id"].as_str().unwrap();
+        assert!(fixture.cli(&["pin", group, "--no-wait"]).status.success());
+        assert_eq!(fixture.status()["groups"][0]["protection"]["pinned"], true);
+    }
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    let deadline = std::time::Instant::now();
+    loop {
+        let status = fixture.status();
+        if status["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["request"]["kind"]["type"] == "clean" && j["state"] == "Complete")
+        {
+            break;
+        }
+        assert!(
+            deadline.elapsed() < std::time::Duration::from_secs(15),
+            "{status}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(original.exists(), pin_during);
+    if pin_during {
+        assert_eq!(std::fs::read(original).unwrap(), b"generated original");
+    }
+}
+
+#[test]
+fn clean_reclaims_hidden_companion_only_after_exact_immutable_archival() {
+    let service = ServiceFixture::new();
+    let body = b"opaque generated companion";
+    std::fs::write(service.r.source.join("a.ORF"), b"generated raw").unwrap();
+    std::fs::write(service.r.source.join("a.ORF.orig"), body).unwrap();
+    assert!(service.cli(&["archive", "init"]).status.success());
+    let imported = service.cli(&[
+        "import",
+        service.r.source.to_str().unwrap(),
+        "--wait-for",
+        "archived",
+    ]);
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stdout)
+    );
+    let digest = Digest::of(body);
+    let hidden = service.r.local.join(format!(
+        ".photo-sorter/companions/{}/a.ORF.orig",
+        &digest.as_str()[7..]
+    ));
+    assert_eq!(std::fs::read(&hidden).unwrap(), body);
+    let cleaned = service.cli(&["clean"]);
+    assert!(
+        cleaned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleaned.stdout)
+    );
+    assert!(!hidden.exists());
+    let history = photo_sorter::archive::history_path(&digest).unwrap();
+    assert_eq!(
+        std::fs::read(service.r.archive.join(history.as_str())).unwrap(),
+        body
+    );
+    assert_eq!(
+        std::fs::read(service.r.source.join("a.ORF.orig")).unwrap(),
+        body
+    );
+}
+
+#[test]
+fn distinct_path_resolution_replans_real_upload_and_preserves_collision_bytes() {
+    use photo_sorter::catalog::*;
+    let service = ServiceFixture::new();
+    let path = "RAW/2026/01/02/a.ORF";
+    let original = b"generated import";
+    std::fs::write(service.r.source.join("a.ORF"), original).unwrap();
+    std::fs::File::open(service.r.source.join("a.ORF"))
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1767355200)),
+        )
+        .unwrap();
+    assert!(service.cli(&["archive", "init"]).status.success());
+    std::fs::create_dir_all(service.r.archive.join("RAW/2026/01/02")).unwrap();
+    std::fs::write(service.r.archive.join(path), b"foreign original preserved").unwrap();
+    assert!(
+        service
+            .cli(&["import", service.r.source.to_str().unwrap(), "--no-wait"])
+            .status
+            .success()
+    );
+    let deadline = Instant::now();
+    let (conflict, group) = loop {
+        let status = service.status();
+        if let Some(conflict) = status["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["kind"] == "original_collision")
+        {
+            break (conflict.clone(), status["groups"][0]["group"].clone());
+        }
+        assert!(deadline.elapsed() < Duration::from_secs(10), "{status}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let destination = ArchivePath::parse("RAW/2026/01/02/selected.ORF").unwrap();
+    let request = ResolutionRequest {
+        operation: OperationId::new(),
+        conflict: serde_json::from_value(conflict["id"].clone()).unwrap(),
+        expected_revision: conflict["revision"].as_u64().unwrap(),
+        expected_heads: vec![],
+        expected_memberships: vec![(
+            serde_json::from_value(group["id"].clone()).unwrap(),
+            serde_json::from_value(group["membership_revision"].clone()).unwrap(),
+        )],
+        resolution: ConflictResolution::ChooseDistinctPath {
+            path: destination.clone(),
+        },
+    };
+    let file = service.r._temp.path().join("resolution.json");
+    std::fs::write(&file, serde_json::to_vec(&request).unwrap()).unwrap();
+    let output = service.cli(&[
+        "conflicts",
+        "resolve",
+        "--request",
+        file.to_str().unwrap(),
+        "--no-wait",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let deadline = Instant::now();
+    loop {
+        if std::fs::read(service.r.archive.join(destination.as_str()))
+            .is_ok_and(|bytes| bytes == original)
+        {
+            break;
+        }
+        assert!(
+            deadline.elapsed() < Duration::from_secs(15),
+            "{}",
+            service.status()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        std::fs::read(service.r.archive.join(path)).unwrap(),
+        b"foreign original preserved"
+    );
+    assert_eq!(std::fs::read(service.r.local.join(path)).unwrap(), original);
+    assert_eq!(
+        std::fs::read(service.r.local.join(destination.as_str())).unwrap(),
+        original
+    );
+    assert!(
+        service
+            .cli(&["conflicts", "resolve", "--request", file.to_str().unwrap()])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn clean_reclaims_only_quiescent_verified_duplicate_local_transfer_payload() {
+    let service = ServiceFixture::new();
+    let body = b"generated duplicate original";
+    let destination = service.r.local.join("RAW/2026/01/02/a.ORF");
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    std::fs::write(&destination, body).unwrap();
+    std::fs::write(service.r.source.join("a.ORF"), body).unwrap();
+    std::fs::File::open(service.r.source.join("a.ORF"))
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1767355200)),
+        )
+        .unwrap();
+    assert!(service.cli(&["archive", "init"]).status.success());
+    let imported = service.cli(&[
+        "import",
+        service.r.source.to_str().unwrap(),
+        "--wait-for",
+        "archived",
+    ]);
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stdout)
+    );
+    fn payloads(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut result = Vec::new();
+        for entry in std::fs::read_dir(root).unwrap().map(Result::unwrap) {
+            if entry.file_type().unwrap().is_dir() {
+                result.extend(payloads(&entry.path()));
+            } else if entry.file_name() == "payload" {
+                result.push(entry.path());
+            }
+        }
+        result
+    }
+    let staging = service.r.local.join(".photo-sorter/staging");
+    let duplicates = payloads(&staging);
+    assert_eq!(duplicates.len(), 1);
+    let cleaned = service.cli(&["clean"]);
+    assert!(
+        cleaned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleaned.stdout)
+    );
+    assert!(payloads(&staging).is_empty());
+    assert_eq!(std::fs::read(destination).unwrap(), body);
+    assert_eq!(
+        std::fs::read(service.r.archive.join("RAW/2026/01/02/a.ORF")).unwrap(),
+        body
+    );
+}
+
+#[test]
+fn explicit_nas_projection_choice_preserves_unknown_bytes_and_publishes_selected_head() {
+    use photo_sorter::catalog::*;
+    let service = ServiceFixture::new();
+    std::fs::write(service.r.source.join("a.ORF"), b"generated raw").unwrap();
+    assert!(service.cli(&["archive", "init"]).status.success());
+    assert!(
+        service
+            .cli(&[
+                "import",
+                service.r.source.to_str().unwrap(),
+                "--wait-for",
+                "archived"
+            ])
+            .status
+            .success()
+    );
+    let status = service.status();
+    let path = status["groups"][0]["group"]["members"][0]["path"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+        + ".rrdata";
+    let baseline = br#"{"version":1,"rating":3,"adjustments":{"exposure":1}}"#;
+    std::fs::write(service.r.local.join(&path), baseline).unwrap();
+    let deadline = Instant::now();
+    while !std::fs::read(service.r.archive.join(&path)).is_ok_and(|b| b == baseline) {
+        assert!(deadline.elapsed() < Duration::from_secs(8));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let unknown = b"unknown NAS bytes preserved";
+    std::fs::write(service.r.archive.join(&path), unknown).unwrap();
+    let desired = br#"{"version":1,"rating":5,"adjustments":{"exposure":2}}"#;
+    std::fs::write(service.r.local.join(&path), desired).unwrap();
+    let deadline = Instant::now();
+    let (conflict, group) = loop {
+        let status = service.status();
+        if let Some(c) = status["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["kind"] == "nas_projection")
+        {
+            break (c.clone(), status["groups"][0]["group"].clone());
+        }
+        assert!(deadline.elapsed() < Duration::from_secs(12), "{status}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let version = serde_json::from_value(conflict["details"]["version"].clone()).unwrap();
+    let request = ResolutionRequest {
+        operation: OperationId::new(),
+        conflict: serde_json::from_value(conflict["id"].clone()).unwrap(),
+        expected_revision: conflict["revision"].as_u64().unwrap(),
+        expected_heads: vec![version],
+        expected_memberships: vec![(
+            serde_json::from_value(group["id"].clone()).unwrap(),
+            serde_json::from_value(group["membership_revision"].clone()).unwrap(),
+        )],
+        resolution: ConflictResolution::ChooseHead { version },
+    };
+    let file = service.r._temp.path().join("choose-projection.json");
+    std::fs::write(&file, serde_json::to_vec(&request).unwrap()).unwrap();
+    let output = service.cli(&[
+        "conflicts",
+        "resolve",
+        "--request",
+        file.to_str().unwrap(),
+        "--no-wait",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let deadline = Instant::now();
+    while !std::fs::read(service.r.archive.join(&path)).is_ok_and(|b| b == desired) {
+        assert!(
+            deadline.elapsed() < Duration::from_secs(15),
+            "{}",
+            service.status()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(std::fs::read(service.r.local.join(path)).unwrap(), desired);
+    fn contains(root: &std::path::Path, expected: &[u8]) -> bool {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(Result::unwrap)
+            .any(|entry| {
+                if entry.file_type().unwrap().is_dir() {
+                    contains(&entry.path(), expected)
+                } else {
+                    std::fs::read(entry.path()).is_ok_and(|body| body == expected)
+                }
+            })
+    }
+    assert!(contains(
+        &service.r.archive.join(".photo-sorter/staging"),
+        unknown
+    ));
+}
+
+#[test]
+fn all_commands_have_real_handlers_for_pins_maintenance_and_inspection() {
+    let service = ServiceFixture::new();
+    std::fs::write(
+        service.r.source.join("commands.ORF"),
+        b"generated command fixture",
+    )
+    .unwrap();
+    assert!(service.cli(&["archive", "init"]).status.success());
+    assert!(
+        service
+            .cli(&[
+                "import",
+                service.r.source.to_str().unwrap(),
+                "--wait-for",
+                "archived"
+            ])
+            .status
+            .success()
+    );
+    let status = service.status();
+    let group = status["groups"][0]["group"]["id"].as_str().unwrap();
+    assert!(service.cli(&["pin", group, "--no-wait"]).status.success());
+    assert_eq!(service.status()["groups"][0]["protection"]["pinned"], true);
+    assert!(service.cli(&["unpin", group]).status.success());
+    assert_eq!(service.status()["groups"][0]["protection"]["pinned"], false);
+    let staged = service.cli(&["refresh", group, "--stage-only"]);
+    assert_eq!(staged.status.code(), Some(3));
+    let refreshed = service.cli(&["refresh", group, "--editor-closed"]);
+    assert!(
+        refreshed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refreshed.stdout)
+    );
+    for args in [
+        vec!["verify"],
+        vec!["conflicts", "list"],
+        vec!["doctor"],
+        vec!["service", "status"],
+    ] {
+        let out = service.cli(&args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    let backup = service.r._temp.path().join("commands-backup.sqlite");
+    let out = service.cli(&["catalog", "backup", backup.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let database =
+        rusqlite::Connection::open_with_flags(&backup, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    assert_eq!(
+        database
+            .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    for job in service.status()["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|j| j["state"] == "Complete")
+    {
+        assert!(
+            service
+                .cli(&["jobs", "show", job["id"].as_str().unwrap()])
+                .status
+                .success()
+        );
+    }
 }

@@ -20,7 +20,7 @@ pub struct SnapshotStamp {
     pub mtime_nsec: i64,
 }
 impl SnapshotStamp {
-    fn of(metadata: &std::fs::Metadata) -> Self {
+    pub(crate) fn of(metadata: &std::fs::Metadata) -> Self {
         Self {
             inode: metadata.ino(),
             size: metadata.len(),
