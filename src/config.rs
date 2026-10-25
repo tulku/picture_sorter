@@ -94,10 +94,8 @@ impl Config {
         {
             return Err(AppError::invalid("invalid batch, byte or timer limit"));
         }
-        if self.import_timezone != "UTC" {
-            return Err(AppError::invalid(
-                "only UTC import fallback is currently supported",
-            ));
+        if self.import_timezone.parse::<chrono_tz::Tz>().is_err() {
+            return Err(AppError::invalid("unknown import timezone"));
         }
         Ok(())
     }

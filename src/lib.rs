@@ -5,5 +5,6 @@ pub mod config;
 pub mod domain;
 pub mod error;
 pub mod fs;
+pub mod import;
 pub mod plan;
 pub mod sidecar;

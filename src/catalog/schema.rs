@@ -2,6 +2,7 @@ pub const VERSION: i64 = 1;
 pub const SCHEMA: &str = r#"
 CREATE TABLE archives(id TEXT PRIMARY KEY, writer TEXT NOT NULL, sequence INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE blobs(digest TEXT PRIMARY KEY, size INTEGER NOT NULL CHECK(size>=0), metadata TEXT, extractor TEXT);
+CREATE TABLE metadata_cache(digest TEXT NOT NULL,extractor TEXT NOT NULL,metadata TEXT NOT NULL,PRIMARY KEY(digest,extractor));
 CREATE TABLE groups(id TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0, published INTEGER NOT NULL DEFAULT 0, primary_raw TEXT);
 CREATE TABLE aliases(alias TEXT PRIMARY KEY REFERENCES groups(id), canonical TEXT NOT NULL REFERENCES groups(id), CHECK(alias<>canonical));
 CREATE TABLE members(archive TEXT NOT NULL, path TEXT NOT NULL, group_id TEXT NOT NULL REFERENCES groups(id), digest TEXT NOT NULL REFERENCES blobs(digest), role TEXT NOT NULL, PRIMARY KEY(archive,path));
