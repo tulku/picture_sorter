@@ -87,3 +87,5 @@ pub(crate) fn decode<T: serde::de::DeserializeOwned>(value: String) -> AppResult
 }
 mod identity;
 pub use identity::{PairEvidence, PairFacts, Protection};
+mod replay;
+pub use replay::{ApplyOutcome, PublicationReadiness};

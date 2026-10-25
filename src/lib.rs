@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod catalog;
 pub mod classify;
 pub mod config;
