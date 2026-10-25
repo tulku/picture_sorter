@@ -41,6 +41,10 @@ CREATE TABLE IF NOT EXISTS import_stats(job TEXT PRIMARY KEY REFERENCES jobs(id)
 CREATE TABLE IF NOT EXISTS group_facts(context TEXT NOT NULL,stem TEXT NOT NULL,camera TEXT NOT NULL,capture TEXT NOT NULL,group_id TEXT NOT NULL REFERENCES groups(id),PRIMARY KEY(context,stem,camera,capture));
 "#;
 pub const EDIT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS pin_attempts(job TEXT PRIMARY KEY,spec TEXT NOT NULL,reservation TEXT NOT NULL,target TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS pin_checks(job TEXT NOT NULL,path TEXT NOT NULL,digest TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(job,path,digest));
+CREATE TABLE IF NOT EXISTS startup_checks(placement TEXT PRIMARY KEY,group_id TEXT NOT NULL,path TEXT NOT NULL,digest TEXT NOT NULL,size INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS capture_requests(operation TEXT PRIMARY KEY,context TEXT NOT NULL,done INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS local_heads(sidecar TEXT PRIMARY KEY REFERENCES sidecars(id),version TEXT NOT NULL REFERENCES versions(id),dirty INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS snapshot_intents(operation TEXT PRIMARY KEY,version TEXT NOT NULL UNIQUE,sidecar TEXT NOT NULL,parents TEXT NOT NULL,body TEXT NOT NULL,origin TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pending_resolutions(conflict TEXT PRIMARY KEY,version TEXT NOT NULL,expected_heads TEXT NOT NULL);
@@ -55,10 +59,12 @@ pub const RATING_AUTHORITY_SCHEMA: &str = "CREATE TABLE rating_authorities(group
 pub const BOOTSTRAP_SCHEMA: &str = r#"
 CREATE TABLE publication_revisions(source TEXT NOT NULL,revision INTEGER NOT NULL,operation TEXT NOT NULL UNIQUE,PRIMARY KEY(source,revision));
 CREATE TABLE publication_failures(source TEXT PRIMARY KEY,next_attempt INTEGER NOT NULL,failures INTEGER NOT NULL,reason TEXT NOT NULL);
+CREATE TABLE projection_commits(sidecar TEXT NOT NULL,version TEXT NOT NULL,commit_id TEXT NOT NULL,PRIMARY KEY(sidecar,version));
 CREATE TABLE nas_projections(sidecar TEXT PRIMARY KEY REFERENCES sidecars(id),version TEXT NOT NULL REFERENCES versions(id),applied INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE published_sidecars(id TEXT PRIMARY KEY REFERENCES sidecars(id));
 CREATE TABLE published_conflicts(id TEXT PRIMARY KEY REFERENCES conflicts(id));
 CREATE TABLE sidecar_diagnostics(sidecar TEXT PRIMARY KEY REFERENCES sidecars(id),reason TEXT NOT NULL);
+CREATE TABLE job_retry(job TEXT PRIMARY KEY REFERENCES jobs(id),failures INTEGER NOT NULL,next_attempt INTEGER NOT NULL,reason TEXT NOT NULL);
 CREATE TABLE job_results(job TEXT PRIMARY KEY REFERENCES jobs(id),result TEXT NOT NULL);
 CREATE TABLE publication_plans(operation TEXT PRIMARY KEY,plan TEXT NOT NULL);
 CREATE TABLE bootstrap_scans(job TEXT PRIMARY KEY REFERENCES jobs(id),request TEXT NOT NULL,report TEXT NOT NULL,pending TEXT);

@@ -102,7 +102,12 @@ impl Catalog {
         let records = commit.records()?;
         let tx = self.db.transaction()?;
         for record in records {
-            apply_record(&tx, &commit.archive_id.to_string(), record)?;
+            apply_record(
+                &tx,
+                &commit.archive_id.to_string(),
+                &commit.commit_id.to_string(),
+                record,
+            )?;
         }
         tx.execute(
             "UPDATE commits SET applied=1,reason=NULL WHERE id=?",
@@ -154,7 +159,12 @@ pub(crate) fn heads(db: &Connection, sidecar: SidecarId) -> AppResult<Vec<Versio
         .map(|s| decode(format!("\"{}\"", s?)))
         .collect()
 }
-fn apply_record(db: &Connection, archive: &str, record: ArchiveRecord) -> AppResult<()> {
+fn apply_record(
+    db: &Connection,
+    archive: &str,
+    commit_id: &str,
+    record: ArchiveRecord,
+) -> AppResult<()> {
     match record {
         ArchiveRecord::AmbiguityRecorded {
             id,
@@ -206,6 +216,7 @@ fn apply_record(db: &Connection, archive: &str, record: ArchiveRecord) -> AppRes
             db.execute("INSERT INTO metadata_cache(digest,extractor,metadata) VALUES(?,?,?) ON CONFLICT(digest,extractor) DO NOTHING",params![result.digest.as_str(),result.extractor,encode(&result)?])?;
         }
         ArchiveRecord::ProjectionPlanned { plan } => {
+            db.execute("INSERT INTO projection_commits(sidecar,version,commit_id) VALUES(?,?,?) ON CONFLICT DO NOTHING", params![plan.sidecar.to_string(),plan.version.to_string(),commit_id])?;
             db.execute("INSERT INTO nas_projections(sidecar,version,applied) VALUES(?,?,0) ON CONFLICT(sidecar) DO UPDATE SET version=excluded.version,applied=0",params![plan.sidecar.to_string(),plan.version.to_string()])?;
             let sidecar = plan.sidecar.to_string();
             let (location, owner): (String, String) = db.query_row(
@@ -433,6 +444,7 @@ fn apply_record(db: &Connection, archive: &str, record: ArchiveRecord) -> AppRes
                 )?;
             }
             db.execute("INSERT INTO projections(sidecar,pending) VALUES(?,1) ON CONFLICT(sidecar) DO UPDATE SET pending=1",[sidecar.to_string()])?;
+            db.execute("UPDATE residency SET metadata_current=0,protected=1 WHERE group_id IN(SELECT group_id FROM sidecars WHERE id=?)", [sidecar.to_string()])?;
         }
         ArchiveRecord::ConflictRecorded {
             id,

@@ -147,3 +147,60 @@ impl Catalog {
         Ok(())
     }
 }
+impl Catalog {
+    pub fn jobs_page(
+        &self,
+        after: Option<JobId>,
+        limit: usize,
+        active_only: bool,
+    ) -> AppResult<Vec<JobRecord>> {
+        if limit == 0 || limit > 128 {
+            return Err(AppError::invalid("job page must be 1..128"));
+        }
+        let mut query=self.db.prepare("SELECT id FROM jobs WHERE id>? AND (?=0 OR json_extract(state,'$') NOT IN('Complete','Cancelled','Failed')) ORDER BY id LIMIT ?")?;
+        let ids = query
+            .query_map(
+                params![
+                    after.map(|id| id.to_string()).unwrap_or_default(),
+                    active_only,
+                    limit
+                ],
+                |r| r.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| self.job(decode(format!("\"{id}\""))?))
+            .collect()
+    }
+    pub fn job_is_due(&self, job: JobId, now: Timestamp) -> AppResult<bool> {
+        let at: Option<u64> = self
+            .db
+            .query_row(
+                "SELECT next_attempt FROM job_retry WHERE job=?",
+                [job.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(at.is_none_or(|at| now >= at))
+    }
+    pub fn defer_job(&mut self, job: JobId, now: Timestamp, reason: &str) -> AppResult<()> {
+        let previous: u32 = self
+            .db
+            .query_row(
+                "SELECT failures FROM job_retry WHERE job=?",
+                [job.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let failures = previous.saturating_add(1);
+        let delay = (1u64 << previous.min(8)).min(300);
+        self.db.execute("INSERT INTO job_retry(job,failures,next_attempt,reason) VALUES(?,?,?,?) ON CONFLICT(job) DO UPDATE SET failures=excluded.failures,next_attempt=excluded.next_attempt,reason=excluded.reason",params![job.to_string(),failures,now.saturating_add(delay),reason])?;
+        Ok(())
+    }
+    pub fn clear_retry(&mut self, job: JobId) -> AppResult<()> {
+        self.db
+            .execute("DELETE FROM job_retry WHERE job=?", [job.to_string()])?;
+        Ok(())
+    }
+}

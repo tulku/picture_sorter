@@ -142,6 +142,23 @@ impl Default for ScanDriver {
     }
 }
 impl ScanDriver {
+    pub fn cancel(&mut self, job: JobId) -> AppResult<()> {
+        if self.active != Some(job) {
+            return Ok(());
+        }
+        match self.worker.receive.try_recv() {
+            Ok(_) | Err(TryRecvError::Disconnected) => {
+                self.active = None;
+                self.pending = None;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+        Ok(())
+    }
+    pub fn active_job(&self) -> Option<JobId> {
+        self.active
+    }
+
     pub fn advance(&mut self, engine: &mut ImportCoordinator, job: JobId) -> AppResult<()> {
         if engine.scan_complete(job)? {
             return Ok(());

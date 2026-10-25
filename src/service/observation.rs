@@ -33,6 +33,7 @@ pub(crate) struct ObservationDriver {
 struct CaptureResult {
     owner: SidecarOwner,
     previous: Option<VersionId>,
+    operation: OperationId,
     receipt: SnapshotReceipt,
 }
 enum Phase {
@@ -40,8 +41,8 @@ enum Phase {
     Start,
     List,
     Capture {
-        owner: SidecarOwner,
-        previous: Option<VersionId>,
+        context: CaptureContext,
+        recovering: bool,
     },
     Events,
 }
@@ -87,8 +88,18 @@ impl ObservationDriver {
                 WorkerState::Failed(error) => {
                     self.status.unreadable += 1;
                     self.status.reason = Some(error.to_string());
-                    if let Phase::Capture { owner, .. } = &phase {
-                        self.unreadable(&mut engine.catalog, owner, &error.to_string())?;
+                    if let Phase::Capture {
+                        context,
+                        recovering,
+                    } = &phase
+                    {
+                        self.unreadable(&mut engine.catalog, &context.owner, &error.to_string())?;
+                        if *recovering {
+                            engine.catalog.db.execute(
+                                "UPDATE capture_requests SET done=1 WHERE operation=?",
+                                [context.operation.to_string()],
+                            )?;
+                        }
                     }
                     self.discover_started = false;
                     return Ok(());
@@ -118,17 +129,25 @@ impl ObservationDriver {
                         self.discover_started = false;
                     }
                 }
-                (Phase::Capture { owner, previous }, NasReply::Captured(receipt)) => self.record(
-                    engine,
-                    local,
-                    state,
-                    clock,
-                    CaptureResult {
-                        owner,
-                        previous,
-                        receipt,
-                    },
-                )?,
+                (Phase::Capture { context, .. }, NasReply::Captured(receipt)) => {
+                    self.record(
+                        engine,
+                        local,
+                        state,
+                        clock,
+                        CaptureResult {
+                            owner: context.owner.clone(),
+                            previous: context.previous,
+                            operation: context.operation,
+                            receipt,
+                        },
+                    )?;
+                    engine.catalog.db.execute(
+                        "UPDATE capture_requests SET done=1 WHERE operation=?",
+                        [context.operation.to_string()],
+                    )?;
+                    context.cleanup(state)?;
+                }
                 (Phase::Events, NasReply::LocalEvents(events)) => {
                     for event in events {
                         match event {
@@ -166,7 +185,29 @@ impl ObservationDriver {
         if !self.worker.available()? {
             return Ok(());
         }
-        let (command, phase) = if !self.watch_ready {
+        let recovery: Option<String> = engine
+            .catalog
+            .db
+            .query_row(
+                "SELECT context FROM capture_requests WHERE done=0 ORDER BY rowid LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let (command, phase) = if let Some(context) = recovery {
+            let context: CaptureContext = serde_json::from_str(&context)?;
+            (
+                NasCommand::RecoverCapture {
+                    state: engine.config.state_root.clone(),
+                    context: context.clone(),
+                    ceiling: engine.config.json_ceiling,
+                },
+                Phase::Capture {
+                    context,
+                    recovering: true,
+                },
+            )
+        } else if !self.watch_ready {
             (
                 NasCommand::WatchLocal {
                     root: engine.config.working_root.clone(),
@@ -175,15 +216,30 @@ impl ObservationDriver {
             )
         } else if let Some(owner) = self.queue.pop_front() {
             let previous = engine.catalog.local_head(owner.id)?;
+            let context = CaptureContext {
+                operation: OperationId::new(),
+                owner,
+                previous,
+            };
+            engine.catalog.db.execute(
+                "INSERT INTO capture_requests(operation,context) VALUES(?,?)",
+                params![
+                    context.operation.to_string(),
+                    serde_json::to_string(&context)?
+                ],
+            )?;
+            context.persist(state)?;
             (
-                NasCommand::CaptureLocal {
+                NasCommand::CaptureOwned {
                     local: engine.config.working_root.clone(),
                     state: engine.config.state_root.clone(),
-                    path: owner.path.clone(),
-                    kind: owner.kind,
+                    context: context.clone(),
                     ceiling: engine.config.json_ceiling,
                 },
-                Phase::Capture { owner, previous },
+                Phase::Capture {
+                    context,
+                    recovering: false,
+                },
             )
         } else if self.discover {
             if self.discover_started {
@@ -273,6 +329,7 @@ impl ObservationDriver {
         let CaptureResult {
             owner,
             previous,
+            operation,
             receipt,
         } = capture;
         if receipt.path != owner.path {
@@ -315,7 +372,7 @@ impl ObservationDriver {
             VersionStore::new(&mut engine.catalog, state).record(SnapshotIntent {
                 sidecar: owner.id,
                 parents: vec![current],
-                operation: OperationId::new(),
+                operation,
                 payload: SnapshotPayload::Reset,
                 origin: VersionOrigin::Observed,
             })?;
@@ -332,7 +389,7 @@ impl ObservationDriver {
                 let intent = SnapshotIntent {
                     sidecar: owner.id,
                     parents: previous.into_iter().collect(),
-                    operation: OperationId::new(),
+                    operation,
                     payload: SnapshotPayload::Stored(stored),
                     origin: VersionOrigin::Observed,
                 };

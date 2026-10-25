@@ -20,6 +20,27 @@ struct Fetch {
     metadata: Option<(SidecarId, VersionId)>,
 }
 impl PinFetchDriver {
+    pub fn cancel(&mut self, worker: &mut WorkerSupervisor, job: JobId) -> AppResult<()> {
+        let Some(active) = self.active.take() else {
+            return Ok(());
+        };
+        if active.job != job {
+            self.active = Some(active);
+            return Ok(());
+        }
+        match worker.poll(active.ticket)? {
+            WorkerState::Active | WorkerState::TimedOutStillAlive | WorkerState::Reaped => {
+                self.active = Some(active)
+            }
+            WorkerState::Completed(_) | WorkerState::Failed(_) => {}
+        }
+        Ok(())
+    }
+
+    pub fn active_job(&self) -> Option<JobId> {
+        self.active.as_ref().map(|active| active.job)
+    }
+
     pub fn advance(
         &mut self,
         catalog: &mut Catalog,

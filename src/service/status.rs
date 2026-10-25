@@ -41,7 +41,7 @@ impl StatusSnapshot {
         archive: serde_json::Value,
     ) -> AppResult<Self> {
         let catalog = &engine.catalog;
-        let jobs = catalog.jobs()?;
+        let jobs = catalog.jobs_page(None, 128, false)?;
         let resident:u64=catalog.db.query_row("SELECT coalesce(sum(b.size),0) FROM placements p JOIN blobs b ON b.digest=p.digest WHERE local_ready=1",[],|r|r.get(0))?;
         let subset = |condition: &str| -> AppResult<u64> {
             Ok(catalog.db.query_row(&format!("SELECT coalesce(sum(b.size),0) FROM placements p JOIN blobs b ON b.digest=p.digest JOIN residency r ON r.group_id=p.group_id WHERE p.local_ready=1 AND {condition}"),[],|r|r.get(0))?)

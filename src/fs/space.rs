@@ -56,13 +56,15 @@ fn occupied(root: &RootHandle, allow_service_socket: bool) -> AppResult<u64> {
                     format!("{}/", path.as_str()),
                 ));
             } else if kind.is_file() {
-                let m = root
-                    .open_relative(&path, libc::O_RDONLY | libc::O_NONBLOCK, 0)?
-                    .metadata()?;
-                use std::os::unix::fs::MetadataExt;
-                if seen.insert((m.dev(), m.ino())) {
+                let m = root.metadata_relative(&path)?;
+                if u32::from(m.stx_mode) & libc::S_IFMT != libc::S_IFREG {
+                    return Err(AppError::invalid(
+                        "managed file changed type during occupancy check",
+                    ));
+                }
+                if seen.insert((m.stx_dev_major, m.stx_dev_minor, m.stx_ino)) {
                     total = total
-                        .checked_add(m.len())
+                        .checked_add(m.stx_size)
                         .ok_or_else(|| AppError::invalid("occupancy overflow"))?;
                 }
             } else {

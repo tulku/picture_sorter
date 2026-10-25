@@ -44,6 +44,7 @@ enum Phase {
     Ack,
     Publish,
     End,
+    Abort,
 }
 impl ImportCoordinator {
     pub fn bind_archive(&mut self) -> AppResult<()> {
@@ -70,7 +71,7 @@ impl ImportCoordinator {
         Ok(())
     }
     fn next_upload(&self, job: JobId) -> AppResult<Option<ImportItem>> {
-        let row:Option<UploadItemRow>=self.catalog.db.query_row("SELECT id,source_root,source_path,digest,size,role,group_id,destination,local_ready,archived FROM import_items WHERE parent=? AND archived=0 AND state<>'conflict' ORDER BY rowid LIMIT 1",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))).optional()?;
+        let row:Option<UploadItemRow>=self.catalog.db.query_row("SELECT id,source_root,source_path,digest,size,role,group_id,destination,local_ready,archived FROM import_items WHERE parent=? AND archived=0 AND state<>'conflict' AND (group_id IS NOT NULL OR EXISTS(SELECT 1 FROM import_scans WHERE job=parent AND complete=1)) ORDER BY group_id IS NULL,rowid LIMIT 1",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))).optional()?;
         row.map(
             |(id, root, path, digest, size, role, group, destination, local_ready, _archived)| {
                 Ok(ImportItem {
@@ -94,6 +95,43 @@ impl ImportCoordinator {
     }
 }
 impl UploadDriver {
+    pub fn cancel(&mut self, worker: &mut WorkerSupervisor, job: JobId) -> AppResult<()> {
+        let Some(mut active) = self.active.take() else {
+            return Ok(());
+        };
+        if active.job != job {
+            self.active = Some(active);
+            return Ok(());
+        }
+        match worker.poll(active.ticket)? {
+            WorkerState::Active | WorkerState::TimedOutStillAlive | WorkerState::Reaped => {
+                self.active = Some(active)
+            }
+            WorkerState::Completed(reply) => {
+                if let NasReply::Session { session, .. } = reply {
+                    active.session = Some(session);
+                }
+                if !matches!(active.phase, Phase::End | Phase::Abort)
+                    && let Some(session) = active.session
+                {
+                    active.phase = Phase::Abort;
+                    active.ticket = worker.submit(NasCommand::EndArchive { session })?;
+                    self.active = Some(active);
+                }
+            }
+            WorkerState::Failed(_) => {
+                if matches!(active.phase, Phase::End | Phase::Abort) {
+                    worker.mark_uncertain();
+                    self.active = Some(active);
+                } else if let Some(session) = active.session {
+                    active.phase = Phase::Abort;
+                    active.ticket = worker.submit(NasCommand::EndArchive { session })?;
+                    self.active = Some(active);
+                }
+            }
+        }
+        Ok(())
+    }
     pub fn active_job(&self) -> Option<JobId> {
         self.active.as_ref().map(|active| active.job)
     }
@@ -188,11 +226,44 @@ impl UploadDriver {
                         error.to_string(),
                     ),
                 )?;
-                self.active = Some(active);
+                if matches!(error.code, ErrorCode::Conflict | ErrorCode::Integrity)
+                    && !matches!(
+                        active.phase,
+                        Phase::Read | Phase::List | Phase::Ack | Phase::Abort
+                    )
+                {
+                    engine.catalog.db.execute(
+                        "UPDATE import_items SET state='conflict' WHERE id=?",
+                        [active.item.id.to_string()],
+                    )?;
+                    if let SourceRole::Original(role) = active.item.role {
+                        engine.catalog.record_ambiguity(
+                            "original_collision",
+                            active.item.group,
+                            serde_json::to_value(OriginalMember {
+                                path: active.item.destination.clone(),
+                                digest: active.item.digest.clone(),
+                                size: active.item.size,
+                                role,
+                            })?,
+                        )?;
+                    }
+                }
+                if let Some(session) = active.session {
+                    if matches!(active.phase, Phase::Abort) {
+                        worker.mark_uncertain();
+                        self.active = Some(active);
+                    } else {
+                        active.phase = Phase::Abort;
+                        active.ticket = worker.submit(NasCommand::EndArchive { session })?;
+                        self.active = Some(active);
+                    }
+                }
                 return engine.report(job);
             }
             WorkerState::Completed(reply) => {
                 let command = match (active.phase, reply) {
+                    (Phase::Abort, NasReply::Done) => return engine.report(job),
                     (Phase::Stage, NasReply::Staged(_)) => {
                         if matches!(active.item.role, SourceRole::Companion(_)) {
                             active.phase = Phase::History;
@@ -363,7 +434,7 @@ fn prepare_plan(engine: &mut ImportCoordinator, active: &Active) -> AppResult<Pu
     if let Some(plan) = existing {
         return Ok(serde_json::from_str(&plan)?);
     }
-    let records = if let Some(group) = active.item.group {
+    let mut records = if let Some(group) = active.item.group {
         let group = engine.catalog.canonical_group(group)?;
         vec![
             ArchiveRecord::GroupCreated { id: group },
@@ -385,37 +456,83 @@ fn prepare_plan(engine: &mut ImportCoordinator, active: &Active) -> AppResult<Pu
             },
         ]
     } else {
-        let sidecar = engine
-            .catalog
-            .managed_sidecar_id(&active.item.destination)?;
-        let version = Version {
-            id: VersionId::new(),
-            sidecar,
-            parents: vec![],
-            body: VersionBody::Content {
-                digest: active.item.digest.clone(),
-                size: active.item.size,
-            },
-            origin: VersionOrigin::Observed,
+        let owner = source_owner(engine, &active.item)?;
+        let (group, sidecar_path, owner_name) = owner.unwrap_or((
+            None,
+            active.item.destination.clone(),
+            "preserved-source-companion".into(),
+        ));
+        let sidecar = engine.catalog.managed_sidecar_id(&sidecar_path)?;
+        let expected = engine.catalog.heads(sidecar)?;
+        let body = VersionBody::Content {
+            digest: active.item.digest.clone(),
+            size: active.item.size,
         };
-        vec![
-            ArchiveRecord::SidecarCreated {
-                id: sidecar,
-                group: None,
-                path: active.item.destination.clone(),
-                owner: "preserved-source-companion".into(),
-            },
-            ArchiveRecord::VersionAdded {
+        let equal = expected
+            .iter()
+            .map(|id| engine.catalog.version(*id))
+            .collect::<AppResult<Vec<_>>>()?
+            .iter()
+            .any(|v| v.body == body);
+        let mut records = vec![ArchiveRecord::SidecarCreated {
+            id: sidecar,
+            group,
+            path: sidecar_path.clone(),
+            owner: owner_name.clone(),
+        }];
+        if !equal {
+            let version = Version {
+                id: VersionId::new(),
+                sidecar,
+                parents: vec![],
+                body,
+                origin: VersionOrigin::Observed,
+            };
+            let mut heads = expected.clone();
+            heads.push(version.id);
+            heads.sort();
+            records.push(ArchiveRecord::VersionAdded {
                 version: version.clone(),
                 operation: OperationId(active.item.id.0),
-            },
-            ArchiveRecord::HeadsChanged {
+            });
+            records.push(ArchiveRecord::HeadsChanged {
                 sidecar,
-                expected: vec![],
-                heads: vec![version.id],
-            },
-        ]
+                expected,
+                heads: heads.clone(),
+            });
+            if heads.len() > 1 {
+                records.push(ArchiveRecord::ConflictRecorded {
+                    id: ConflictId::new(),
+                    group,
+                    kind: "sidecar".into(),
+                    heads,
+                });
+            } else if group.is_some() && owner_name != "jpeg-xmp-external" {
+                records.push(ArchiveRecord::ProjectionPlanned {
+                    plan: ProjectionPlan {
+                        sidecar,
+                        path: sidecar_path.clone(),
+                        version: version.id,
+                        expected: VersionBody::Reset,
+                        body: version.body,
+                        owner: owner_name.clone(),
+                    },
+                });
+            }
+        }
+        if group.is_none() {
+            records.push(ArchiveRecord::AmbiguityRecorded {
+                id: ConflictId(active.item.id.0),
+                kind: "orphan_sidecar".into(),
+                group: None,
+                details: serde_json::json!({"sidecar":sidecar,"path":active.item.destination}),
+            });
+        }
+        records
     };
+    if let Some(result) = engine.catalog.metadata(&active.item.digest)? {
+        records.push(ArchiveRecord::MetadataCached { result });
+    }
     let tx = engine.catalog.db.transaction()?;
     let sequence:u64=tx.query_row("INSERT INTO writer_sequences(writer,sequence) VALUES(?,1) ON CONFLICT(writer) DO UPDATE SET sequence=sequence+1 RETURNING sequence",[engine.config.writer_id.to_string()],|r|r.get(0))?;
     let mut dependencies = Vec::new();
@@ -461,4 +578,58 @@ fn prepare_plan(engine: &mut ImportCoordinator, active: &Active) -> AppResult<Pu
     )?;
     tx.commit()?;
     Ok(plan)
+}
+
+fn source_owner(
+    engine: &ImportCoordinator,
+    item: &ImportItem,
+) -> AppResult<Option<(Option<GroupId>, ArchivePath, String)>> {
+    use crate::edit::{OwnerDecision, SidecarKind, resolve_owner};
+    let mut query=engine.catalog.db.prepare("SELECT source_path,destination,digest,size,role,group_id FROM import_items WHERE source_root=? AND group_id IS NOT NULL AND archived=1 AND substr(?,1,length(source_path))=source_path ORDER BY length(source_path) DESC LIMIT 128")?;
+    let rows = query
+        .query_map(
+            params![item.source.root.to_str(), item.source.path.as_str()],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, u64>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (source, destination, digest, size, role, group) in rows {
+        let SourceRole::Original(role) = serde_json::from_str(&role)? else {
+            continue;
+        };
+        let member = OriginalMember {
+            path: ArchivePath::parse(&source)?,
+            digest: Digest::parse(&digest)?,
+            size,
+            role,
+        };
+        if let OwnerDecision::Owned {
+            kind, virtual_copy, ..
+        } = resolve_owner(&item.source.path, &[member])
+        {
+            let suffix = &item.source.path.as_str()[source.len()..];
+            let path = ArchivePath::parse(&format!("{destination}{suffix}"))?;
+            let group = engine
+                .catalog
+                .canonical_group(serde_json::from_str(&format!("\"{group}\""))?)?;
+            let owner = match kind {
+                SidecarKind::RapidRaw if virtual_copy.is_some() => "rapidraw-virtual",
+                SidecarKind::RapidRaw => "rapidraw-base",
+                SidecarKind::Rrexif => "rrexif",
+                SidecarKind::RawXmp => "raw-xmp",
+                SidecarKind::JpegXmpExternal => "jpeg-xmp-external",
+                SidecarKind::Opaque => "opaque",
+            };
+            return Ok(Some((Some(group), path, owner.into())));
+        }
+    }
+    Ok(None)
 }

@@ -111,9 +111,21 @@ pub(crate) fn capture_local(
     kind: SidecarKind,
     ceiling: u64,
 ) -> AppResult<SnapshotReceipt> {
+    capture_with_stage(local, state, path, kind, ceiling, None)
+}
+fn capture_with_stage(
+    local: &RootHandle,
+    state: &RootHandle,
+    path: &ArchivePath,
+    kind: SidecarKind,
+    ceiling: u64,
+    owned: Option<OperationId>,
+) -> AppResult<SnapshotReceipt> {
     local.require_local()?;
     state.require_local()?;
-    validate_sidecar_path(path)?;
+    if !path.as_str().starts_with(".photo-sorter/captures/") {
+        validate_sidecar_path(path)?;
+    }
     let mut source = match local.open_relative(path, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
         Ok(file) => file,
         Err(e) if e.errno == Some(libc::ENOENT) => {
@@ -153,10 +165,14 @@ pub(crate) fn capture_local(
         return Err(AppError::invalid("sidecar must be a regular file"));
     }
     state.mkdir_all(&ArchivePath::parse(".photo-sorter/snapshots")?)?;
-    let stage = ArchivePath::parse(&format!(
-        ".photo-sorter/snapshots/capture-{}",
-        OperationId::new()
-    ))?;
+    let stage = if let Some(operation) = owned {
+        capture_path(operation, "payload")?
+    } else {
+        ArchivePath::parse(&format!(
+            ".photo-sorter/snapshots/capture-{}",
+            OperationId::new()
+        ))?
+    };
     let mut destination = state.create_new(&stage)?;
     let mut hash = blake3::Hasher::new();
     let mut size = 0u64;
@@ -185,7 +201,12 @@ pub(crate) fn capture_local(
         ));
     }
     let target = snapshot_path(&digest)?;
-    if publish_noreplace(state, &stage, &target)? == PublishOutcome::Exists {
+    let published = if owned.is_some() {
+        link_noreplace(state, &stage, &target)?
+    } else {
+        publish_noreplace(state, &stage, &target)?
+    };
+    if published == PublishOutcome::Exists {
         let mut existing = state.open_relative(&target, libc::O_RDONLY, 0)?;
         if digest_file(&mut existing)? != (digest.clone(), size) {
             return Err(AppError::integrity("stored immutable snapshot is corrupt"));
@@ -227,5 +248,109 @@ impl SnapshotReceipt {
             }
             Err(_) => Ok(false),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureContext {
+    pub operation: OperationId,
+    pub owner: super::SidecarOwner,
+    pub previous: Option<VersionId>,
+}
+fn capture_path(operation: OperationId, name: &str) -> AppResult<ArchivePath> {
+    ArchivePath::parse(&format!(".photo-sorter/captures/{operation}/{name}"))
+}
+impl CaptureContext {
+    pub fn persist(&self, state: &RootHandle) -> AppResult<()> {
+        state.require_local()?;
+        state.mkdir_all(&ArchivePath::parse(&format!(
+            ".photo-sorter/captures/{}",
+            self.operation
+        ))?)?;
+        let path = capture_path(self.operation, "intent.json")?;
+        let bytes = serde_json::to_vec(self)?;
+        match state.write_new(&path, &bytes) {
+            Ok(()) => Ok(()),
+            Err(e) if e.errno == Some(libc::EEXIST) && state.read(&path, 65536)? == bytes => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+    pub(crate) fn cleanup(&self, state: &RootHandle) -> AppResult<()> {
+        for name in ["payload", "receipt.json", "intent.json"] {
+            match state.unlink(&capture_path(self.operation, name)?, false) {
+                Ok(()) => {}
+                Err(e) if e.errno == Some(libc::ENOENT) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        state.unlink(
+            &ArchivePath::parse(&format!(".photo-sorter/captures/{}", self.operation))?,
+            true,
+        )
+    }
+}
+pub(crate) fn capture_owned(
+    local: &RootHandle,
+    state: &RootHandle,
+    context: &CaptureContext,
+    ceiling: u64,
+) -> AppResult<SnapshotReceipt> {
+    context.persist(state)?;
+    let receipt = capture_with_stage(
+        local,
+        state,
+        &context.owner.path,
+        context.owner.kind,
+        ceiling,
+        Some(context.operation),
+    )?;
+    state.write_new(
+        &capture_path(context.operation, "receipt.json")?,
+        &serde_json::to_vec(&receipt)?,
+    )?;
+    Ok(receipt)
+}
+pub(crate) fn recover_capture(
+    state: &RootHandle,
+    context: &CaptureContext,
+    ceiling: u64,
+) -> AppResult<SnapshotReceipt> {
+    context.persist(state)?;
+    match state.read(&capture_path(context.operation, "receipt.json")?, 65536) {
+        Ok(bytes) => {
+            let receipt: SnapshotReceipt = serde_json::from_slice(&bytes)?;
+            if receipt.path != context.owner.path {
+                return Err(AppError::integrity("capture receipt owner mismatch"));
+            }
+            if let VersionBody::Content { digest, size } = &receipt.body {
+                let mut file = state.open_relative(&snapshot_path(digest)?, libc::O_RDONLY, 0)?;
+                if digest_file(&mut file)? != (digest.clone(), *size) {
+                    return Err(AppError::integrity("recovered snapshot corrupt"));
+                }
+            }
+            Ok(receipt)
+        }
+        Err(e) if e.errno == Some(libc::ENOENT) => {
+            let payload = capture_path(context.operation, "payload")?;
+            let mut receipt = capture_with_stage(
+                state,
+                state,
+                &payload,
+                super::SidecarKind::Opaque,
+                ceiling,
+                None,
+            )?;
+            if receipt.body == VersionBody::Reset {
+                return Err(AppError::new(
+                    ErrorCode::NotFound,
+                    "capture stopped before retaining payload",
+                ));
+            }
+            receipt.path = context.owner.path.clone();
+            receipt.source_stamp = None;
+            receipt.opaque_invalid = true;
+            Ok(receipt)
+        }
+        Err(e) => Err(e),
     }
 }

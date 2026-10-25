@@ -90,6 +90,32 @@ impl RootHandle {
     pub fn fd(&self) -> RawFd {
         self.dir.as_raw_fd()
     }
+    pub fn metadata_relative(&self, path: &ArchivePath) -> AppResult<libc::statx> {
+        let (parent, name) = self.parent(path)?;
+        let mut metadata = std::mem::MaybeUninit::<libc::statx>::uninit();
+        // statx checks the held parent without opening and closing a SQLite database inode.
+        if unsafe {
+            libc::statx(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT,
+                libc::STATX_BASIC_STATS | libc::STATX_MNT_ID,
+                metadata.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // A successful statx initializes the output structure.
+        let metadata = unsafe { metadata.assume_init() };
+        if metadata.stx_mask & libc::STATX_MNT_ID == 0 || metadata.stx_mnt_id != self.mount_id {
+            return Err(AppError::new(
+                ErrorCode::Unavailable,
+                "managed file crosses a mount boundary",
+            ));
+        }
+        Ok(metadata)
+    }
     pub fn inode(&self) -> u64 {
         self.inode
     }

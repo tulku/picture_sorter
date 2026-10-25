@@ -19,6 +19,36 @@ use std::{
 const MAX_LINE: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasCommand {
+    PublishLocal {
+        root: PathBuf,
+        receipt: TransferReceipt,
+        destination: crate::domain::ArchivePath,
+    },
+    AuditLocal {
+        root: PathBuf,
+        objects: Vec<crate::catalog::VerifyObject>,
+    },
+    CaptureOwned {
+        local: PathBuf,
+        state: PathBuf,
+        context: crate::edit::CaptureContext,
+        ceiling: u64,
+    },
+    RecoverCapture {
+        state: PathBuf,
+        context: crate::edit::CaptureContext,
+        ceiling: u64,
+    },
+    BackupCatalog {
+        state: PathBuf,
+        destination: PathBuf,
+    },
+    LocalForensicStart {
+        root: PathBuf,
+    },
+    LocalInventoryHashNext {
+        limit: usize,
+    },
     LocalInventoryStart {
         root: PathBuf,
     },
@@ -143,6 +173,11 @@ pub enum NasCommand {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasReply {
+    LocalObserved {
+        entries: Vec<ArchiveObservation>,
+        end: bool,
+        skipped: u64,
+    },
     LocalFiles {
         entries: Vec<LocalFile>,
         end: bool,
@@ -273,6 +308,12 @@ impl WorkerSupervisor {
     }
     pub fn available(&mut self) -> AppResult<bool> {
         Ok(self.pending.is_none() && !self.timed_out && self.child.try_wait()?.is_none())
+    }
+    pub fn mark_uncertain(&mut self) {
+        self.timed_out = true;
+    }
+    pub fn is_uncertain(&self) -> bool {
+        self.timed_out
     }
     pub fn pid(&self) -> u32 {
         self.child.id()
@@ -757,6 +798,82 @@ struct LocalRuntime {
 impl LocalRuntime {
     fn execute(&mut self, command: NasCommand) -> AppResult<NasReply> {
         match command {
+            NasCommand::BackupCatalog { state, destination } => {
+                let state = RootHandle::open(&state, RootPolicy::Local)?;
+                crate::catalog::backup_readonly(&state, &destination)?;
+                Ok(NasReply::Done)
+            }
+            NasCommand::LocalForensicStart { root } => {
+                self.inventory = Some(crate::import::Inventory::open_forensic(RootHandle::open(
+                    &root,
+                    RootPolicy::Local,
+                )?)?);
+                Ok(NasReply::Done)
+            }
+            NasCommand::LocalInventoryHashNext { limit } => {
+                let inventory = self
+                    .inventory
+                    .as_mut()
+                    .ok_or_else(|| AppError::invalid("local inventory not started"))?;
+                let files = inventory.next_batch(limit)?;
+                let end = files.is_empty();
+                let entries = files
+                    .into_iter()
+                    .map(|entry| {
+                        Ok(ArchiveObservation {
+                            digest: crate::import::hash_source(&entry)?,
+                            path: entry.path,
+                            size: entry.size,
+                            role: entry.role,
+                        })
+                    })
+                    .collect::<AppResult<Vec<_>>>()?;
+                Ok(NasReply::LocalObserved {
+                    entries,
+                    end,
+                    skipped: inventory.skipped,
+                })
+            }
+            NasCommand::PublishLocal {
+                root,
+                receipt,
+                destination,
+            } => {
+                let root = RootHandle::open(&root, RootPolicy::Local)?;
+                if let Some((parent, _)) = destination.as_str().rsplit_once('/') {
+                    root.mkdir_all(&crate::domain::ArchivePath::parse(parent)?)?;
+                }
+                crate::transfer::publish_local(&root, &receipt, &destination)?;
+                Ok(NasReply::Staged(receipt))
+            }
+            NasCommand::AuditLocal { root, objects } => {
+                let root = RootHandle::open(&root, RootPolicy::Local)?;
+                Ok(NasReply::Integrity(
+                    crate::catalog::IntegrityReport::audit_objects(&root, &objects)?,
+                ))
+            }
+            NasCommand::CaptureOwned {
+                local,
+                state,
+                context,
+                ceiling,
+            } => {
+                let local = RootHandle::open(&local, RootPolicy::Local)?;
+                let state = RootHandle::open(&state, RootPolicy::Local)?;
+                Ok(NasReply::Captured(crate::edit::capture_owned(
+                    &local, &state, &context, ceiling,
+                )?))
+            }
+            NasCommand::RecoverCapture {
+                state,
+                context,
+                ceiling,
+            } => {
+                let state = RootHandle::open(&state, RootPolicy::Local)?;
+                Ok(NasReply::Captured(crate::edit::recover_capture(
+                    &state, &context, ceiling,
+                )?))
+            }
             NasCommand::CaptureLocal {
                 local,
                 state,

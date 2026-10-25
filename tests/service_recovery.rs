@@ -284,3 +284,187 @@ fn same_length_corrupt_local_original_cannot_satisfy_repeat_ingestion() {
         b"other"
     );
 }
+#[test]
+fn durable_backoff_and_job_pages_survive_restart() {
+    let r = TestRig::new();
+    let state = RootHandle::open(&r.state, RootPolicy::Local).unwrap();
+    let mut cat = Catalog::open(&state).unwrap();
+    let mut ids = vec![];
+    for _ in 0..260 {
+        ids.push(
+            cat.enqueue(DurableRequest {
+                operation_id: OperationId::new(),
+                kind: JobKind::Clean,
+            })
+            .unwrap(),
+        );
+    }
+    cat.defer_job(ids[0], 100, "fixture unavailable").unwrap();
+    assert!(!cat.job_is_due(ids[0], 100).unwrap());
+    drop(cat);
+    let cat = Catalog::open(&state).unwrap();
+    assert!(!cat.job_is_due(ids[0], 100).unwrap());
+    assert!(cat.job_is_due(ids[0], 101).unwrap());
+    let first = cat.jobs_page(None, 128, true).unwrap();
+    assert_eq!(first.len(), 128);
+    let next = cat
+        .jobs_page(first.last().map(|j| j.id), 128, true)
+        .unwrap();
+    assert_eq!(next.len(), 128);
+    assert!(first.iter().all(|a| next.iter().all(|b| a.id != b.id)));
+}
+#[test]
+fn original_publication_carries_cached_metadata_to_fresh_client() {
+    use photo_sorter::{archive::*, transfer::*};
+    use std::time::{Duration, Instant};
+    let r = TestRig::new();
+    std::fs::write(r.source.join("A.JPG"), b"jpeg").unwrap();
+    let mut config = Config::new(r.local.clone(), r.state.clone(), r.archive.clone());
+    config.archive_id = Some(ArchiveId::new());
+    let root = RootHandle::open(&r.archive, RootPolicy::TestArchive).unwrap();
+    ArchiveStore::initialize(
+        &root,
+        InitArchive {
+            archive_id: config.archive_id.unwrap(),
+            writer_id: config.writer_id,
+        },
+    )
+    .unwrap();
+    let mut engine = ImportCoordinator::new(
+        config.clone(),
+        Catalog::open(&RootHandle::open(&r.state, RootPolicy::Local).unwrap()).unwrap(),
+    );
+    let job = engine
+        .prepare(ImportRequest {
+            source_path: r.source,
+            strict: true,
+            dry_run: false,
+            operation_id: OperationId::new(),
+        })
+        .unwrap()
+        .job
+        .unwrap();
+    let mut worker =
+        WorkerSupervisor::new(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+    let mut driver = UploadDriver::default();
+    let begin = Instant::now();
+    loop {
+        if driver
+            .advance(&mut engine, &mut worker, job)
+            .unwrap()
+            .archive_committed
+            == 1
+        {
+            break;
+        }
+        assert!(begin.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let other = tempfile::tempdir().unwrap();
+    let mut target =
+        Catalog::open(&RootHandle::open(other.path(), RootPolicy::Local).unwrap()).unwrap();
+    let store = ArchiveStore::open(root, config.archive_id.unwrap(), config.writer_id).unwrap();
+    let mut journal = store.read_only_journal().unwrap();
+    loop {
+        let batch = journal.next_batch(128).unwrap();
+        for entry in batch.entries {
+            target
+                .apply_commit(&journal.read(&entry.path).unwrap())
+                .unwrap();
+        }
+        if batch.end {
+            break;
+        }
+    }
+    assert!(target.metadata(&Digest::of(b"jpeg")).unwrap().is_some());
+}
+#[test]
+fn interrupted_capture_has_owned_bytes_and_recovers_after_live_overwrite() {
+    use photo_sorter::{edit::*, transfer::*};
+    let r = TestRig::new();
+    let state = RootHandle::open(&r.state, RootPolicy::Local).unwrap();
+    let path = ArchivePath::parse("A.ORF.rrdata").unwrap();
+    std::fs::write(r.local.join(path.as_str()), b"first saved edit").unwrap();
+    let context = CaptureContext {
+        operation: OperationId::new(),
+        owner: SidecarOwner {
+            id: SidecarId::new(),
+            group: None,
+            path: path.clone(),
+            kind: SidecarKind::Opaque,
+            virtual_copy: None,
+        },
+        previous: None,
+    };
+    context.persist(&state).unwrap();
+    let mut worker =
+        WorkerSupervisor::new_local(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+    let ticket = worker
+        .submit(NasCommand::CaptureOwned {
+            local: r.local.clone(),
+            state: r.state.clone(),
+            context: context.clone(),
+            ceiling: 1024,
+        })
+        .unwrap();
+    loop {
+        match worker.poll(ticket).unwrap() {
+            WorkerState::Completed(NasReply::Captured(_)) => break,
+            WorkerState::Active => std::thread::sleep(std::time::Duration::from_millis(10)),
+            other => panic!("{other:?}"),
+        }
+    }
+    drop(worker);
+    std::fs::write(r.local.join(path.as_str()), b"later saved edit").unwrap();
+    let mut worker =
+        WorkerSupervisor::new_local(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+    let ticket = worker
+        .submit(NasCommand::RecoverCapture {
+            state: r.state.clone(),
+            context: context.clone(),
+            ceiling: 1024,
+        })
+        .unwrap();
+    let receipt = loop {
+        match worker.poll(ticket).unwrap() {
+            WorkerState::Completed(NasReply::Captured(r)) => break r,
+            WorkerState::Active => std::thread::sleep(std::time::Duration::from_millis(10)),
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(receipt.path, path);
+    assert_eq!(
+        receipt.body,
+        VersionBody::Content {
+            digest: Digest::of(b"first saved edit"),
+            size: 16
+        }
+    );
+    assert_eq!(
+        std::fs::read(r.local.join(path.as_str())).unwrap(),
+        b"later saved edit"
+    );
+}
+#[test]
+fn startup_invalidates_physical_readiness_until_local_worker_checks_bytes() {
+    let r = TestRig::new();
+    std::fs::write(r.source.join("A.JPG"), b"jpeg").unwrap();
+    let state = RootHandle::open(&r.state, RootPolicy::Local).unwrap();
+    let mut engine = ImportCoordinator::new(
+        Config::new(r.local.clone(), r.state.clone(), r.archive.clone()),
+        Catalog::open(&state).unwrap(),
+    );
+    let report = engine
+        .prepare(ImportRequest {
+            source_path: r.source.clone(),
+            strict: true,
+            dry_run: false,
+            operation_id: OperationId::new(),
+        })
+        .unwrap();
+    engine.advance(report.job.unwrap()).unwrap();
+    let group = engine.catalog.group_batch(None, 1).unwrap()[0].id;
+    assert!(engine.catalog.readiness(group).unwrap().originals_ready);
+    photo_sorter::service::ServiceRecovery::restore(&mut engine.catalog).unwrap();
+    assert!(!engine.catalog.readiness(group).unwrap().originals_ready);
+}

@@ -248,7 +248,11 @@ impl ImportCoordinator {
         self.catalog
             .transition(attempt.spec.job, child.generation, JobTransition::Complete)?;
         let report = self.report(attempt.parent)?;
-        if report.waiting == 0 && report.conflicting == 0 && self.scan_complete(attempt.parent)? {
+        if report.waiting == 0
+            && report.conflicting == 0
+            && self.scan_complete(attempt.parent)?
+            && !self.catalog.job(attempt.parent)?.cancel_requested
+        {
             let parent = self.catalog.job(attempt.parent)?;
             self.catalog
                 .transition(attempt.parent, parent.generation, JobTransition::Ingested)?;
@@ -284,6 +288,9 @@ impl ImportCoordinator {
                     })?,
                 )?;
             }
+        }
+        if record.cancel_requested {
+            return Ok(());
         }
         self.catalog.transition(
             attempt.parent,

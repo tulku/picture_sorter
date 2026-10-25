@@ -230,6 +230,10 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
     }
     let mut catalog = Catalog::open(&state)?;
     let _recovery = super::ServiceRecovery::restore(&mut catalog)?;
+    let maintenance_worker = WorkerSupervisor::new_local(
+        std::env::current_exe()?,
+        vec![profile.inherit()?, work.inherit()?],
+    )?;
     let observation_worker = WorkerSupervisor::new_local(
         std::env::current_exe()?,
         vec![profile.inherit()?, work.inherit()?],
@@ -255,8 +259,12 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
     };
     let mut runtime = Runtime {
         http,
+        maintenance: maintenance_worker,
+        startup: super::recovery::StartupVerifier::default(),
+        reader: super::archive_reader::ArchiveReader::default(),
         http_reason,
         rating_cursor: None,
+        job_cursor: None,
         engine: ImportCoordinator::new(config.clone(), catalog),
         local,
         state,
@@ -268,10 +276,11 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         scheduler: super::Scheduler::new(&config),
         upload: UploadDriver::default(),
         bootstrap: BootstrapDriver::default(),
-        fetch: crate::immich::PinFetchDriver::default(),
+        fetch: super::pin::PinDriver::default(),
         sessions: ApplicationSessions::default(),
         authorizations: HashMap::new(),
         control: None,
+        local_control: None,
         archive_status: serde_json::json!({"availability":"unobserved","identity":null}),
         last_tick: Instant::now(),
     };
@@ -407,9 +416,13 @@ struct Control {
 }
 struct Runtime {
     engine: ImportCoordinator,
+    maintenance: WorkerSupervisor,
+    startup: super::recovery::StartupVerifier,
+    reader: super::archive_reader::ArchiveReader,
     http: Option<super::http::AsyncImmich>,
     http_reason: Option<String>,
     rating_cursor: Option<Option<uuid::Uuid>>,
+    job_cursor: Option<JobId>,
     local: RootHandle,
     state: RootHandle,
     worker: WorkerSupervisor,
@@ -420,10 +433,11 @@ struct Runtime {
     local_transfer: super::local_transfer::LocalTransferDriver,
     scheduler: super::Scheduler,
     bootstrap: BootstrapDriver,
-    fetch: crate::immich::PinFetchDriver,
+    fetch: super::pin::PinDriver,
     sessions: ApplicationSessions,
     authorizations: HashMap<JobId, ApplicationSessionId>,
     control: Option<Control>,
+    local_control: Option<Control>,
     archive_status: serde_json::Value,
     last_tick: Instant,
 }
@@ -452,7 +466,7 @@ impl Runtime {
                     &self.engine,
                     &self.local,
                     &self.state,
-                    serde_json::json!({"pid":self.worker.pid(),"local_pid":self.local_transfer.worker.pid(),"observation_pid":self.observation.worker.pid(),"available":self.worker.available()?}),
+                    serde_json::json!({"pid":self.worker.pid(),"local_pid":self.local_transfer.worker.pid(),"observation_pid":self.observation.worker.pid(),"maintenance_pid":self.maintenance.pid(),"available":self.worker.available()?}),
                     self.archive_status.clone(),
                 )?;
                 status.watcher = serde_json::to_value(&self.observation.status)?;
@@ -667,9 +681,12 @@ impl Runtime {
             },
             _ => false,
         };
-        if matches!(record.request.kind, JobKind::PinUrl { .. })
+        if let JobKind::PinUrl { asset, .. } = record.request.kind
             && record.state == JobState::WaitingImmich
-            && self.http.as_ref().is_some_and(|http| http.in_flight())
+            && self
+                .http
+                .as_ref()
+                .is_some_and(|http| !http.asset_failed(asset))
         {
             return Ok(None);
         }
@@ -699,15 +716,24 @@ impl Runtime {
     }
     fn complete(&mut self, job: JobId) -> AppResult<()> {
         let record = self.engine.catalog.job(job)?;
-        if record.state != JobState::Complete {
-            self.engine
-                .catalog
-                .transition(job, record.generation, JobTransition::Complete)?;
+        if !matches!(record.state, JobState::Complete | JobState::Cancelled) {
+            self.engine.catalog.transition(
+                job,
+                record.generation,
+                if record.cancel_requested {
+                    JobTransition::ConfirmCancelled
+                } else {
+                    JobTransition::Complete
+                },
+            )?;
         }
         Ok(())
     }
     fn wait(&mut self, job: JobId, state: JobState, reason: String) -> AppResult<()> {
         let record = self.engine.catalog.job(job)?;
+        if record.state == state && record.reason.as_deref() == Some(&reason) {
+            return Ok(());
+        }
         self.engine
             .catalog
             .transition(job, record.generation, JobTransition::Wait(state, reason))
@@ -718,6 +744,10 @@ impl Runtime {
         if timing.poll_ratings {
             self.rating_cursor = Some(None);
         }
+        if timing.poll_ratings {
+            self.reader.requested = true;
+        }
+
         if let Some(http) = &self.http
             && let Err(error) = http.pump()
         {
@@ -734,7 +764,49 @@ impl Runtime {
         ) {
             self.observation.status.reason = Some(error.to_string());
         }
+        self.startup
+            .advance(&mut self.engine, &mut self.maintenance)?;
         self.worker.timeout(Duration::from_secs(5));
+        if (self.reader.busy()
+            || (self.control.is_none()
+                && self.upload.active_job().is_none()
+                && !self.shared_publisher.busy()
+                && self.worker.available()?))
+            && let Err(error) = self.reader.advance(
+                &mut self.engine,
+                &self.state,
+                &mut self.worker,
+                &mut self.maintenance,
+            )
+        {
+            self.reader.reason = Some(error.to_string());
+        }
+
+        if let Some(control) = self.local_control.take() {
+            match self.maintenance.poll(control.ticket)? {
+                WorkerState::Active | WorkerState::TimedOutStillAlive => {
+                    self.local_control = Some(control)
+                }
+                WorkerState::Completed(reply) => {
+                    self.result(control.job, serde_json::to_value(reply)?)?;
+                    self.complete(control.job)?;
+                }
+                WorkerState::Failed(error) => self.wait(
+                    control.job,
+                    if error.code == ErrorCode::Capacity || error.errno == Some(libc::ENOSPC) {
+                        JobState::WaitingCapacity
+                    } else {
+                        JobState::Failed
+                    },
+                    error.to_string(),
+                )?,
+                WorkerState::Reaped => self.wait(
+                    control.job,
+                    JobState::Failed,
+                    "maintenance worker disappeared; partial backup retained".into(),
+                )?,
+            }
+        }
         if let Some(control) = self.control.take() {
             match self.worker.poll(control.ticket)? {
                 WorkerState::Active | WorkerState::TimedOutStillAlive => {
@@ -758,15 +830,68 @@ impl Runtime {
                 )?,
             }
         }
-        let jobs = self.engine.catalog.jobs()?;
-        for record in jobs.into_iter().take(128) {
+        let now = clock.now();
+        let mut jobs = self.engine.catalog.jobs_page(self.job_cursor, 128, true)?;
+        self.job_cursor = jobs.last().map(|job| job.id);
+        let active = [
+            self.scan.active_job(),
+            self.local_transfer.active_parent(),
+            self.upload.active_job(),
+            self.fetch.active_job(),
+            self.bootstrap.active_job(),
+            self.reader.active_job(),
+        ];
+        for job in active.into_iter().flatten() {
+            if !jobs.iter().any(|record| record.id == job) {
+                jobs.push(self.engine.catalog.job(job)?);
+            }
+        }
+        for record in jobs {
             if matches!(
                 record.state,
-                JobState::Complete | JobState::Cancelled | JobState::Failed | JobState::Conflict
-            ) {
+                JobState::Complete | JobState::Cancelled | JobState::Failed
+            ) || (record.state == JobState::Conflict
+                && !matches!(record.request.kind, JobKind::Import { .. })
+                && !active.contains(&Some(record.id)))
+            {
                 continue;
             }
+            let http_ready = matches!(record.request.kind,JobKind::PinUrl{asset,..} if self.http.as_ref().is_some_and(|http|http.has_ready_asset(asset)));
+            if !matches!(record.request.kind, JobKind::Import { .. })
+                && !active.contains(&Some(record.id))
+                && !http_ready
+                && !self.engine.catalog.job_is_due(record.id, now)?
+            {
+                continue;
+            }
+            let was_due = self.engine.catalog.job_is_due(record.id, now)?;
             if record.cancel_requested {
+                self.scan.cancel(record.id)?;
+                self.upload.cancel(&mut self.worker, record.id)?;
+                self.bootstrap.cancel(&mut self.worker, record.id)?;
+                self.fetch.cancel(
+                    &mut self.engine.catalog,
+                    &mut self.worker,
+                    &mut self.maintenance,
+                    record.id,
+                )?;
+                if self.local_transfer.active_parent() == Some(record.id) {
+                    self.local_transfer.advance(&mut self.engine, record.id)?;
+                }
+                let draining = [
+                    self.scan.active_job(),
+                    self.upload.active_job(),
+                    self.bootstrap.active_job(),
+                    self.fetch.active_job(),
+                    self.local_transfer.active_parent(),
+                    self.reader.active_job(),
+                    self.control.as_ref().map(|c| c.job),
+                    self.local_control.as_ref().map(|c| c.job),
+                ]
+                .contains(&Some(record.id));
+                if !draining {
+                    self.complete(record.id)?;
+                }
                 continue;
             }
             let result = self.advance(&record);
@@ -797,6 +922,25 @@ impl Runtime {
                     _ => JobState::Failed,
                 };
                 self.wait(record.id, state, error.to_string())?;
+            }
+            let current = self.engine.catalog.job(record.id)?;
+            if was_due
+                && matches!(
+                    current.state,
+                    JobState::WaitingNas
+                        | JobState::WaitingImmich
+                        | JobState::WaitingSource
+                        | JobState::WaitingCapacity
+                )
+            {
+                self.engine.catalog.defer_job(
+                    record.id,
+                    now,
+                    current
+                        .reason
+                        .as_deref()
+                        .unwrap_or("dependency unavailable"),
+                )?;
             }
         }
         if let Some(http) = &self.http {
@@ -859,8 +1003,16 @@ impl Runtime {
         match &record.request.kind {
             JobKind::LocalTransfer { .. } => {}
             JobKind::Import { .. } => {
-                self.scan.advance(&mut self.engine, job)?;
-                self.local_transfer.advance(&mut self.engine, job)?;
+                let due = self
+                    .engine
+                    .catalog
+                    .job_is_due(job, SystemClock::default().now())?;
+                if due || self.scan.active_job() == Some(job) {
+                    self.scan.advance(&mut self.engine, job)?;
+                }
+                if due || self.local_transfer.active_parent() == Some(job) {
+                    self.local_transfer.advance(&mut self.engine, job)?;
+                }
                 let report = self.engine.report(job)?;
                 if report.conflicting > 0 {
                     self.wait(
@@ -877,7 +1029,9 @@ impl Runtime {
                 {
                     self.complete(job)?;
                 } else if self.upload.active_job() == Some(job)
-                    || (self.upload.active_job().is_none()
+                    || (due
+                        && report.selected > 0
+                        && self.upload.active_job().is_none()
                         && self.local_transfer.active_parent() != Some(job)
                         && self.control.is_none()
                         && self.worker.available()?)
@@ -898,13 +1052,20 @@ impl Runtime {
                 self.result(job, report)?;
             }
             JobKind::Pin { .. } => {
-                let readiness =
-                    self.fetch
-                        .advance(&mut self.engine.catalog, &config, &mut self.worker, job)?;
+                let readiness = self.fetch.advance(
+                    &mut self.engine.catalog,
+                    &config,
+                    &mut self.worker,
+                    &mut self.maintenance,
+                    job,
+                )?;
                 self.result(job, &readiness)?;
-                if readiness.originals_ready && readiness.metadata_current {
+                if self.fetch.verified(job)
+                    && readiness.originals_ready
+                    && readiness.metadata_current
+                {
                     self.complete(job)?;
-                } else if readiness.originals_ready {
+                } else if self.fetch.verified(job) && readiness.originals_ready {
                     self.wait(job,JobState::WaitingApplication,"originals are resident; retained sidecars require foreground refresh --editor-closed".into())?;
                 }
             }
@@ -960,13 +1121,20 @@ impl Runtime {
                         }
                     }
                 }
-                let readiness =
-                    self.fetch
-                        .advance(&mut self.engine.catalog, &config, &mut self.worker, job)?;
+                let readiness = self.fetch.advance(
+                    &mut self.engine.catalog,
+                    &config,
+                    &mut self.worker,
+                    &mut self.maintenance,
+                    job,
+                )?;
                 self.result(job, &readiness)?;
-                if readiness.originals_ready && readiness.metadata_current {
+                if self.fetch.verified(job)
+                    && readiness.originals_ready
+                    && readiness.metadata_current
+                {
                     self.complete(job)?;
-                } else if readiness.originals_ready {
+                } else if self.fetch.verified(job) && readiness.originals_ready {
                     self.wait(job,JobState::WaitingApplication,"originals are resident; use foreground refresh --editor-closed for pending metadata".into())?;
                 }
             }
@@ -1067,16 +1235,20 @@ impl Runtime {
                 }
             }
             JobKind::Backup { destination } => {
-                self.engine.catalog.backup(destination)?;
-                self.result(job, serde_json::json!({"backup":destination}))?;
-                self.complete(job)?;
+                if self.local_control.is_none() && self.maintenance.available()? {
+                    let ticket = self.maintenance.submit(NasCommand::BackupCatalog {
+                        state: config.state_root.clone(),
+                        destination: destination.clone(),
+                    })?;
+                    self.local_control = Some(Control { job, ticket });
+                }
             }
-            JobKind::Rebuild { .. } => {
-                return Err(AppError::new(
-                    ErrorCode::Unavailable,
-                    "online rebuild requires service handoff; use explicit catalog rebuild --offline into a new state location",
-                ));
-            }
+            JobKind::Rebuild { replacement } => self.reader.start_rebuild(
+                &mut self.engine,
+                &mut self.maintenance,
+                job,
+                replacement,
+            )?,
             JobKind::Verify { archive: false } => {
                 let report = IntegrityVerifier::new(&self.engine.catalog, &self.local)
                     .audit(VerifyScope::Originals)?;
@@ -1094,10 +1266,8 @@ impl Runtime {
                 }
             }
             JobKind::Verify { archive: true } => {
-                return Err(AppError::new(
-                    ErrorCode::Unavailable,
-                    "archive audit requires a free read-only worker session",
-                ));
+                self.reader
+                    .start_verify(&mut self.engine, &self.state, &mut self.worker, job)?
             }
             JobKind::ResolveAmbiguity { request } => {
                 let records = self.engine.catalog.resolution_records(request)?;

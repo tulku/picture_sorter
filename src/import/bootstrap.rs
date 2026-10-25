@@ -29,6 +29,48 @@ pub struct BootstrapReport {
 pub struct BootstrapDriver {
     active: Option<Active>,
 }
+impl BootstrapDriver {
+    pub fn cancel(&mut self, worker: &mut WorkerSupervisor, job: JobId) -> AppResult<()> {
+        let Some(mut active) = self.active.take() else {
+            return Ok(());
+        };
+        if active.job != job {
+            self.active = Some(active);
+            return Ok(());
+        }
+        match worker.poll(active.ticket)? {
+            WorkerState::Active | WorkerState::TimedOutStillAlive | WorkerState::Reaped => {
+                self.active = Some(active)
+            }
+            WorkerState::Completed(reply) => {
+                if let NasReply::Session { session, .. } = reply {
+                    active.session = Some(session);
+                }
+                if !matches!(active.phase, Phase::End | Phase::Abort)
+                    && let Some(session) = active.session
+                {
+                    active.phase = Phase::Abort;
+                    active.ticket = worker.submit(NasCommand::EndArchive { session })?;
+                    self.active = Some(active);
+                }
+            }
+            WorkerState::Failed(_) => {
+                if matches!(active.phase, Phase::End | Phase::Abort) {
+                    worker.mark_uncertain();
+                    self.active = Some(active);
+                } else if let Some(session) = active.session {
+                    active.phase = Phase::Abort;
+                    active.ticket = worker.submit(NasCommand::EndArchive { session })?;
+                    self.active = Some(active);
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn active_job(&self) -> Option<JobId> {
+        self.active.as_ref().map(|active| active.job)
+    }
+}
 struct Active {
     job: JobId,
     ticket: WorkerTicket,
@@ -50,6 +92,7 @@ enum Phase {
     Metadata,
     Publish,
     End,
+    Abort,
 }
 pub struct BootstrapCoordinator<'a> {
     config: &'a Config,
@@ -177,7 +220,22 @@ impl<'a> BootstrapCoordinator<'a> {
             }
             WorkerState::Failed(e) => {
                 report.reason = Some(e.to_string());
-                self.driver.active = Some(active);
+                let record = self.catalog.job(job)?;
+                self.catalog.transition(
+                    job,
+                    record.generation,
+                    JobTransition::Wait(JobState::WaitingNas, e.to_string()),
+                )?;
+                if let Some(session) = active.session {
+                    if matches!(active.phase, Phase::Abort) {
+                        self.worker.mark_uncertain();
+                        self.driver.active = Some(active);
+                    } else {
+                        active.phase = Phase::Abort;
+                        active.ticket = self.worker.submit(NasCommand::EndArchive { session })?;
+                        self.driver.active = Some(active);
+                    }
+                }
                 self.save(job, &report)?;
                 return Ok(report);
             }
@@ -191,6 +249,7 @@ impl<'a> BootstrapCoordinator<'a> {
             WorkerState::Completed(reply) => reply,
         };
         let command = match (active.phase, reply) {
+            (Phase::Abort, NasReply::Done) => return Ok(report),
             (Phase::Begin, NasReply::Session { session, .. }) => {
                 active.session = Some(session);
                 active.phase = Phase::List;

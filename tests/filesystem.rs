@@ -62,3 +62,38 @@ fn non_utf8_is_reported() {
     let name = OsString::from_vec(vec![0xff]);
     assert!(photo_sorter::fs::path_from_os(&name).is_err());
 }
+#[test]
+fn state_occupancy_does_not_release_sqlite_style_process_locks() {
+    use std::os::fd::AsRawFd;
+    let r = support::TestRig::new();
+    let root = RootHandle::open(&r.state, RootPolicy::Local).unwrap();
+    let file = root.create_new(&p("catalog.sqlite")).unwrap();
+    let mut lock = libc::flock {
+        l_type: libc::F_WRLCK as i16,
+        l_whence: libc::SEEK_SET as i16,
+        l_start: 0,
+        l_len: 1,
+        l_pid: 0,
+    };
+    // The isolated fixture file remains held while another process checks the POSIX lock.
+    assert_eq!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) },
+        0
+    );
+    photo_sorter::fs::state_occupied_bytes(&root).unwrap();
+    // The child performs only async-signal-safe system calls before _exit.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &mut lock) };
+        unsafe {
+            libc::_exit(if result == -1 { 0 } else { 1 });
+        }
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert_eq!(
+        status, 0,
+        "occupancy released a process-scoped database lock"
+    );
+}

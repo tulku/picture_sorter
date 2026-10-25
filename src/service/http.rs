@@ -154,6 +154,20 @@ impl AsyncImmich {
         }
         Ok(())
     }
+    pub fn has_ready_asset(&self, asset: uuid::Uuid) -> bool {
+        self.inner
+            .borrow()
+            .assets
+            .get(&asset)
+            .is_some_and(|(at, result)| at.elapsed() < Duration::from_secs(30) && result.is_ok())
+    }
+    pub fn asset_failed(&self, asset: uuid::Uuid) -> bool {
+        self.inner
+            .borrow()
+            .assets
+            .get(&asset)
+            .is_some_and(|(at, result)| at.elapsed() < Duration::from_secs(30) && result.is_err())
+    }
     pub fn in_flight(&self) -> bool {
         self.inner.borrow().active.is_some()
     }
@@ -193,7 +207,7 @@ impl ImmichAccess for AsyncImmich {
             return Err(pending());
         }
         if let Some((at, result)) = self.inner.borrow().assets.get(&asset)
-            && at.elapsed() < Duration::from_secs(1)
+            && at.elapsed() < Duration::from_secs(30)
         {
             return result.clone();
         }

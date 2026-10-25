@@ -21,6 +21,7 @@ pub struct ImportRequest {
 pub struct ImportReport {
     pub job: Option<JobId>,
     pub selected: u64,
+    pub skipped: u64,
     pub recognized: u64,
     pub local_ready: u64,
     pub archive_committed: u64,
@@ -405,7 +406,18 @@ impl ImportCoordinator {
         let (selected,recognized,exif_invocations,transfer_bytes,hash_bytes)=self.catalog.db.query_row("SELECT selected,recognized,exif_calls,transfer_bytes,hash_bytes FROM import_stats WHERE job=?",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
         let(local_ready,archive_committed,waiting,conflicting,association_warnings):(u64,u64,u64,u64,u64)=self.catalog.db.query_row("SELECT coalesce(sum(local_ready),0),coalesce(sum(archived),0),coalesce(sum(local_ready=0 AND archived=0 AND state<>'conflict'),0),coalesce(sum(state='conflict'),0),coalesce(sum(warning),0) FROM import_items WHERE parent=?",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
         let pending_archive = selected - archive_committed;
+        let skipped = self
+            .catalog
+            .db
+            .query_row(
+                "SELECT skipped FROM import_scans WHERE job=?",
+                [job.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
         Ok(ImportReport {
+            skipped,
             job: Some(job),
             selected,
             recognized,

@@ -45,8 +45,7 @@ pub fn offline_backup(config: &Config, destination: &Path) -> AppResult<()> {
             Err(e) => return Err(e),
         }
     }
-    let catalog = Catalog::open(&state)?;
-    catalog.backup(destination)?;
+    crate::catalog::backup_readonly(&state, destination)?;
     Ok(())
 }
 mod recovery;
@@ -55,6 +54,9 @@ mod local_transfer;
 mod scan;
 mod scheduler;
 pub use scheduler::*;
+mod archive_reader;
 mod http;
 mod observation;
 mod publication;
+
+mod pin;

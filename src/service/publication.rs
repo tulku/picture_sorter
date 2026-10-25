@@ -27,6 +27,7 @@ struct Active {
 enum Candidate {
     Version(VersionId),
     Records(OperationId),
+    Projection(SidecarId, VersionId),
 }
 #[derive(Clone, Copy)]
 enum Phase {
@@ -37,6 +38,7 @@ enum Phase {
     Read,
     Ack,
     Publish,
+    Repair,
     End,
     Abort,
 }
@@ -137,6 +139,9 @@ impl SharedPublisher {
                     active.phase = Phase::Abort;
                     active.ticket = worker.submit(NasCommand::EndArchive { session })?;
                     self.active = Some(active);
+                } else if active.session.is_some() {
+                    worker.mark_uncertain();
+                    self.active = Some(active);
                 } else {
                     defer(&mut engine.catalog, &active.candidate, &error.to_string())?;
                 }
@@ -205,6 +210,28 @@ impl SharedPublisher {
                         NasCommand::EndArchive {
                             session: session(&active)?,
                         }
+                    } else if let Candidate::Projection(sidecar, version) = active.candidate {
+                        if engine.catalog.heads(sidecar)? != vec![version] {
+                            active.phase = Phase::End;
+                            NasCommand::EndArchive {
+                                session: session(&active)?,
+                            }
+                        } else {
+                            let (plan,envelope):(String,Vec<u8>)=engine.catalog.db.query_row("SELECT p.committed,c.envelope FROM projections p JOIN projection_commits pc ON pc.sidecar=p.sidecar JOIN commits c ON c.id=pc.commit_id WHERE p.sidecar=? AND pc.version=?",params![sidecar.to_string(),version.to_string()],|r|Ok((r.get(0)?,r.get(1)?)))?;
+                            let plan: ProjectionPlan = serde_json::from_str(&plan)?;
+                            let commit = CommitEnvelope::decode(&envelope, archive)?;
+                            if plan.sidecar != sidecar || plan.version != version {
+                                return Err(AppError::integrity(
+                                    "projection repair identity changed",
+                                ));
+                            }
+                            active.phase = Phase::Repair;
+                            NasCommand::RepairProjection {
+                                session: session(&active)?,
+                                commit,
+                                plan,
+                            }
+                        }
                     } else {
                         match prepare(engine, &active.candidate) {
                             Ok(plan) => {
@@ -241,6 +268,39 @@ impl SharedPublisher {
                     session: session(&active)?,
                 }
             }
+            (Phase::Repair, NasReply::Projection(outcome)) => {
+                let Candidate::Projection(sidecar, version) = active.candidate else {
+                    return Err(AppError::integrity("repair has no projection"));
+                };
+                if let ProjectionOutcome::Conflict {
+                    observed,
+                    preserved,
+                } = outcome
+                {
+                    let group: Option<String> = engine.catalog.db.query_row(
+                        "SELECT group_id FROM sidecars WHERE id=?",
+                        [sidecar.to_string()],
+                        |r| r.get(0),
+                    )?;
+                    let group = group
+                        .map(|g| serde_json::from_str(&format!("\"{g}\"")))
+                        .transpose()?;
+                    engine.catalog.record_ambiguity("nas_projection",group,serde_json::json!({"sidecar":sidecar,"version":version,"observed":observed,"preserved":preserved}))?;
+                    self.reason = Some(
+                        "NAS sidecar differs from committed predecessor; all bytes retained".into(),
+                    );
+                    active.phase = Phase::Abort;
+                } else {
+                    engine.catalog.db.execute(
+                        "UPDATE nas_projections SET applied=1 WHERE sidecar=? AND version=?",
+                        params![sidecar.to_string(), version.to_string()],
+                    )?;
+                    active.phase = Phase::End;
+                }
+                NasCommand::EndArchive {
+                    session: session(&active)?,
+                }
+            }
             (Phase::End, NasReply::Done) => {
                 self.reason = None;
                 return Ok(());
@@ -269,6 +329,7 @@ impl SharedPublisher {
 fn candidate_key(candidate: &Candidate) -> String {
     match candidate {
         Candidate::Version(v) => format!("version:{v}"),
+        Candidate::Projection(sidecar, version) => format!("projection:{sidecar}:{version}"),
         Candidate::Records(op) => format!("records:{op}"),
     }
 }
@@ -279,6 +340,13 @@ fn defer(catalog: &mut Catalog, candidate: &Candidate, reason: &str) -> AppResul
 }
 fn select(catalog: &Catalog) -> AppResult<Option<Candidate>> {
     let now = SystemClock::default().now();
+    let projection:Option<(String,String)>=catalog.db.query_row("SELECT n.sidecar,n.version FROM nas_projections n WHERE n.applied=0 AND EXISTS(SELECT 1 FROM heads h WHERE h.sidecar=n.sidecar AND h.version=n.version) AND (SELECT count(*) FROM heads h WHERE h.sidecar=n.sidecar)=1 AND NOT EXISTS(SELECT 1 FROM publication_failures f WHERE f.source='projection:'||n.sidecar||':'||n.version AND f.next_attempt>?) ORDER BY n.rowid LIMIT 1",[now],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    if let Some((sidecar, version)) = projection {
+        return Ok(Some(Candidate::Projection(
+            serde_json::from_str(&format!("\"{sidecar}\""))?,
+            serde_json::from_str(&format!("\"{version}\""))?,
+        )));
+    }
     let raw:Option<String>=catalog.db.query_row("SELECT operation FROM pending_shared_records p WHERE committed=0 AND NOT EXISTS(SELECT 1 FROM publication_failures f WHERE f.source='records:'||p.operation AND f.next_attempt>?) ORDER BY rowid LIMIT 1",[now],|r|r.get(0)).optional()?;
     if let Some(op) = raw {
         return Ok(Some(Candidate::Records(serde_json::from_str(&format!(
@@ -340,6 +408,11 @@ fn prepare(engine: &mut ImportCoordinator, candidate: &Candidate) -> AppResult<V
     let mut projections = vec![];
     let mut records = vec![];
     match candidate {
+        Candidate::Projection(..) => {
+            return Err(AppError::integrity(
+                "projection repair cannot create a new commit",
+            ));
+        }
         Candidate::Records(operation) => {
             let text: String = engine.catalog.db.query_row(
                 "SELECT records FROM pending_shared_records WHERE operation=?",
