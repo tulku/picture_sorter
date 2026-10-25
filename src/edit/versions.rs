@@ -8,6 +8,11 @@ use rusqlite::{OptionalExtension, params};
 #[derive(Debug, Clone)]
 pub enum SnapshotPayload {
     Content(Vec<u8>),
+    File {
+        file: std::sync::Arc<std::fs::File>,
+        digest: Digest,
+        size: u64,
+    },
     Reset,
 }
 #[derive(Debug, Clone)]
@@ -64,6 +69,10 @@ impl<'a> VersionStore<'a> {
             SnapshotPayload::Content(bytes) => VersionBody::Content {
                 digest: Digest::of(bytes),
                 size: bytes.len() as u64,
+            },
+            SnapshotPayload::File { digest, size, .. } => VersionBody::Content {
+                digest: digest.clone(),
+                size: *size,
             },
             SnapshotPayload::Reset => VersionBody::Reset,
         };
@@ -131,6 +140,50 @@ impl<'a> VersionStore<'a> {
             self.catalog.db.execute(
                 "INSERT INTO snapshots(digest,path,size) VALUES(?,?,?) ON CONFLICT DO NOTHING",
                 params![digest.as_str(), target.as_str(), bytes.len() as u64],
+            )?;
+        }
+        if let SnapshotPayload::File { file, digest, size } = &intent.payload {
+            self.root
+                .mkdir_all(&ArchivePath::parse(".photo-sorter/snapshots")?)?;
+            let target = ArchivePath::parse(&format!(
+                ".photo-sorter/snapshots/{}",
+                &digest.as_str()[7..]
+            ))?;
+            let stage = ArchivePath::parse(&format!(
+                ".photo-sorter/snapshots/stage-{}",
+                intent.operation
+            ))?;
+            let mut dest = self.root.create_new(&stage)?;
+            let mut offset = 0;
+            let mut buffer = [0u8; 128 * 1024];
+            let mut hash = blake3::Hasher::new();
+            use std::{io::Write, os::unix::fs::FileExt};
+            loop {
+                let n = file.read_at(&mut buffer, offset)?;
+                if n == 0 {
+                    break;
+                }
+                dest.write_all(&buffer[..n])?;
+                hash.update(&buffer[..n]);
+                offset += n as u64;
+            }
+            dest.sync_all()?;
+            if offset != *size
+                || Digest::parse(&format!("blake3:{}", hash.finalize().to_hex()))? != *digest
+            {
+                return Err(AppError::integrity(
+                    "snapshot source changed during streaming copy; staged bytes retained",
+                ));
+            }
+            if publish_noreplace(self.root, &stage, &target)? == PublishOutcome::Exists {
+                let mut existing = self.root.open_relative(&target, libc::O_RDONLY, 0)?;
+                if crate::transfer::digest_file(&mut existing)? != (digest.clone(), *size) {
+                    return Err(AppError::integrity("immutable snapshot is corrupt"));
+                }
+            }
+            self.catalog.db.execute(
+                "INSERT INTO snapshots(digest,path,size) VALUES(?,?,?) ON CONFLICT DO NOTHING",
+                params![digest.as_str(), target.as_str(), size],
             )?;
         }
         let tx = self.catalog.db.transaction()?;
