@@ -12,7 +12,7 @@
 
 ## Global constraints
 
-- Repository `/home/tulku/Repos/picture_sorter`; inspected baseline `de1cffa6a785a594c7aebf5de2e2e8716c30a448`; preserve its untracked `fill_gaps.sh`.
+- Repository `/home/tulku/Repos/picture_sorter`; inspected baseline `de1cffa6a785a594c7aebf5de2e2e8716c30a448`; keep this personal main checkout in place. The user authorized deletion of the former untracked `fill_gaps.sh` during repository relocation.
 - Implementation branch `feat/offline-photo-archive`; worktree exactly `/home/tulku/Repos/picture_sorter/offline-photo-archive`. State and verify this path before creation. If layout cannot be used, report the expected/attempted paths and stop; no fallback.
 - Planning artifacts remain only in the existing orphan `meta/superpowers-plans` worktree. Never copy/commit this plan, the spec, execution ledger, or reviewer prompts to the implementation branch.
 - Read any applicable AGENTS.md before modifications. Comments only for constraints code cannot express, one line each; no history. Runtime docs describe product behavior, not development narration.

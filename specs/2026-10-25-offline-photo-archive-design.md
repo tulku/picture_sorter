@@ -170,7 +170,7 @@ New-file hashing can be streamed by tool-owned reads, but rsync subprocess trans
 
 Never delete camera originals. If the card disappears, preserve job/source identity and partial-transfer state; resume only when the corresponding source is available and validated. The service must not mistake a different mounted card with the same volume label for the previous source.
 
-The legacy .photo_sorter.json watermark is ignored by the new engine. Preserve it during migration; do not use it to declare unknown files already imported. The untracked fill_gaps.sh in the implementation checkout is user-owned and must not be modified, staged, or deleted.
+The legacy .photo_sorter.json watermark is ignored by the new engine. Preserve it during migration; do not use it to declare unknown files already imported. The former untracked fill_gaps.sh was deleted with explicit user authorization during the later personal-repository relocation.
 
 ## 8. Local budget, pins, and admission control
 
@@ -577,7 +577,7 @@ Do not add a NAS service, enable native Immich editing storage, replace explicit
 ## 24. Source evidence and limitations
 
 - Existing repository: src/main.rs, src/plan.rs, src/classify.rs, src/sidecar.rs, run.sh at the baseline above. Most pipeline behavior lives in main.rs. Existing tests do not cover end-to-end metadata extraction/classification.
-- Existing untracked fill_gaps.sh uses --skip-existing; preserve as user work.
+- At the inspected baseline, untracked fill_gaps.sh used --skip-existing; its later deletion was explicitly authorized during personal-repository relocation.
 - ExifTool documentation: https://exiftool.org/exiftool_pod2.html ; -fast2 omits MakerNotes.
 - Olympus metadata tag definitions: https://exiftool.org/TagNames/Olympus.html .
 - rsync manual: https://download.samba.org/pub/rsync/rsync.1 ; local-path mode works over mounted shares without NAS rsync installation; transfer checks and ordinary quick checks differ.
