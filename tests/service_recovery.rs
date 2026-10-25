@@ -166,7 +166,7 @@ fn archive_receipt_during_incomplete_scan_cannot_complete_import() {
         .accept_scan_batch(job, &inventory.next_batch(1).unwrap(), None)
         .unwrap();
     let mut worker =
-        WorkerSupervisor::new(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+        WorkerSupervisor::new_test(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
     let mut uploader = UploadDriver::default();
     let begin = Instant::now();
     loop {
@@ -345,7 +345,7 @@ fn original_publication_carries_cached_metadata_to_fresh_client() {
         .job
         .unwrap();
     let mut worker =
-        WorkerSupervisor::new(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+        WorkerSupervisor::new_test(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
     let mut driver = UploadDriver::default();
     let begin = Instant::now();
     loop {
@@ -506,7 +506,7 @@ fn coordinator_rejection_releases_confirmed_archive_session() {
         )
         .unwrap();
     let mut worker =
-        WorkerSupervisor::new(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+        WorkerSupervisor::new_test(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
     let mut driver = UploadDriver::default();
     let deadline = std::time::Instant::now();
     let mut rejected = false;

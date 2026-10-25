@@ -149,7 +149,7 @@ fn resume_does_not_repeat_completed_metadata() {
     let mut cat = Catalog::open(&state).unwrap();
     let mut driver = BootstrapDriver::default();
     let mut worker =
-        WorkerSupervisor::new(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+        WorkerSupervisor::new_test(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
     let request = BootstrapRequest {
         operation: OperationId::new(),
         archive: c.archive_id.unwrap(),
@@ -193,7 +193,7 @@ fn assert_bootstrap(r: &TestRig, originals: u64, companions: u64) {
     let mut cat = Catalog::open(&state).unwrap();
     let mut driver = BootstrapDriver::default();
     let mut worker =
-        WorkerSupervisor::new(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+        WorkerSupervisor::new_test(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
     let job = BootstrapCoordinator::new(&c, &mut cat, &mut driver, &mut worker)
         .start(BootstrapRequest {
             operation: OperationId::new(),
@@ -345,7 +345,7 @@ fn interrupted_bootstrap_resumes_batches_after_explicit_lock_recovery() {
     let mut cat = Catalog::open(&state).unwrap();
     let mut driver = BootstrapDriver::default();
     let mut worker =
-        WorkerSupervisor::new(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+        WorkerSupervisor::new_test(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
     let job = BootstrapCoordinator::new(&c, &mut cat, &mut driver, &mut worker)
         .start(BootstrapRequest {
             operation: OperationId::new(),
@@ -380,7 +380,7 @@ fn interrupted_bootstrap_resumes_batches_after_explicit_lock_recovery() {
     let mut cat = Catalog::open(&state).unwrap();
     let mut driver = BootstrapDriver::default();
     let mut worker =
-        WorkerSupervisor::new(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+        WorkerSupervisor::new_test(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
     let report = run_bootstrap(&c, &mut cat, &mut driver, &mut worker, job);
     assert_eq!(report.originals, 4);
     assert_eq!(report.metadata_calls, 4);
@@ -435,7 +435,7 @@ fn worker_archive_audit_is_read_only_and_reports_corruption() {
         .unwrap()
         .count();
     let mut worker =
-        WorkerSupervisor::new(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+        WorkerSupervisor::new_test(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
     let ticket = worker
         .submit(NasCommand::AuditArchive {
             root: r.archive.clone(),

@@ -19,6 +19,15 @@ use std::{
 const MAX_LINE: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasCommand {
+    ChangeMode {
+        root: PathBuf,
+        archive: crate::domain::ArchiveId,
+        writer: crate::domain::WriterId,
+        request: crate::archive::ModeChangeRequest,
+    },
+    QualifyNas(crate::qualification::NasProbeRequest),
+    QualifyImmich(crate::qualification::ImmichProbeRequest),
+    QualifyEditor(crate::qualification::EditorProbeRequest),
     PublishLocal {
         root: PathBuf,
         receipt: TransferReceipt,
@@ -173,6 +182,7 @@ pub enum NasCommand {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasReply {
+    Capability(crate::qualification::CapabilityReport),
     LocalObserved {
         entries: Vec<ArchiveObservation>,
         end: bool,
@@ -222,6 +232,8 @@ struct Message {
 struct Reply {
     #[serde(default)]
     metrics: crate::metrics::Metrics,
+    #[serde(default)]
+    nas_decision: Option<crate::qualification::CapabilityDecision>,
     ticket: WorkerTicket,
     result: AppResult<NasReply>,
 }
@@ -233,7 +245,40 @@ pub enum WorkerState {
     TimedOutStillAlive,
     Reaped,
 }
+#[derive(Default, Clone, Serialize, Deserialize)]
+struct WorkerSettings {
+    local_test_backend: bool,
+    state_root: Option<PathBuf>,
+    capability_evidence: Vec<PathBuf>,
+}
+impl WorkerSettings {
+    fn registry(&self) -> crate::qualification::CapabilityRegistry {
+        let Some(state) = &self.state_root else {
+            return crate::qualification::CapabilityRegistry::default();
+        };
+        let config = crate::config::Config {
+            state_root: state.clone(),
+            capability_evidence: self.capability_evidence.clone(),
+            ..Default::default()
+        };
+        crate::qualification::load_registry(&config).unwrap_or_default()
+    }
+    fn root(&self, path: &std::path::Path) -> AppResult<RootHandle> {
+        if self.local_test_backend {
+            RootHandle::open(path, RootPolicy::TestArchive)
+        } else {
+            use std::os::unix::fs::MetadataExt;
+            RootHandle::open(
+                path,
+                RootPolicy::Archive {
+                    expected_device: std::fs::metadata(path)?.dev(),
+                },
+            )
+        }
+    }
+}
 pub struct WorkerSupervisor {
+    nas_decision: Option<crate::qualification::CapabilityDecision>,
     metrics: crate::metrics::Metrics,
     child: Child,
     input: std::process::ChildStdin,
@@ -260,16 +305,54 @@ fn nonblocking(fd: RawFd) -> AppResult<()> {
 }
 impl WorkerSupervisor {
     pub fn new(executable: PathBuf, locks: Vec<OwnedFd>) -> AppResult<Self> {
-        Self::spawn(executable, locks, "--nas-worker")
+        Self::spawn(executable, locks, "--nas-worker", WorkerSettings::default())
     }
     pub fn new_local(executable: PathBuf, locks: Vec<OwnedFd>) -> AppResult<Self> {
-        Self::spawn(executable, locks, "--local-worker")
+        Self::spawn(
+            executable,
+            locks,
+            "--local-worker",
+            WorkerSettings::default(),
+        )
     }
-    fn spawn(executable: PathBuf, locks: Vec<OwnedFd>, mode: &str) -> AppResult<Self> {
+    pub fn new_test(executable: PathBuf, locks: Vec<OwnedFd>) -> AppResult<Self> {
+        Self::spawn(
+            executable,
+            locks,
+            "--nas-worker",
+            WorkerSettings {
+                local_test_backend: true,
+                ..Default::default()
+            },
+        )
+    }
+    pub fn new_configured(
+        executable: PathBuf,
+        locks: Vec<OwnedFd>,
+        config: &crate::config::Config,
+    ) -> AppResult<Self> {
+        Self::spawn(
+            executable,
+            locks,
+            "--nas-worker",
+            WorkerSettings {
+                local_test_backend: config.local_test_backend,
+                state_root: Some(config.state_root.clone()),
+                capability_evidence: config.capability_evidence.clone(),
+            },
+        )
+    }
+    fn spawn(
+        executable: PathBuf,
+        locks: Vec<OwnedFd>,
+        mode: &str,
+        settings: WorkerSettings,
+    ) -> AppResult<Self> {
         let inherited = locks.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>();
         let mut command = Command::new(executable);
         command
             .arg(mode)
+            .arg(serde_json::to_string(&settings)?)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -297,6 +380,7 @@ impl WorkerSupervisor {
         nonblocking(input.as_raw_fd())?;
         nonblocking(output.as_raw_fd())?;
         Ok(Self {
+            nas_decision: None,
             metrics: crate::metrics::Metrics::default(),
             child,
             input,
@@ -309,6 +393,9 @@ impl WorkerSupervisor {
             _locks: locks,
             completed: None,
         })
+    }
+    pub fn nas_decision(&self) -> Option<crate::qualification::CapabilityDecision> {
+        self.nas_decision.clone()
     }
     pub fn latest_ticket(&self) -> Option<WorkerTicket> {
         self.pending
@@ -418,6 +505,7 @@ impl WorkerSupervisor {
                 return Err(AppError::integrity("worker ticket mismatch"));
             }
             self.metrics.add(&reply.metrics);
+            self.nas_decision = reply.nas_decision;
             let state = match reply.result {
                 Ok(value) => WorkerState::Completed(value),
                 Err(e) => WorkerState::Failed(e),
@@ -447,7 +535,15 @@ pub fn run_local_worker() -> AppResult<()> {
     run_worker_mode(true)
 }
 fn run_worker_mode(local_only: bool) -> AppResult<()> {
-    let mut runtime = ArchiveRuntime::default();
+    let settings = std::env::args()
+        .nth(2)
+        .map(|text| serde_json::from_str::<WorkerSettings>(&text))
+        .transpose()?
+        .unwrap_or_default();
+    let mut runtime = ArchiveRuntime {
+        settings,
+        ..Default::default()
+    };
     let mut local_runtime = LocalRuntime::default();
     let input = std::io::stdin();
     let mut input = input.lock();
@@ -487,11 +583,34 @@ fn run_worker_mode(local_only: bool) -> AppResult<()> {
                         })
                     })
                 }
-                NasCommand::Stage(spec) => TransferEngine::stage(&spec).map(NasReply::Staged),
+                NasCommand::Stage(spec) if runtime.settings.local_test_backend => {
+                    let source = RootHandle::open(&spec.source.root, RootPolicy::Local)?;
+                    let destination = runtime.settings.root(&spec.destination_root)?;
+                    TransferEngine::stage_confined(&spec, &source, &destination)
+                        .map(NasReply::Staged)
+                }
+                NasCommand::Stage(_) => Err(AppError::new(
+                    ErrorCode::Unsupported,
+                    "raw worker staging requires the explicit local test backend; production uses archive-qualified staging",
+                )),
                 command => runtime.execute(command),
             }
         };
+        let nas_decision = if local_only {
+            None
+        } else {
+            runtime.last_decision.clone().or_else(|| {
+                result
+                    .as_ref()
+                    .err()
+                    .map(|error| crate::qualification::CapabilityDecision {
+                        allowed: false,
+                        reason: error.to_string(),
+                    })
+            })
+        };
         let reply = Reply {
+            nas_decision,
             metrics: crate::metrics::snapshot().difference(&before_metrics),
             ticket: message.ticket,
             result,
@@ -505,14 +624,50 @@ fn run_worker_mode(local_only: bool) -> AppResult<()> {
 
 #[derive(Default)]
 struct ArchiveRuntime {
+    last_decision: Option<crate::qualification::CapabilityDecision>,
+    settings: WorkerSettings,
     readonly: Option<ReadOnlyJournal>,
     inventory: Option<ArchiveInventory>,
     store: Option<ArchiveStore>,
     guard: Option<PublicationGuard>,
 }
 impl ArchiveRuntime {
+    fn open_store(
+        &mut self,
+        root: &std::path::Path,
+        archive: crate::domain::ArchiveId,
+        writer: crate::domain::WriterId,
+    ) -> AppResult<ArchiveStore> {
+        let store = ArchiveStore::open(self.settings.root(root)?, archive, writer)?
+            .with_registry(self.settings.registry());
+        self.last_decision = Some(store.write_decision());
+        Ok(store)
+    }
     fn execute(&mut self, command: NasCommand) -> AppResult<NasReply> {
+        self.last_decision = None;
+        let registry = self.settings.registry();
+        if let Some(store) = self.store.as_mut() {
+            store.set_registry(registry);
+            self.last_decision = Some(store.write_decision());
+        }
         match command {
+            NasCommand::ChangeMode {
+                root,
+                archive,
+                writer,
+                request,
+            } => {
+                let mut store = self.open_store(&root, archive, writer)?;
+                store.change_mode(request).map(NasReply::Marker)
+            }
+            NasCommand::QualifyNas(request) => {
+                if request.local_test_backend != self.settings.local_test_backend {
+                    return Err(AppError::invalid(
+                        "probe backend differs from worker backend",
+                    ));
+                }
+                crate::qualification::qualify_nas(request).map(NasReply::Capability)
+            }
             NasCommand::RecoverArchive {
                 root,
                 archive,
@@ -520,18 +675,7 @@ impl ArchiveRuntime {
                 prior_owner_stopped,
                 all_writers_quiescent,
             } => {
-                use std::os::unix::fs::MetadataExt;
-                let device = std::fs::metadata(&root)?.dev();
-                let mut store = ArchiveStore::open(
-                    RootHandle::open(
-                        &root,
-                        RootPolicy::Archive {
-                            expected_device: device,
-                        },
-                    )?,
-                    archive,
-                    writer,
-                )?;
+                let mut store = self.open_store(&root, archive, writer)?;
                 store.recover_lock(prior_owner_stopped, all_writers_quiescent)?;
                 Ok(NasReply::Done)
             }
@@ -540,18 +684,7 @@ impl ArchiveRuntime {
                 archive,
                 writer,
             } => {
-                use std::os::unix::fs::MetadataExt;
-                let device = std::fs::metadata(&root)?.dev();
-                let store = ArchiveStore::open(
-                    RootHandle::open(
-                        &root,
-                        RootPolicy::Archive {
-                            expected_device: device,
-                        },
-                    )?,
-                    archive,
-                    writer,
-                )?;
+                let store = self.open_store(&root, archive, writer)?;
                 let readonly = store.read_only_journal()?;
                 let id = readonly.id;
                 self.readonly = Some(readonly);
@@ -574,18 +707,7 @@ impl ArchiveRuntime {
                 writer,
                 objects,
             } => {
-                use std::os::unix::fs::MetadataExt;
-                let device = std::fs::metadata(&root)?.dev();
-                let store = ArchiveStore::open(
-                    RootHandle::open(
-                        &root,
-                        RootPolicy::Archive {
-                            expected_device: device,
-                        },
-                    )?,
-                    archive,
-                    writer,
-                )?;
+                let store = self.open_store(&root, archive, writer)?;
                 let report = crate::catalog::IntegrityReport::audit_objects(&store.root, &objects)?;
                 store.validate()?;
                 Ok(NasReply::Integrity(report))
@@ -626,18 +748,7 @@ impl ArchiveRuntime {
                 writer,
                 spec,
             } => {
-                use std::os::unix::fs::MetadataExt;
-                let device = std::fs::metadata(&spec.source.root)?.dev();
-                let store = ArchiveStore::open(
-                    RootHandle::open(
-                        &spec.source.root,
-                        RootPolicy::Archive {
-                            expected_device: device,
-                        },
-                    )?,
-                    archive,
-                    writer,
-                )?;
+                let store = self.open_store(&spec.source.root, archive, writer)?;
                 let dest = RootHandle::open(&spec.destination_root, RootPolicy::Local)?;
                 let result = TransferEngine::stage_confined(&spec, &store.root, &dest)?;
                 store.validate()?;
@@ -648,18 +759,8 @@ impl ArchiveRuntime {
                 writer,
                 spec,
             } => {
-                use std::os::unix::fs::MetadataExt;
-                let device = std::fs::metadata(&spec.destination_root)?.dev();
-                let store = ArchiveStore::open(
-                    RootHandle::open(
-                        &spec.destination_root,
-                        RootPolicy::Archive {
-                            expected_device: device,
-                        },
-                    )?,
-                    archive,
-                    writer,
-                )?;
+                let store = self.open_store(&spec.destination_root, archive, writer)?;
+                store.require_writable()?;
                 let source = RootHandle::open(&spec.source.root, RootPolicy::Local)?;
                 let result = TransferEngine::stage_confined(&spec, &source, &store.root)?;
                 store.validate()?;
@@ -673,33 +774,18 @@ impl ArchiveRuntime {
                 digest,
                 size,
             } => {
-                use std::os::unix::fs::MetadataExt;
-                let device = std::fs::metadata(&root)?.dev();
-                let store = ArchiveStore::open(
-                    RootHandle::open(
-                        &root,
-                        RootPolicy::Archive {
-                            expected_device: device,
-                        },
-                    )?,
-                    archive,
-                    writer,
-                )?;
+                let store = self.open_store(&root, archive, writer)?;
                 store.store_history(&staged, &digest, size)?;
                 Ok(NasReply::Done)
             }
             NasCommand::Initialize { root, request } => {
-                let device = std::fs::metadata(&root).map(|m| {
-                    use std::os::unix::fs::MetadataExt;
-                    m.dev()
-                })?;
-                let root = RootHandle::open(
-                    &root,
-                    RootPolicy::Archive {
-                        expected_device: device,
-                    },
-                )?;
-                Ok(NasReply::Marker(ArchiveStore::initialize(&root, request)?))
+                let root = self.settings.root(&root)?;
+                let registry = self.settings.registry();
+                let marker = ArchiveStore::initialize_qualified(&root, request, &registry)?;
+                let store = ArchiveStore::open(root, marker.archive_id, marker.writer_id)?
+                    .with_registry(registry);
+                self.last_decision = Some(store.write_decision());
+                Ok(NasReply::Marker(marker))
             }
             NasCommand::BeginArchive {
                 root,
@@ -712,18 +798,7 @@ impl ArchiveRuntime {
                         "worker already holds a publication session",
                     ));
                 }
-                use std::os::unix::fs::MetadataExt;
-                let device = std::fs::metadata(&root)?.dev();
-                let store = ArchiveStore::open(
-                    RootHandle::open(
-                        &root,
-                        RootPolicy::Archive {
-                            expected_device: device,
-                        },
-                    )?,
-                    archive,
-                    writer,
-                )?;
+                let store = self.open_store(&root, archive, writer)?;
                 let guard = store.acquire_publication()?;
                 let session = guard.owner.session;
                 let marker = store.marker().clone();
@@ -817,6 +892,12 @@ struct LocalRuntime {
 impl LocalRuntime {
     fn execute(&mut self, command: NasCommand) -> AppResult<NasReply> {
         match command {
+            NasCommand::QualifyImmich(request) => {
+                crate::qualification::qualify_immich(request).map(NasReply::Capability)
+            }
+            NasCommand::QualifyEditor(request) => {
+                crate::qualification::qualify_rapidraw(request).map(NasReply::Capability)
+            }
             NasCommand::BackupCatalog { state, destination } => {
                 let state = RootHandle::open(&state, RootPolicy::Local)?;
                 crate::catalog::backup_readonly(&state, &destination)?;

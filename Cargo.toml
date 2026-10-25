@@ -19,7 +19,7 @@ rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 libc = "0.2.190"
 chrono-tz = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-url = "2"
+url = { version = "2", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

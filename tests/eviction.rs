@@ -79,7 +79,7 @@ fn archived_fixture(r: &support::TestRig) -> (photo_sorter::import::ImportCoordi
         engine.advance(job).unwrap();
     }
     let mut worker =
-        WorkerSupervisor::new(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+        WorkerSupervisor::new_test(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
     let mut uploads = UploadDriver::default();
     for _ in 0..1000 {
         uploads.advance(&mut engine, &mut worker, job).unwrap();

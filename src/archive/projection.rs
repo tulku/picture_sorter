@@ -63,6 +63,7 @@ impl ArchiveStore {
         Ok(CommittedProjection { plan: plan.clone() })
     }
     pub fn apply_projection(&self, proof: &CommittedProjection) -> AppResult<ProjectionOutcome> {
+        self.require_writable()?;
         let plan = &proof.plan;
         validate_sidecar_path(&plan.path)?;
         self.validate()?;

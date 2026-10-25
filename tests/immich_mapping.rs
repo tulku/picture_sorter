@@ -421,7 +421,7 @@ fn re_fetch_keeps_local_sidecars() {
     config.writer_id = writer;
     config.reserve = 0;
     let mut worker =
-        WorkerSupervisor::new(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+        WorkerSupervisor::new_test(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
     let mut driver = PinFetchDriver::default();
     for _ in 0..1000 {
         if driver

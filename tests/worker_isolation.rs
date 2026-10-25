@@ -18,7 +18,8 @@ fn wait(worker: &mut WorkerSupervisor, ticket: WorkerTicket) -> WorkerState {
 #[test]
 fn hung_nas_does_not_block_local_work() {
     let r = support::TestRig::new();
-    let mut w = WorkerSupervisor::new(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+    let mut w =
+        WorkerSupervisor::new_test(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
     let id = w
         .submit(NasCommand::Inspect {
             root: r.archive.clone(),
@@ -48,7 +49,8 @@ fn hung_nas_does_not_block_local_work() {
 #[test]
 fn timed_out_worker_not_replaced() {
     let r = support::TestRig::new();
-    let mut w = WorkerSupervisor::new(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+    let mut w =
+        WorkerSupervisor::new_test(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
     unsafe {
         libc::kill(w.pid() as i32, libc::SIGSTOP);
     };
@@ -97,7 +99,7 @@ fn cancel_uncertain_worker_keeps_reservation() {
 fn exact_late_reply_can_confirm_same_worker_after_deadline() {
     let r = support::TestRig::new();
     let mut worker =
-        WorkerSupervisor::new(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+        WorkerSupervisor::new_test(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
     unsafe {
         libc::kill(worker.pid() as i32, libc::SIGSTOP);
     };

@@ -29,6 +29,7 @@ pub struct ArchiveStore {
     pub(crate) root: RootHandle,
     pub(crate) marker: ArchiveMarker,
     pub(crate) writer: WriterId,
+    pub(crate) registry: crate::qualification::CapabilityRegistry,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StagedMember {
@@ -52,6 +53,55 @@ pub(crate) fn path(value: &str) -> AppResult<ArchivePath> {
 }
 impl ArchiveStore {
     pub fn initialize(root: &RootHandle, request: InitArchive) -> AppResult<ArchiveMarker> {
+        Self::initialize_qualified(
+            root,
+            request,
+            &crate::qualification::CapabilityRegistry::default(),
+        )
+    }
+    pub fn initialize_qualified(
+        root: &RootHandle,
+        request: InitArchive,
+        registry: &crate::qualification::CapabilityRegistry,
+    ) -> AppResult<ArchiveMarker> {
+        match root.read(&path(".photo-sorter/archive.json")?, 64 * 1024) {
+            Ok(bytes) => {
+                let existing: ArchiveMarker = serde_json::from_slice(&bytes)?;
+                if existing.schema_version != 1 || existing.archive_id != request.archive_id {
+                    return Err(AppError::new(
+                        ErrorCode::Conflict,
+                        "archive already initialized with another identity/schema",
+                    ));
+                }
+                if existing.mode == PublicationMode::SingleWriter
+                    && existing.writer_id != request.writer_id
+                {
+                    return Err(AppError::new(
+                        ErrorCode::Unsupported,
+                        "single-writer archive belongs to another publisher",
+                    ));
+                }
+                Self::check_write(
+                    root,
+                    existing.archive_id,
+                    request.writer_id,
+                    &existing.mode,
+                    existing.mode_revision,
+                    registry,
+                )?;
+                return Ok(existing);
+            }
+            Err(error) if error.errno == Some(libc::ENOENT) => {}
+            Err(error) => return Err(error),
+        }
+        Self::check_write(
+            root,
+            request.archive_id,
+            request.writer_id,
+            &PublicationMode::SingleWriter,
+            1,
+            registry,
+        )?;
         root.mkdir_all(&path(".photo-sorter")?)?;
         for dir in ["commits", "versions", "staging", "locks", "sequences"] {
             root.mkdir_all(&path(&format!(".photo-sorter/{dir}"))?)?;
@@ -96,7 +146,84 @@ impl ArchiveStore {
             root,
             marker,
             writer,
+            registry: crate::qualification::CapabilityRegistry::default(),
         })
+    }
+    pub fn with_registry(mut self, registry: crate::qualification::CapabilityRegistry) -> Self {
+        self.registry = registry;
+        self
+    }
+    pub(crate) fn set_registry(&mut self, registry: crate::qualification::CapabilityRegistry) {
+        self.registry = registry;
+    }
+    pub(crate) fn check_write(
+        root: &RootHandle,
+        archive: ArchiveId,
+        writer: WriterId,
+        mode: &PublicationMode,
+        revision: u64,
+        registry: &crate::qualification::CapabilityRegistry,
+    ) -> AppResult<()> {
+        root.validate_identity()?;
+        if root.is_test_archive() {
+            return Ok(());
+        }
+        let mount = root.mount_identity()?;
+        let fingerprint =
+            crate::qualification::nas_fingerprint(root, archive, writer, mode, revision)?;
+        let decision = registry.allows(crate::qualification::OperationKind::ArchiveWrite {
+            mount_identity: &mount,
+            fingerprint: &fingerprint,
+            mode,
+        });
+        if !decision.allowed {
+            return Err(AppError::new(ErrorCode::Unsupported, decision.reason));
+        }
+        Ok(())
+    }
+    pub fn write_decision(&self) -> crate::qualification::CapabilityDecision {
+        let result = self.require_writable();
+        crate::qualification::CapabilityDecision {
+            allowed: result.is_ok(),
+            reason: match result {
+                Ok(()) if self.root.is_test_archive() => {
+                    "explicit local test backend; no network qualification".into()
+                }
+                Ok(()) => "matching runtime filesystem evidence and publisher identity".into(),
+                Err(error) => error.to_string(),
+            },
+        }
+    }
+    pub fn require_writable(&self) -> AppResult<()> {
+        self.validate()?;
+        match self
+            .root
+            .read(&path(".photo-sorter/mode-pending.json")?, 65536)
+        {
+            Ok(_) => {
+                return Err(AppError::new(
+                    ErrorCode::Conflict,
+                    "uncertain mode administration blocks publication; explicit matching recovery required",
+                ));
+            }
+            Err(error) if error.errno == Some(libc::ENOENT) => {}
+            Err(error) => return Err(error),
+        }
+        if self.marker.mode == PublicationMode::SingleWriter && self.marker.writer_id != self.writer
+        {
+            return Err(AppError::new(
+                ErrorCode::Unsupported,
+                "single-writer archive belongs to another publisher",
+            ));
+        }
+        Self::check_write(
+            &self.root,
+            self.marker.archive_id,
+            self.writer,
+            &self.marker.mode,
+            self.marker.mode_revision,
+            &self.registry,
+        )
     }
     pub fn root_path(&self) -> &std::path::Path {
         self.root.path()
@@ -125,6 +252,7 @@ impl ArchiveStore {
         plan: PublicationPlan,
         faults: &dyn FaultInjector,
     ) -> AppResult<PublicationReceipt> {
+        self.require_writable()?;
         self.validate_guard(guard)?;
         if !guard.replayed() {
             return Err(AppError::new(
@@ -294,7 +422,7 @@ pub fn history_path(digest: &Digest) -> AppResult<ArchivePath> {
 }
 impl ArchiveStore {
     pub fn store_history(&self, staged: &ArchivePath, digest: &Digest, size: u64) -> AppResult<()> {
-        self.validate()?;
+        self.require_writable()?;
         if !staged.as_str().starts_with(".photo-sorter/staging/") {
             return Err(AppError::invalid("history must come from hidden staging"));
         }

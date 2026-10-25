@@ -24,6 +24,10 @@ impl PublicationGuard {
 }
 impl ArchiveStore {
     pub fn acquire_publication(&self) -> AppResult<PublicationGuard> {
+        self.require_writable()?;
+        self.acquire_admin()
+    }
+    pub(crate) fn acquire_admin(&self) -> AppResult<PublicationGuard> {
         self.validate()?;
         let lock = path(".photo-sorter/locks/publication")?;
         self.root.mkdir_exclusive(&lock).map_err(|e| {
@@ -87,7 +91,7 @@ impl ArchiveStore {
                 "recovery requires operator-verified prior owner shutdown and all writers quiescent; timeout is insufficient",
             ));
         }
-        self.validate()?;
+        self.require_writable()?;
         let retired = path(&format!(
             ".photo-sorter/locks/retired-{}",
             OperationId::new()

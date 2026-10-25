@@ -230,11 +230,17 @@ impl ImmichClient {
         self.rating_registry = registry;
         self
     }
+    pub(crate) fn update_rating_registry(
+        &mut self,
+        registry: crate::qualification::CapabilityRegistry,
+    ) {
+        self.rating_registry = registry;
+    }
     pub fn outbound_enabled(&self) -> bool {
         self.rating_mode != super::RatingWriteMode::Disabled
     }
     pub fn set_rating(&self, request: super::RatingWrite) -> AppResult<super::WriteOutcome> {
-        use super::{RatingWriteMode, WriteOutcome};
+        use super::RatingWriteMode;
         if self.rating_mode != RatingWriteMode::BestEffort {
             return Err(AppError::new(
                 ErrorCode::Unsupported,
@@ -258,6 +264,22 @@ impl ImmichClient {
         if !decision.allowed {
             return Err(AppError::new(ErrorCode::Unsupported, decision.reason));
         }
+        self.write_rating_checked(request)
+    }
+    pub(crate) fn probe_rating(
+        &self,
+        request: super::RatingWrite,
+    ) -> AppResult<super::WriteOutcome> {
+        if self.server_info()?.version != TESTED_VERSION {
+            return Err(AppError::new(
+                ErrorCode::Unsupported,
+                "unsupported probe server version",
+            ));
+        }
+        self.write_rating_checked(request)
+    }
+    fn write_rating_checked(&self, request: super::RatingWrite) -> AppResult<super::WriteOutcome> {
+        use super::WriteOutcome;
         let current = self.asset(request.asset)?;
         let observed = super::ratings::remote_rating(&current)?;
         if current.checksum != request.jpeg_checksum {

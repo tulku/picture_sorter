@@ -11,3 +11,6 @@ pub use projection::*;
 mod inventory;
 pub(crate) use inventory::ArchiveInventory;
 pub use inventory::{ArchiveInventoryBatch, ArchiveObservation};
+
+mod mode;
+pub use mode::*;

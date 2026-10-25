@@ -83,6 +83,7 @@ impl ServiceFixture {
         let profile = r._temp.path().join("profile.toml");
         let mut c = Config::new(r.local.clone(), r.state.clone(), r.archive.clone());
         c.archive_id = Some(ArchiveId::new());
+        c.local_test_backend = true;
         update(&mut c, &r);
         std::fs::write(&profile, toml::to_string(&c).unwrap()).unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_photo_sorter"))

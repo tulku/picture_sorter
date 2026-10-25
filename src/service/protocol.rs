@@ -97,6 +97,9 @@ pub enum Command {
         archive: bool,
     },
     ArchiveInit,
+    ChangeMode {
+        request: crate::archive::ModeChangeRequest,
+    },
     RecoverLock {
         prior_owner_stopped: bool,
         all_writers_quiescent: bool,
@@ -153,6 +156,23 @@ impl Response {
         })
     }
     pub fn exit_code(&self) -> i32 {
+        if let ResponseOutcome::Job { job, detail } = &self.outcome
+            && matches!(job.request.kind, crate::catalog::JobKind::Qualify { .. })
+            && job.state == crate::catalog::JobState::Complete
+            && detail.get("qualified").and_then(serde_json::Value::as_bool) == Some(false)
+        {
+            let failed = detail
+                .get("report")
+                .and_then(|r| r.get("results"))
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|results| {
+                    results.iter().any(|r| {
+                        r.get("outcome").and_then(serde_json::Value::as_str) == Some("Fail")
+                    })
+                });
+            return if failed { 4 } else { 3 };
+        }
+
         match &self.outcome {
             ResponseOutcome::Error { error } => error_exit(error),
             ResponseOutcome::Job { job, .. } => match job.state {

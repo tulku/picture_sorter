@@ -139,7 +139,7 @@ fn larger_than_budget_direct_nas() {
     .unwrap();
     e.config.archive_id = Some(archive);
     let report = e.prepare(request(&r)).unwrap();
-    let mut worker = photo_sorter::transfer::WorkerSupervisor::new(
+    let mut worker = photo_sorter::transfer::WorkerSupervisor::new_test(
         env!("CARGO_BIN_EXE_photo_sorter").into(),
         vec![],
     )
@@ -212,7 +212,7 @@ fn evicted_known_original_not_reimported() {
     e.config.archive_id = Some(archive);
     let initial = e.prepare(request(&r)).unwrap();
     drive(&mut e, initial.job.unwrap());
-    let mut worker = photo_sorter::transfer::WorkerSupervisor::new(
+    let mut worker = photo_sorter::transfer::WorkerSupervisor::new_test(
         env!("CARGO_BIN_EXE_photo_sorter").into(),
         vec![],
     )

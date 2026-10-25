@@ -1,6 +1,5 @@
 use crate::{
     config::Config,
-    domain::*,
     error::{AppError, AppResult, ErrorCode},
     immich::*,
     qualification::*,
@@ -39,7 +38,7 @@ pub(crate) struct AsyncImmich {
     origin: url::Url,
     inner: RefCell<Inner>,
     mode: RatingWriteMode,
-    registry: CapabilityRegistry,
+    config: Config,
 }
 impl AsyncImmich {
     pub fn new(config: &Config) -> AppResult<Option<Self>> {
@@ -54,26 +53,12 @@ impl AsyncImmich {
             "conditional" => RatingWriteMode::Conditional,
             _ => return Err(AppError::invalid("unknown Immich write mode")),
         };
-        let mut reports = vec![];
-        for path in &config.capability_evidence {
-            let parent = crate::fs::RootHandle::open(
-                path.parent()
-                    .ok_or_else(|| AppError::invalid("evidence needs local parent"))?,
-                crate::fs::RootPolicy::Local,
-            )?;
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| AppError::invalid("evidence filename must be UTF-8"))?;
-            let bytes = parent.read(&ArchivePath::parse(name)?, 1024 * 1024)?;
-            let report: CapabilityReport = serde_json::from_slice(&bytes)?;
-            reports.push(report);
-        }
-        let registry = CapabilityRegistry::new(reports);
+        let registry = load_registry(config).unwrap_or_default();
         let (send, commands) = mpsc::sync_channel(1);
         let (results, receive) = mpsc::sync_channel(1);
         let worker_origin = origin.clone();
         let worker_registry = registry.clone();
+        let worker_config = config.clone();
         std::thread::spawn(move || {
             let mut client: Option<ImmichClient> = None;
             while let Ok(task) = commands.recv() {
@@ -96,10 +81,17 @@ impl AsyncImmich {
                     Task::Server => Reply::Server(
                         configured.and_then(|_| client.as_ref().unwrap().server_info()),
                     ),
-                    Task::Write(write) => Reply::Write(
-                        write.asset,
-                        configured.and_then(|_| client.as_ref().unwrap().set_rating(write)),
-                    ),
+                    Task::Write(write) => {
+                        if let Some(client) = client.as_mut() {
+                            client.update_rating_registry(
+                                load_registry(&worker_config).unwrap_or_default(),
+                            );
+                        }
+                        Reply::Write(
+                            write.asset,
+                            configured.and_then(|_| client.as_ref().unwrap().set_rating(write)),
+                        )
+                    }
                 };
                 if results.send(reply).is_err() {
                     break;
@@ -109,7 +101,7 @@ impl AsyncImmich {
         Ok(Some(Self {
             origin,
             mode,
-            registry,
+            config: config.clone(),
             inner: RefCell::new(Inner {
                 send,
                 receive,
@@ -219,11 +211,14 @@ impl ImmichAccess for AsyncImmich {
     }
     fn set_rating(&self, write: RatingWrite) -> AppResult<WriteOutcome> {
         let info = self.server_info()?;
-        let decision = self.registry.allows(OperationKind::RatingWrite {
-            origin: &self.origin,
-            asset: write.asset,
-            version: &info.version,
-        });
+        let decision =
+            load_registry(&self.config)
+                .unwrap_or_default()
+                .allows(OperationKind::RatingWrite {
+                    origin: &self.origin,
+                    asset: write.asset,
+                    version: &info.version,
+                });
         if !decision.allowed || self.mode != RatingWriteMode::BestEffort {
             return Err(AppError::new(ErrorCode::Unsupported, decision.reason));
         }

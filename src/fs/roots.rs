@@ -119,6 +119,27 @@ impl RootHandle {
     pub fn inode(&self) -> u64 {
         self.inode
     }
+    pub fn is_test_archive(&self) -> bool {
+        matches!(self.policy, RootPolicy::TestArchive)
+    }
+    pub fn mount_number(&self) -> u64 {
+        self.mount_id
+    }
+    pub fn mount_identity(&self) -> AppResult<String> {
+        self.validate_identity()?;
+        let id = self.mount_id.to_string();
+        let info = std::fs::read_to_string("/proc/self/mountinfo")?;
+        let line = info
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(id.as_str()))
+            .ok_or_else(|| AppError::invalid("held mount is absent from mountinfo"))?;
+        Ok(format!(
+            "linux:{}:{}:{}",
+            self.device,
+            self.inode,
+            crate::domain::Digest::of(line.as_bytes()).as_str()
+        ))
+    }
     pub fn device(&self) -> u64 {
         self.device
     }

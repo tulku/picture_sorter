@@ -1,0 +1,585 @@
+mod support;
+use photo_sorter::{archive::*, config::Config, domain::*, fs::*, qualification::*};
+use std::os::unix::fs::MetadataExt;
+fn production_root(r: &support::TestRig) -> RootHandle {
+    RootHandle::open(
+        &r.archive,
+        RootPolicy::Archive {
+            expected_device: std::fs::metadata(&r.archive).unwrap().dev(),
+        },
+    )
+    .unwrap()
+}
+#[test]
+fn unqualified_production_write_blocked_before_namespace_creation() {
+    let r = support::TestRig::new();
+    let root = production_root(&r);
+    assert!(
+        ArchiveStore::initialize(
+            &root,
+            InitArchive {
+                archive_id: ArchiveId::new(),
+                writer_id: WriterId::new()
+            }
+        )
+        .is_err()
+    );
+    assert!(!r.archive.join(".photo-sorter").exists());
+}
+#[test]
+fn single_client_evidence_never_enables_multi_writer() {
+    let r = support::TestRig::new();
+    let root = production_root(&r);
+    let archive = ArchiveId::new();
+    let writer = WriterId::new();
+    let fingerprint =
+        nas_fingerprint(&root, archive, writer, &PublicationMode::MultiWriter, 2).unwrap();
+    let report = CapabilityReport {
+        schema_version: 1,
+        capability: "nas-publication".into(),
+        backend_or_application: "linux-filesystem".into(),
+        tested_version: NAS_IMPLEMENTATION.into(),
+        mount_identity: Some(root.mount_identity().unwrap()),
+        config_fingerprint: fingerprint.clone(),
+        scope: ProbeScope::SingleClient,
+        results: [
+            "exclusive_init",
+            "no_replace",
+            "rename_exchange",
+            "lock_exclusion",
+            "flush_reopen",
+        ]
+        .into_iter()
+        .map(|name| ProbeResult {
+            name: name.into(),
+            outcome: ProbeOutcome::Pass,
+            detail: "isolated fixture".into(),
+        })
+        .collect(),
+        limitations: vec!["second client unrun".into()],
+    };
+    assert!(
+        !CapabilityRegistry::new(vec![report])
+            .allows(OperationKind::ArchiveWrite {
+                mount_identity: &root.mount_identity().unwrap(),
+                fingerprint: &fingerprint,
+                mode: &PublicationMode::MultiWriter
+            })
+            .allowed
+    );
+}
+#[test]
+fn local_test_evidence_cannot_enable_production_writes() {
+    let r = support::TestRig::new();
+    let root = production_root(&r);
+    let archive = ArchiveId::new();
+    let writer = WriterId::new();
+    let fingerprint =
+        nas_fingerprint(&root, archive, writer, &PublicationMode::SingleWriter, 1).unwrap();
+    let report = CapabilityReport {
+        schema_version: 1,
+        capability: "nas-publication".into(),
+        backend_or_application: "local-test".into(),
+        tested_version: NAS_IMPLEMENTATION.into(),
+        mount_identity: Some(root.mount_identity().unwrap()),
+        config_fingerprint: fingerprint.clone(),
+        scope: ProbeScope::SingleClient,
+        results: [
+            "exclusive_init",
+            "no_replace",
+            "rename_exchange",
+            "lock_exclusion",
+            "flush_reopen",
+        ]
+        .into_iter()
+        .map(|name| ProbeResult {
+            name: name.into(),
+            outcome: ProbeOutcome::Pass,
+            detail: "local test".into(),
+        })
+        .collect(),
+        limitations: vec![],
+    };
+    assert!(
+        !CapabilityRegistry::new(vec![report])
+            .allows(OperationKind::ArchiveWrite {
+                mount_identity: &root.mount_identity().unwrap(),
+                fingerprint: &fingerprint,
+                mode: &PublicationMode::SingleWriter
+            })
+            .allowed
+    );
+}
+#[test]
+fn readonly_doctor_works_without_service_and_never_initializes_roots() {
+    let r = support::TestRig::new();
+    let config = Config::new(
+        r.local.clone(),
+        r.state.clone(),
+        r._temp.path().join("unavailable-archive"),
+    );
+    let profile = r._temp.path().join("profile.toml");
+    std::fs::write(&profile, toml::to_string(&config).unwrap()).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_photo_sorter"))
+        .arg("--config")
+        .arg(&profile)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(std::fs::read_dir(&r.state).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(&r.local).unwrap().count(), 0);
+    assert!(!config.archive_root.exists());
+}
+#[test]
+fn executable_scratch_probe_binds_mount_and_profile_without_touching_archive() {
+    let r = support::TestRig::new();
+    let scratch = r._temp.path().join("probe");
+    std::fs::create_dir(&scratch).unwrap();
+    std::fs::write(
+        r.archive.join("sentinel"),
+        b"personal bytes remain untouched",
+    )
+    .unwrap();
+    let archive = ArchiveId::new();
+    let writer = WriterId::new();
+    let report = qualify_nas(NasProbeRequest {
+        archive_root: r.archive.clone(),
+        archive,
+        writer,
+        mode: PublicationMode::SingleWriter,
+        mode_revision: 1,
+        scratch_root: scratch,
+        session: OperationId::new(),
+        phase: NasProbePhase::Prepare,
+        local_test_backend: false,
+        prior_peer_stopped: false,
+        all_writers_quiescent: false,
+        disconnect_observed: false,
+        interrupt_bytes: 1024 * 1024,
+    })
+    .unwrap();
+    let root = production_root(&r);
+    let fingerprint =
+        nas_fingerprint(&root, archive, writer, &PublicationMode::SingleWriter, 1).unwrap();
+    assert!(
+        CapabilityRegistry::new(vec![report.clone()])
+            .allows(OperationKind::ArchiveWrite {
+                mount_identity: &root.mount_identity().unwrap(),
+                fingerprint: &fingerprint,
+                mode: &PublicationMode::SingleWriter
+            })
+            .allowed
+    );
+    assert!(matches!(report.scope, ProbeScope::SingleClient));
+    assert!(
+        report
+            .results
+            .iter()
+            .any(|r| r.name == "peer_handoff" && matches!(r.outcome, ProbeOutcome::Unrun))
+    );
+    assert_eq!(
+        std::fs::read(r.archive.join("sentinel")).unwrap(),
+        b"personal bytes remain untouched"
+    );
+    assert!(!r.archive.join(".photo-sorter").exists());
+}
+#[test]
+fn real_cli_probe_enables_only_matching_production_mount_and_writer() {
+    use support::service::ServiceFixture;
+    let request_path = std::cell::RefCell::new(None);
+    let fixture = ServiceFixture::with_config(|config, r| {
+        config.local_test_backend = false;
+        let scratch = r._temp.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let request = QualificationRequest::Nas(NasProbeRequest {
+            archive_root: config.archive_root.clone(),
+            archive: config.archive_id.unwrap(),
+            writer: config.writer_id,
+            mode: PublicationMode::SingleWriter,
+            mode_revision: 1,
+            scratch_root: scratch,
+            session: OperationId::new(),
+            phase: NasProbePhase::Prepare,
+            local_test_backend: false,
+            prior_peer_stopped: false,
+            all_writers_quiescent: false,
+            disconnect_observed: false,
+            interrupt_bytes: 1024 * 1024,
+        });
+        let path = r._temp.path().join("request.json");
+        std::fs::write(&path, serde_json::to_vec(&request).unwrap()).unwrap();
+        *request_path.borrow_mut() = Some(path);
+    });
+    let before = fixture.cli(&["archive", "init"]);
+    assert_eq!(before.status.code(), Some(3));
+    assert!(!fixture.r.archive.join(".photo-sorter").exists());
+    let request_path = request_path.into_inner().unwrap();
+    let out = fixture.cli(&["qualify", "--request", request_path.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let data: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(data["outcome"]["detail"]["qualified"], true);
+    assert!(fixture.r.state.join("capability-registry.json").exists());
+    let out = fixture.cli(&["archive", "init"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        fixture
+            .r
+            .archive
+            .join(".photo-sorter/archive.json")
+            .exists()
+    );
+}
+#[test]
+fn editor_probe_compares_native_saves_and_detects_lost_unknown_fields() {
+    let r = support::TestRig::new();
+    let scratch = r._temp.path().join("editor");
+    std::fs::create_dir(&scratch).unwrap();
+    let mut value = serde_json::json!({"version":1,"rating":0,"adjustments":{"exposure":1},"masks":[{"unknown":"retain"}]});
+    for (name, rating) in [
+        ("before.json", 0),
+        ("three.json", 3),
+        ("five.json", 5),
+        ("zero.json", 0),
+        ("reopen.json", 0),
+    ] {
+        value["rating"] = rating.into();
+        std::fs::write(scratch.join(name), serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    std::fs::write(
+        scratch.join("reset.json"),
+        include_bytes!("fixtures/rapidraw/default.json"),
+    )
+    .unwrap();
+    let request = EditorProbeRequest {
+        isolated_root: scratch.clone(),
+        version: "1.6.6".into(),
+        before: ArchivePath::parse("before.json").unwrap(),
+        three: ArchivePath::parse("three.json").unwrap(),
+        five: ArchivePath::parse("five.json").unwrap(),
+        zero: ArchivePath::parse("zero.json").unwrap(),
+        reopened: ArchivePath::parse("reopen.json").unwrap(),
+        regenerated_after_reset: ArchivePath::parse("reset.json").unwrap(),
+        runtime_binary: None,
+        runtime_saves_attested: false,
+    };
+    let report = qualify_rapidraw(request.clone()).unwrap();
+    assert!(
+        report
+            .results
+            .iter()
+            .filter(|r| r.name != "runtime_application")
+            .all(|r| matches!(r.outcome, ProbeOutcome::Pass))
+    );
+    assert!(matches!(report.scope, ProbeScope::Source));
+    value.as_object_mut().unwrap().remove("masks");
+    std::fs::write(
+        scratch.join("five.json"),
+        serde_json::to_vec(&value).unwrap(),
+    )
+    .unwrap();
+    let report = qualify_rapidraw(request).unwrap();
+    assert!(
+        report
+            .results
+            .iter()
+            .any(|r| matches!(r.outcome, ProbeOutcome::Fail))
+    );
+}
+#[test]
+fn isolated_immich_probe_round_trips_and_restores_without_certifying_other_assets() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = support::TestRig::new();
+    let server = support::http::RatingServer::new();
+    let key = r.state.join("key");
+    std::fs::write(&key, "fixture-key").unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    *server.state.rating.lock().unwrap() = Some(2);
+    let request = ImmichProbeRequest {
+        origin: server.origin.clone(),
+        key_file: key,
+        asset: server.asset,
+        isolated_asset_confirmed: true,
+        fixture: true,
+    };
+    let report = qualify_immich(request).unwrap();
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|r| matches!(r.outcome, ProbeOutcome::Pass)),
+        "{report:?}"
+    );
+    assert_eq!(*server.state.rating.lock().unwrap(), Some(2));
+    let registry = CapabilityRegistry::new(vec![report]);
+    assert!(
+        registry
+            .allows(OperationKind::RatingWrite {
+                origin: &server.origin,
+                asset: server.asset,
+                version: "3.3.5"
+            })
+            .allowed
+    );
+    assert!(
+        !registry
+            .allows(OperationKind::RatingWrite {
+                origin: &server.origin,
+                asset: uuid::Uuid::new_v4(),
+                version: "3.3.5"
+            })
+            .allowed
+    );
+}
+#[test]
+fn writer_mode_transition_requires_quiescence_and_preserves_journal() {
+    let r = support::TestRig::new();
+    let archive = ArchiveId::new();
+    let writer = WriterId::new();
+    ArchiveStore::initialize(
+        &RootHandle::open(&r.archive, RootPolicy::TestArchive).unwrap(),
+        InitArchive {
+            archive_id: archive,
+            writer_id: writer,
+        },
+    )
+    .unwrap();
+    let mut store = ArchiveStore::open(
+        RootHandle::open(&r.archive, RootPolicy::TestArchive).unwrap(),
+        archive,
+        writer,
+    )
+    .unwrap();
+    let request = ModeChangeRequest {
+        operation: OperationId::new(),
+        expected: store.marker().clone(),
+        mode: PublicationMode::MultiWriter,
+        new_owner: writer,
+        all_writers_quiescent: false,
+        prior_owner_stopped: true,
+        no_unresolved_io: true,
+        recover: false,
+    };
+    assert!(store.change_mode(request.clone()).is_err());
+    assert_eq!(store.marker().mode_revision, 1);
+    let request = ModeChangeRequest {
+        all_writers_quiescent: true,
+        ..request
+    };
+    let marker = store.change_mode(request.clone()).unwrap();
+    assert_eq!(marker.mode, PublicationMode::MultiWriter);
+    assert_eq!(marker.mode_revision, 2);
+    assert!(
+        r.archive
+            .join(format!(".photo-sorter/modes/2-{}.json", request.operation))
+            .exists()
+    );
+    assert!(store.require_writable().is_ok());
+    assert_eq!(store.change_mode(request).unwrap(), marker);
+}
+#[test]
+fn interrupted_mode_change_blocks_writes_until_matching_recovery() {
+    for point in [
+        FaultPoint::IntentSaved,
+        FaultPoint::CommitPublished,
+        FaultPoint::ProjectionPublished,
+    ] {
+        let r = support::TestRig::new();
+        let archive = ArchiveId::new();
+        let writer = WriterId::new();
+        ArchiveStore::initialize(
+            &RootHandle::open(&r.archive, RootPolicy::TestArchive).unwrap(),
+            InitArchive {
+                archive_id: archive,
+                writer_id: writer,
+            },
+        )
+        .unwrap();
+        let mut store = ArchiveStore::open(
+            RootHandle::open(&r.archive, RootPolicy::TestArchive).unwrap(),
+            archive,
+            writer,
+        )
+        .unwrap();
+        let mut request = ModeChangeRequest {
+            operation: OperationId::new(),
+            expected: store.marker().clone(),
+            mode: PublicationMode::MultiWriter,
+            new_owner: writer,
+            all_writers_quiescent: true,
+            prior_owner_stopped: true,
+            no_unresolved_io: true,
+            recover: false,
+        };
+        *r.faults.0.lock().unwrap() = Some(point);
+        assert!(
+            store
+                .change_mode_with_faults(request.clone(), &r.faults)
+                .is_err()
+        );
+        drop(store);
+        let mut store = ArchiveStore::open(
+            RootHandle::open(&r.archive, RootPolicy::TestArchive).unwrap(),
+            archive,
+            writer,
+        )
+        .unwrap();
+        assert!(store.require_writable().is_err());
+        assert!(store.change_mode(request.clone()).is_err());
+        request.recover = true;
+        assert_eq!(store.change_mode(request).unwrap().mode_revision, 2);
+        assert!(store.require_writable().is_ok());
+        let guard = store.acquire_publication().unwrap();
+        store.release(guard).unwrap();
+    }
+}
+#[test]
+fn changed_mount_version_and_writer_invalidate_evidence() {
+    let r = support::TestRig::new();
+    let scratch = r._temp.path().join("scope");
+    std::fs::create_dir(&scratch).unwrap();
+    let archive = ArchiveId::new();
+    let writer = WriterId::new();
+    let root = production_root(&r);
+    let request = NasProbeRequest {
+        archive_root: r.archive.clone(),
+        archive,
+        writer,
+        mode: PublicationMode::SingleWriter,
+        mode_revision: 1,
+        scratch_root: scratch,
+        session: OperationId::new(),
+        phase: NasProbePhase::Prepare,
+        local_test_backend: false,
+        prior_peer_stopped: false,
+        all_writers_quiescent: false,
+        disconnect_observed: false,
+        interrupt_bytes: 1024,
+    };
+    let report = qualify_nas(request).unwrap();
+    let fingerprint = report.config_fingerprint.clone();
+    let mount = root.mount_identity().unwrap();
+    let mut stale = report.clone();
+    stale.tested_version = "future-unverified".into();
+    assert!(
+        !CapabilityRegistry::new(vec![stale])
+            .allows(OperationKind::ArchiveWrite {
+                mount_identity: &mount,
+                fingerprint: &fingerprint,
+                mode: &PublicationMode::SingleWriter
+            })
+            .allowed
+    );
+    let registry = CapabilityRegistry::new(vec![report]);
+    assert!(
+        !registry
+            .allows(OperationKind::ArchiveWrite {
+                mount_identity: "different-mount",
+                fingerprint: &fingerprint,
+                mode: &PublicationMode::SingleWriter
+            })
+            .allowed
+    );
+    let other = nas_fingerprint(
+        &root,
+        archive,
+        WriterId::new(),
+        &PublicationMode::SingleWriter,
+        1,
+    )
+    .unwrap();
+    assert!(
+        !registry
+            .allows(OperationKind::ArchiveWrite {
+                mount_identity: &mount,
+                fingerprint: &other,
+                mode: &PublicationMode::SingleWriter
+            })
+            .allowed
+    );
+}
+#[test]
+fn probe_requires_explicit_inputs_and_preserves_unknown_scratch() {
+    assert!(
+        serde_json::from_value::<QualificationRequest>(
+            serde_json::json!({"kind":"nas","request":{}})
+        )
+        .is_err()
+    );
+    assert!(serde_json::from_value::<QualificationRequest>(serde_json::json!({"kind":"immich","request":{"origin":"http://127.0.0.1/","key_file":"/tmp/no-default"}})).is_err());
+    let r = support::TestRig::new();
+    let scratch = r._temp.path().join("probe-owned");
+    let session = OperationId::new();
+    let session_dir = scratch.join(format!(".photo-sorter-qualification/{session}"));
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(session_dir.join("sentinel"), b"retain").unwrap();
+    let result = qualify_nas(NasProbeRequest {
+        archive_root: r.archive.clone(),
+        archive: ArchiveId::new(),
+        writer: WriterId::new(),
+        mode: PublicationMode::SingleWriter,
+        mode_revision: 1,
+        scratch_root: scratch,
+        session,
+        phase: NasProbePhase::Prepare,
+        local_test_backend: true,
+        prior_peer_stopped: false,
+        all_writers_quiescent: false,
+        disconnect_observed: false,
+        interrupt_bytes: 1024,
+    });
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read(session_dir.join("sentinel")).unwrap(),
+        b"retain"
+    );
+    assert!(!r.archive.join(".photo-sorter").exists());
+}
+#[test]
+fn uncertain_isolated_asset_probe_never_blindly_retries_or_restores() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::Ordering;
+    let r = support::TestRig::new();
+    let server = support::http::RatingServer::new();
+    let key = r.state.join("probe-key");
+    std::fs::write(&key, "fixture").unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    *server.state.rating.lock().unwrap() = Some(2);
+    server.state.drop_put.store(true, Ordering::SeqCst);
+    let report = qualify_immich(ImmichProbeRequest {
+        origin: server.origin.clone(),
+        key_file: key,
+        asset: server.asset,
+        isolated_asset_confirmed: true,
+        fixture: true,
+    })
+    .unwrap();
+    assert!(
+        report
+            .results
+            .iter()
+            .any(|r| matches!(r.outcome, ProbeOutcome::Fail))
+    );
+    assert_eq!(server.state.writes.lock().unwrap().len(), 1);
+    assert!(
+        !CapabilityRegistry::new(vec![report])
+            .allows(OperationKind::RatingWrite {
+                origin: &server.origin,
+                asset: server.asset,
+                version: "3.3.5"
+            })
+            .allowed
+    );
+}

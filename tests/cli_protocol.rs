@@ -17,7 +17,8 @@ impl Drop for Running {
 }
 fn config(r: &TestRig) -> std::path::PathBuf {
     let p = r._temp.path().join("profile.toml");
-    let c = Config::new(r.local.clone(), r.state.clone(), r.archive.clone());
+    let mut c = Config::new(r.local.clone(), r.state.clone(), r.archive.clone());
+    c.local_test_backend = true;
     std::fs::write(&p, toml::to_string(&c).unwrap()).unwrap();
     p
 }

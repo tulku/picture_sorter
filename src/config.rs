@@ -25,7 +25,9 @@ pub struct Config {
     pub immich: Option<ImmichConfig>,
     pub immich_path_mappings: Vec<crate::immich::PrefixMapping>,
     pub rapidraw_version: String,
+    pub rapidraw_binary: Option<PathBuf>,
     pub capability_evidence: Vec<PathBuf>,
+    pub local_test_backend: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,7 +58,9 @@ impl Default for Config {
             immich: None,
             immich_path_mappings: vec![],
             rapidraw_version: "1.6.6".into(),
+            rapidraw_binary: None,
             capability_evidence: vec![],
+            local_test_backend: false,
         }
     }
 }

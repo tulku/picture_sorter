@@ -9,6 +9,9 @@ pub enum JobKind {
         item: JobId,
     },
     ArchiveInit,
+    ChangeMode {
+        request: crate::archive::ModeChangeRequest,
+    },
     RecoverLock {
         prior_owner_stopped: bool,
         all_writers_quiescent: bool,

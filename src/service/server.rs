@@ -242,9 +242,10 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         std::env::current_exe()?,
         vec![profile.inherit()?, work.inherit()?],
     )?;
-    let worker = WorkerSupervisor::new(
+    let worker = WorkerSupervisor::new_configured(
         std::env::current_exe()?,
         vec![profile.inherit()?, work.inherit()?],
+        &config,
     )?;
     let listener = UnixListener::bind(&socket)?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
@@ -281,6 +282,10 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         authorizations: HashMap::new(),
         control: None,
         local_control: None,
+        doctor_snapshot: crate::qualification::doctor(&config)?,
+        editor_identity: crate::qualification::EditorRuntimeIdentity::capture(&config)
+            .ok()
+            .flatten(),
         archive_status: serde_json::json!({"availability":"unobserved","identity":null}),
         last_tick: Instant::now(),
     };
@@ -439,6 +444,8 @@ struct Runtime {
     control: Option<Control>,
     local_control: Option<Control>,
     archive_status: serde_json::Value,
+    doctor_snapshot: serde_json::Value,
+    editor_identity: Option<crate::qualification::EditorRuntimeIdentity>,
     last_tick: Instant,
 }
 impl Runtime {
@@ -457,7 +464,7 @@ impl Runtime {
         let data = |data| Ok(ResponseOutcome::Data { data });
         if request.dry_run {
             return data(
-                serde_json::json!({"dry_run":true,"command":request.command,"effect":"no jobs, pins, reservations or archive markers created"}),
+                serde_json::json!({"dry_run":true,"command":"validated preview","effect":"no jobs, pins, reservations or archive markers created"}),
             );
         }
         match &request.command {
@@ -493,6 +500,18 @@ impl Runtime {
                 ] {
                     status.session_metrics.add(&metrics);
                 }
+                let mut nas = self.worker.nas_decision().unwrap_or(
+                    crate::qualification::CapabilityDecision {
+                        allowed: false,
+                        reason: "archive capability has not been observed by the worker".into(),
+                    },
+                );
+                if self.worker.is_uncertain() {
+                    nas.allowed = false;
+                    nas.reason =
+                        "worker outcome is uncertain; no replacement publisher is allowed".into();
+                }
+                status.capabilities["nas_publication"] = serde_json::to_value(nas)?;
                 status.worker["publication_reason"] =
                     serde_json::to_value(&self.shared_publisher.reason)?;
                 status.watcher = serde_json::to_value(&self.observation.status)?;
@@ -637,6 +656,12 @@ impl Runtime {
             Command::Verify { archive } => {
                 self.enqueue(request, JobKind::Verify { archive: *archive })
             }
+            Command::ChangeMode { request: change } => self.enqueue(
+                request,
+                JobKind::ChangeMode {
+                    request: change.clone(),
+                },
+            ),
             Command::ArchiveInit => self.enqueue(request, JobKind::ArchiveInit),
             Command::RecoverLock {
                 prior_owner_stopped,
@@ -667,9 +692,7 @@ impl Runtime {
                     replacement: replacement.clone(),
                 },
             ),
-            Command::Doctor => data(
-                serde_json::json!({"protocol_version":1,"profile":self.engine.config.profile_id,"archive_probe":"unrun: doctor performs no archive writes or implicit probes","tools":{"rsync":tool_version("rsync","--version"),"exiftool":tool_version("exiftool","-ver")},"personal_integrations":"unverified"}),
-            ),
+            Command::Doctor => data(self.doctor_snapshot.clone()),
             Command::Qualify { request: probe } => self.enqueue(
                 request,
                 JobKind::Qualify {
@@ -749,6 +772,28 @@ impl Runtime {
             return Ok(Some(response));
         }
         Ok(None)
+    }
+    fn finish_control(&mut self, job: JobId, reply: NasReply) -> AppResult<()> {
+        if let NasReply::Capability(report) = reply {
+            let JobKind::Qualify { request } = self.engine.catalog.job(job)?.request.kind else {
+                return Err(AppError::integrity(
+                    "probe receipt has no qualification job",
+                ));
+            };
+            let request: crate::qualification::QualificationRequest =
+                serde_json::from_value(request)?;
+            crate::qualification::validate_request(&self.engine.config, &request)?;
+            let evidence = crate::qualification::persist_report(&self.engine.config, &report)?;
+            self.engine.catalog.db.execute("INSERT INTO capabilities(id,report) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET report=excluded.report",params![Digest::of(&serde_json::to_vec(&report)?).as_str(),serde_json::to_string(&report)?])?;
+            let qualified = crate::qualification::report_qualified(&request, &report);
+            self.result(
+                job,
+                serde_json::json!({"report":report,"qualified":qualified,"evidence":evidence}),
+            )?;
+        } else {
+            self.result(job, serde_json::to_value(reply)?)?;
+        }
+        self.complete(job)
     }
     fn result(&mut self, job: JobId, value: impl serde::Serialize) -> AppResult<()> {
         self.engine.catalog.db.execute("INSERT INTO job_results(job,result) VALUES(?,?) ON CONFLICT(job) DO UPDATE SET result=excluded.result",params![job.to_string(),serde_json::to_string(&value)?])?;
@@ -830,8 +875,9 @@ impl Runtime {
                     self.local_control = Some(control)
                 }
                 WorkerState::Completed(reply) => {
-                    self.result(control.job, serde_json::to_value(reply)?)?;
-                    self.complete(control.job)?;
+                    if let Err(error) = self.finish_control(control.job, reply) {
+                        self.wait(control.job, JobState::Failed, error.to_string())?;
+                    }
                 }
                 WorkerState::Failed(error) => self.wait(
                     control.job,
@@ -859,12 +905,22 @@ impl Runtime {
                         self.archive_status =
                             serde_json::json!({"availability":"online","identity":marker});
                     }
-                    self.result(control.job, serde_json::to_value(&reply)?)?;
-                    self.complete(control.job)?;
+                    if let Err(error) = self.finish_control(control.job, reply) {
+                        self.wait(control.job, JobState::Failed, error.to_string())?;
+                    }
                 }
-                WorkerState::Failed(error) => {
-                    self.wait(control.job, JobState::WaitingNas, error.to_string())?
-                }
+                WorkerState::Failed(error) => self.wait(
+                    control.job,
+                    if matches!(
+                        self.engine.catalog.job(control.job)?.request.kind,
+                        JobKind::Qualify { .. } | JobKind::ChangeMode { .. }
+                    ) {
+                        JobState::Failed
+                    } else {
+                        JobState::WaitingNas
+                    },
+                    error.to_string(),
+                )?,
                 WorkerState::Reaped => self.wait(
                     control.job,
                     JobState::WaitingNas,
@@ -985,8 +1041,13 @@ impl Runtime {
                 )?;
             }
         }
+        let editor_allowed = self.engine.config.local_test_backend
+            || self
+                .editor_identity
+                .as_ref()
+                .is_some_and(|identity| identity.decision(&self.engine.config).allowed);
         if let Some(http) = &self.http {
-            if let Some(after) = self.rating_cursor {
+            if let Some(after) = self.rating_cursor.filter(|_| editor_allowed) {
                 let config = &self.engine.config;
                 let scope = crate::immich::RatingScope {
                     state_root: config.state_root.clone(),
@@ -1297,6 +1358,23 @@ impl Runtime {
                 self.complete(job)?;
                 SnapshotGc { state: &self.state }.collect(&mut self.engine.catalog)?;
             }
+            JobKind::ChangeMode { request } => {
+                if self.nas_job_allowed(job)
+                    && self.control.is_none()
+                    && self.worker.available()?
+                    && self.maintenance.available()?
+                {
+                    let ticket = self.worker.submit(NasCommand::ChangeMode {
+                        root: config.archive_root.clone(),
+                        archive: config
+                            .archive_id
+                            .ok_or_else(|| AppError::invalid("missing archive ID"))?,
+                        writer: config.writer_id,
+                        request: request.clone(),
+                    })?;
+                    self.control = Some(Control { job, ticket });
+                }
+            }
             JobKind::ArchiveInit => {
                 if self.nas_job_allowed(job) && self.control.is_none() && self.worker.available()? {
                     let ticket = self.worker.submit(NasCommand::Initialize {
@@ -1376,11 +1454,37 @@ impl Runtime {
                     "validated resolution awaits journal publication".into(),
                 )?;
             }
-            JobKind::Qualify { .. } => {
-                return Err(AppError::new(
-                    ErrorCode::Unavailable,
-                    "explicit qualification request awaits probe execution",
-                ));
+            JobKind::Qualify { request } => {
+                let request: crate::qualification::QualificationRequest =
+                    serde_json::from_value(request.clone())?;
+                crate::qualification::validate_request(&config, &request)?;
+                match request {
+                    crate::qualification::QualificationRequest::Nas(request) => {
+                        if self.nas_job_allowed(job)
+                            && self.control.is_none()
+                            && self.worker.available()?
+                        {
+                            let ticket = self.worker.submit(NasCommand::QualifyNas(request))?;
+                            self.control = Some(Control { job, ticket });
+                        }
+                    }
+                    crate::qualification::QualificationRequest::Immich(request) => {
+                        if self.local_control.is_none() && self.maintenance.available()? {
+                            let ticket = self
+                                .maintenance
+                                .submit(NasCommand::QualifyImmich(request))?;
+                            self.local_control = Some(Control { job, ticket });
+                        }
+                    }
+                    crate::qualification::QualificationRequest::Rapidraw(request) => {
+                        if self.local_control.is_none() && self.maintenance.available()? {
+                            let ticket = self
+                                .maintenance
+                                .submit(NasCommand::QualifyEditor(request))?;
+                            self.local_control = Some(Control { job, ticket });
+                        }
+                    }
+                }
             }
             JobKind::Evict {
                 group,
@@ -1423,13 +1527,5 @@ impl Runtime {
             }
         }
         Ok(())
-    }
-}
-fn tool_version(name: &str, flag: &str) -> serde_json::Value {
-    match std::process::Command::new(name).arg(flag).output() {
-        Ok(out) => {
-            serde_json::json!({"available":out.status.success(),"version":String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("")})
-        }
-        Err(_) => serde_json::json!({"available":false}),
     }
 }

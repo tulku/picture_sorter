@@ -102,6 +102,10 @@ pub enum ServiceCommand {
 #[derive(Subcommand)]
 pub enum ArchiveCommand {
     Init,
+    ChangeMode {
+        #[arg(long)]
+        request: PathBuf,
+    },
     RecoverLock {
         #[arg(long)]
         prior_owner_stopped: bool,
@@ -178,6 +182,21 @@ pub fn run(cli: Cli) -> AppResult<i32> {
         return Ok(0);
     }
     let config = Config::load(path)?;
+    if matches!(cli.command, CliCommand::Doctor) {
+        let response = Response {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: cli.request_id.unwrap_or_default(),
+            outcome: ResponseOutcome::Data {
+                data: crate::qualification::doctor(&config)?,
+            },
+        };
+        if cli.json {
+            println!("{}", serde_json::to_string(&response)?);
+        } else {
+            print_response(&response)?;
+        }
+        return Ok(0);
+    }
     match &cli.command {
         CliCommand::Service {
             command: ServiceCommand::Run,
@@ -292,6 +311,11 @@ pub fn run(cli: Cli) -> AppResult<i32> {
             request: read_json(&request)?,
         },
         CliCommand::Verify { archive } => Command::Verify { archive },
+        CliCommand::Archive {
+            command: ArchiveCommand::ChangeMode { request },
+        } => Command::ChangeMode {
+            request: read_json(&request)?,
+        },
         CliCommand::Archive {
             command: ArchiveCommand::Init,
         } => Command::ArchiveInit,
