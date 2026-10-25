@@ -1,4 +1,5 @@
 use super::*;
+use crate::archive::*;
 use crate::{
     domain::OperationId,
     error::{AppError, AppResult, ErrorCode},
@@ -18,13 +19,55 @@ use std::{
 const MAX_LINE: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasCommand {
-    Inspect { root: PathBuf },
+    Inspect {
+        root: PathBuf,
+    },
     Stage(TransferSpec),
+    Initialize {
+        root: PathBuf,
+        request: InitArchive,
+    },
+    BeginArchive {
+        root: PathBuf,
+        archive: crate::domain::ArchiveId,
+        writer: crate::domain::WriterId,
+    },
+    JournalNext {
+        session: OperationId,
+        limit: usize,
+    },
+    JournalRead {
+        session: OperationId,
+        path: crate::domain::ArchivePath,
+    },
+    JournalAck {
+        session: OperationId,
+        token: OperationId,
+    },
+    Publish {
+        session: OperationId,
+        plan: PublicationPlan,
+    },
+    EndArchive {
+        session: OperationId,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasReply {
-    Root { device: u64, free: u64 },
+    Root {
+        device: u64,
+        free: u64,
+    },
     Staged(TransferReceipt),
+    Marker(ArchiveMarker),
+    Session {
+        session: OperationId,
+        marker: ArchiveMarker,
+    },
+    Journal(JournalBatch),
+    Commit(CommitEnvelope),
+    Published(PublicationReceipt),
+    Done,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerTicket(pub OperationId);
@@ -222,6 +265,7 @@ impl Drop for WorkerSupervisor {
     }
 }
 pub fn run_worker() -> AppResult<()> {
+    let mut runtime = ArchiveRuntime::default();
     let input = std::io::stdin();
     let mut input = input.lock();
     let mut output = std::io::stdout().lock();
@@ -257,6 +301,7 @@ pub fn run_worker() -> AppResult<()> {
                 })
             }
             NasCommand::Stage(spec) => TransferEngine::stage(&spec).map(NasReply::Staged),
+            command => runtime.execute(command),
         };
         let reply = Reply {
             ticket: message.ticket,
@@ -266,5 +311,111 @@ pub fn run_worker() -> AppResult<()> {
         bytes.push(b'\n');
         output.write_all(&bytes)?;
         output.flush()?;
+    }
+}
+
+#[derive(Default)]
+struct ArchiveRuntime {
+    store: Option<ArchiveStore>,
+    guard: Option<PublicationGuard>,
+}
+impl ArchiveRuntime {
+    fn execute(&mut self, command: NasCommand) -> AppResult<NasReply> {
+        match command {
+            NasCommand::Initialize { root, request } => {
+                let device = std::fs::metadata(&root).map(|m| {
+                    use std::os::unix::fs::MetadataExt;
+                    m.dev()
+                })?;
+                let root = RootHandle::open(
+                    &root,
+                    RootPolicy::Archive {
+                        expected_device: device,
+                    },
+                )?;
+                Ok(NasReply::Marker(ArchiveStore::initialize(&root, request)?))
+            }
+            NasCommand::BeginArchive {
+                root,
+                archive,
+                writer,
+            } => {
+                if self.guard.is_some() {
+                    return Err(AppError::new(
+                        ErrorCode::Conflict,
+                        "worker already holds a publication session",
+                    ));
+                }
+                use std::os::unix::fs::MetadataExt;
+                let device = std::fs::metadata(&root)?.dev();
+                let store = ArchiveStore::open(
+                    RootHandle::open(
+                        &root,
+                        RootPolicy::Archive {
+                            expected_device: device,
+                        },
+                    )?,
+                    archive,
+                    writer,
+                )?;
+                let guard = store.acquire_publication()?;
+                let session = guard.owner.session;
+                let marker = store.marker().clone();
+                self.store = Some(store);
+                self.guard = Some(guard);
+                Ok(NasReply::Session { session, marker })
+            }
+            NasCommand::JournalNext { session, limit } => {
+                let (store, guard) = self.session(session)?;
+                Ok(NasReply::Journal(store.journal_batch(guard, limit)?))
+            }
+            NasCommand::JournalRead { session, path } => {
+                let (store, guard) = self.session(session)?;
+                Ok(NasReply::Commit(store.read_commit(guard, &path)?))
+            }
+            NasCommand::JournalAck { session, token } => {
+                let (store, guard) = self.session(session)?;
+                store.ack_journal(guard, token)?;
+                Ok(NasReply::Done)
+            }
+            NasCommand::Publish { session, plan } => {
+                let (store, guard) = self.session(session)?;
+                Ok(NasReply::Published(store.publish_originals(
+                    guard,
+                    plan,
+                    &crate::domain::NoFaults,
+                )?))
+            }
+            NasCommand::EndArchive { session } => {
+                self.session(session)?;
+                let guard = self
+                    .guard
+                    .take()
+                    .ok_or_else(|| AppError::integrity("session disappeared"))?;
+                self.store
+                    .as_ref()
+                    .ok_or_else(|| AppError::integrity("archive disappeared"))?
+                    .release(guard)?;
+                Ok(NasReply::Done)
+            }
+            _ => Err(AppError::invalid("not an archive-session command")),
+        }
+    }
+    fn session(&mut self, id: OperationId) -> AppResult<(&ArchiveStore, &mut PublicationGuard)> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| AppError::new(ErrorCode::Conflict, "no open archive"))?;
+        let guard = self
+            .guard
+            .as_mut()
+            .ok_or_else(|| AppError::new(ErrorCode::Conflict, "no live publication session"))?;
+        if guard.owner.session != id {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "retired publication session",
+            ));
+        }
+        Ok((store, guard))
     }
 }

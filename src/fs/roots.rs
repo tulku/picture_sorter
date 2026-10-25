@@ -215,3 +215,32 @@ impl RootHandle {
         Ok(matches!(kind, 0x6969 | 0xff534d42 | 0xfe534d42 | 0x517b))
     }
 }
+impl RootHandle {
+    pub fn mkdir_exclusive(&self, path: &ArchivePath) -> AppResult<()> {
+        self.validate_identity()?;
+        let (parent, name) = self.parent(path)?;
+        // mkdirat creates the lock directory atomically beneath its held parent.
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        parent.sync_all()?;
+        Ok(())
+    }
+    pub fn unlink(&self, path: &ArchivePath, directory: bool) -> AppResult<()> {
+        self.validate_identity()?;
+        let (parent, name) = self.parent(path)?;
+        // unlinkat never follows the final path component and is confined to the held parent.
+        if unsafe {
+            libc::unlinkat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                if directory { libc::AT_REMOVEDIR } else { 0 },
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        parent.sync_all()?;
+        Ok(())
+    }
+}
