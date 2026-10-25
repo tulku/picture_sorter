@@ -1,14 +1,21 @@
-use crate::{catalog::*, domain::*, error::AppResult, fs::*, import::ImportCoordinator};
+use crate::{catalog::*, domain::*, error::AppResult, import::ImportCoordinator};
 use serde::Serialize;
 #[derive(Debug, Serialize)]
 pub struct SpaceSnapshot {
     pub budget: u64,
     pub reserve: u64,
-    pub filesystem_free: u64,
-    pub exclusive_total: u64,
+    pub filesystem_free: Option<u64>,
+    pub state_filesystem_free: Option<u64>,
+    pub occupancy_observed_at: Option<Timestamp>,
+    pub occupancy_reason: Option<String>,
+    pub snapshots: Option<u64>,
+    pub source_companions: Option<u64>,
+    pub retained_displaced: Option<u64>,
+    pub catalog_overhead: Option<u64>,
+    pub exclusive_total: Option<u64>,
     pub resident: u64,
-    pub staging: u64,
-    pub metadata: u64,
+    pub staging: Option<u64>,
+    pub metadata: Option<u64>,
     pub pinned: u64,
     pub protected: u64,
     pub evictable: u64,
@@ -37,8 +44,7 @@ pub struct StatusSnapshot {
 impl StatusSnapshot {
     pub(crate) fn collect_page(
         engine: &ImportCoordinator,
-        local: &RootHandle,
-        state: &RootHandle,
+        occupancy: &super::space::SpaceMeter,
         worker: serde_json::Value,
         archive: serde_json::Value,
         query: &super::protocol::StatusQuery,
@@ -75,11 +81,15 @@ impl StatusSnapshot {
         let subset = |condition: &str| -> AppResult<u64> {
             Ok(catalog.db.query_row(&format!("SELECT coalesce(sum(b.size),0) FROM placements p JOIN blobs b ON b.digest=p.digest JOIN residency r ON r.group_id=p.group_id WHERE p.local_ready=1 AND {condition}"),[],|r|r.get(0))?)
         };
-        let local_used = occupied_bytes(local)?;
-        let metadata = state_occupied_bytes(state)?;
-        let exclusive_total = local_used
-            .checked_add(metadata)
-            .ok_or_else(|| crate::error::AppError::invalid("occupancy overflow"))?;
+        let measured = occupancy.measurement.as_ref();
+        let exclusive_total = measured
+            .map(|m| {
+                m.local
+                    .total
+                    .checked_add(m.state.total)
+                    .ok_or_else(|| crate::error::AppError::invalid("occupancy overflow"))
+            })
+            .transpose()?;
         let groups = group_records
             .into_iter()
             .map(|group| {
@@ -90,7 +100,14 @@ impl StatusSnapshot {
                 Ok(serde_json::json!({"group":group,"readiness":readiness,"protection":protection,"physical_findings":findings}))
             })
             .collect::<AppResult<Vec<_>>>()?;
-        let space=SpaceSnapshot{budget:engine.config.budget,reserve:engine.config.reserve,filesystem_free:available_bytes(local)?,exclusive_total,resident,metadata,staging:local_used.saturating_sub(resident),pinned:subset("r.pin=1")?,protected:subset("r.protected=1 OR r.conflict=1")?,evictable:subset("r.pin=0 AND r.protected=0 AND r.conflict=0")?,remaining_reservations:catalog.remaining_reservations(crate::storage::FilesystemId(local.device()))?,subset_note:"resident, staging and metadata describe occupancy; pinned/protected/evictable are overlapping resident subsets and must not be added to the exclusive total; eligibility is rechecked before deletion".into()};
+        let space=SpaceSnapshot {
+            budget:engine.config.budget,reserve:engine.config.reserve,
+            filesystem_free:measured.map(|m|m.filesystem_free),state_filesystem_free:measured.map(|m|m.state_filesystem_free),occupancy_observed_at:occupancy.observed_at,occupancy_reason:occupancy.reason.clone(),
+            exclusive_total,resident,metadata:measured.map(|m|m.state.total),staging:measured.map(|m|m.local.staging.saturating_add(m.state.staging)),snapshots:measured.map(|m|m.state.snapshots),source_companions:measured.map(|m|m.local.companions),retained_displaced:measured.map(|m|m.local.retained),catalog_overhead:measured.map(|m|m.state.catalog),
+            pinned:subset("r.pin=1")?,protected:subset("r.protected=1 OR r.conflict=1")?,evictable:subset("r.pin=0 AND r.protected=0 AND r.conflict=0")?,remaining_reservations:catalog.total_remaining_reservations()?,
+            subset_note:"Filesystem observations are cached at occupancy_observed_at; null means unmeasured. Metadata includes state snapshots, staging and catalog overhead. Pinned/protected/evictable overlap resident bytes. Do not add overlapping subsets or cached/current observations; admission and deletion recheck fresh evidence.".into(),
+        };
+
         Ok(Self {
             session_metrics: crate::metrics::snapshot(),
             pagination,
@@ -102,11 +119,7 @@ impl StatusSnapshot {
             archive,
             capabilities: serde_json::json!({"nas_publication":{"allowed":false,"reason":"deployment qualification must match this mount and writer mode"},"immich_ratings":{"allowed":false,"reason":"outbound writes require matching runtime evidence and explicit best_effort"}}),
             space,
-            last_successful_operations: jobs
-                .iter()
-                .filter(|j| j.state == JobState::Complete)
-                .map(|j| j.id)
-                .collect(),
+            last_successful_operations: catalog.successful_operations(query.limit)?,
             jobs,
             groups,
             conflicts,

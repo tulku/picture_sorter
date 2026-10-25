@@ -505,3 +505,28 @@ fn reindexed_asset_cannot_supply_stars_to_old_mapping() {
     assert_eq!(report.observed, 0);
     assert_eq!(report.conflicts, 1);
 }
+#[test]
+fn outbound_rating_refuses_replaced_managed_root_even_with_matching_runtime_evidence() {
+    let r = support::TestRig::new();
+    let server = support::http::RatingServer::new();
+    let (_catalog, client, _group) = setup(&r, &server);
+    let client = client
+        .with_rating_policy(RatingWriteMode::BestEffort, evidence(&server))
+        .with_managed_roots(vec![RootHandle::open(&r.local, RootPolicy::Local).unwrap()]);
+    std::fs::rename(&r.local, r._temp.path().join("old-local")).unwrap();
+    std::fs::create_dir(&r.local).unwrap();
+    let checksum = server.state.checksum.lock().unwrap().clone();
+    let result = client.set_rating(RatingWrite {
+        asset: server.asset,
+        expected: stars(0),
+        desired: Rating::try_from(5).unwrap(),
+        jpeg_checksum: checksum,
+    });
+    assert!(
+        result
+            .unwrap_err()
+            .message
+            .contains("managed root replaced")
+    );
+    assert!(server.state.writes.lock().unwrap().is_empty());
+}

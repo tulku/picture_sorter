@@ -1015,3 +1015,37 @@ fn rebuilt_profile_finishes_real_readonly_catchup_and_physical_reconciliation() 
         "read-only reconciliation cannot silently take publication ownership"
     );
 }
+#[test]
+fn status_reports_space_audit_failure_without_walking_or_following_unknown_symlinks() {
+    let service = ServiceFixture::with_config(|config, _| {
+        config.reconcile_seconds = 1;
+    });
+    let sentinel = service.r._temp.path().join("unmanaged-sentinel");
+    std::fs::write(&sentinel, b"keep").unwrap();
+    std::os::unix::fs::symlink(&sentinel, service.r.local.join("unexpected.link")).unwrap();
+    let deadline = Instant::now();
+    loop {
+        let out = service.cli(&["status"]);
+        assert!(
+            out.status.success(),
+            "status must remain readable while space measurement is unavailable: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let response: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        if response["outcome"]["data"]["space"]["occupancy_reason"]
+            .as_str()
+            .is_some()
+        {
+            break;
+        }
+        assert!(deadline.elapsed() < Duration::from_secs(6));
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        std::fs::symlink_metadata(service.r.local.join("unexpected.link"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"keep");
+}

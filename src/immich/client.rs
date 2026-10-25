@@ -72,6 +72,7 @@ pub struct ServerInfo {
     pub licensed: bool,
 }
 pub struct ImmichClient {
+    managed_roots: Vec<crate::fs::RootHandle>,
     rating_mode: super::RatingWriteMode,
     rating_registry: crate::qualification::CapabilityRegistry,
     origin: Url,
@@ -127,6 +128,7 @@ impl ImmichClient {
             .build()
             .map_err(|_| AppError::invalid("cannot configure TLS HTTP client"))?;
         Ok(Self {
+            managed_roots: Vec::new(),
             origin,
             http,
             rating_mode: super::RatingWriteMode::Disabled,
@@ -236,6 +238,10 @@ impl ImmichClient {
     ) {
         self.rating_registry = registry;
     }
+    pub fn with_managed_roots(mut self, roots: Vec<crate::fs::RootHandle>) -> Self {
+        self.managed_roots = roots;
+        self
+    }
     pub fn outbound_enabled(&self) -> bool {
         self.rating_mode != super::RatingWriteMode::Disabled
     }
@@ -297,6 +303,10 @@ impl ImmichClient {
             .origin
             .join(&format!("/api/assets/{}", request.asset))
             .map_err(|_| AppError::invalid("invalid API path"))?;
+        for root in &self.managed_roots {
+            root.require_local()?;
+            root.validate_identity()?;
+        }
         let response = self.http.put(url).json(&body).send();
         match response {
             Ok(response) if response.status().is_success() => {}

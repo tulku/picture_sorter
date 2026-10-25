@@ -16,6 +16,8 @@ CREATE TABLE heads(sidecar TEXT NOT NULL REFERENCES sidecars(id),version TEXT NO
 CREATE TABLE projections(sidecar TEXT PRIMARY KEY REFERENCES sidecars(id),committed TEXT,applied TEXT,observed TEXT,pending INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE commits(id TEXT PRIMARY KEY,envelope BLOB NOT NULL,applied INTEGER NOT NULL DEFAULT 0,reason TEXT);
 CREATE TABLE dependencies(commit_id TEXT NOT NULL REFERENCES commits(id),dependency TEXT NOT NULL,PRIMARY KEY(commit_id,dependency));
+CREATE TABLE completed_operations(sequence INTEGER PRIMARY KEY AUTOINCREMENT,job TEXT NOT NULL UNIQUE,successful INTEGER NOT NULL);
+CREATE INDEX successful_completions ON completed_operations(successful,sequence DESC);
 CREATE TABLE jobs(id TEXT PRIMARY KEY,operation TEXT NOT NULL UNIQUE,request TEXT NOT NULL,state TEXT NOT NULL,generation INTEGER NOT NULL DEFAULT 0,local_ready INTEGER NOT NULL DEFAULT 0,archive_committed INTEGER NOT NULL DEFAULT 0,reason TEXT,cancel_requested INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE attempts(job TEXT NOT NULL REFERENCES jobs(id),generation INTEGER NOT NULL,state TEXT NOT NULL,receipt TEXT,PRIMARY KEY(job,generation));
 CREATE TABLE reservations(id TEXT PRIMARY KEY,job TEXT NOT NULL REFERENCES jobs(id),filesystem TEXT NOT NULL,remaining INTEGER NOT NULL CHECK(remaining>=0));

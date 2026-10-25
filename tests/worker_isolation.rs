@@ -126,3 +126,93 @@ fn exact_late_reply_can_confirm_same_worker_after_deadline() {
     assert_eq!(worker.pid(), pid);
     assert!(worker.available().unwrap());
 }
+#[test]
+fn configured_local_worker_refuses_replaced_profile_root_before_writing() {
+    let r = support::TestRig::new();
+    let config =
+        photo_sorter::config::Config::new(r.local.clone(), r.state.clone(), r.archive.clone());
+    let mut worker = WorkerSupervisor::new_local_configured(
+        env!("CARGO_BIN_EXE_photo_sorter").into(),
+        vec![],
+        &config,
+    )
+    .unwrap();
+    let held = r._temp.path().join("original-working-root");
+    std::fs::rename(&r.local, &held).unwrap();
+    std::fs::create_dir(&r.local).unwrap();
+    std::fs::write(r.local.join("sentinel"), b"foreign directory").unwrap();
+    std::fs::write(r.source.join("A.ORF"), b"raw").unwrap();
+    let job = JobId::new();
+    let ticket = worker
+        .submit(NasCommand::LocalTransfer {
+            spec: TransferSpec {
+                job,
+                generation: 1,
+                source: SourceLocation {
+                    root: r.source.clone(),
+                    path: ArchivePath::parse("A.ORF").unwrap(),
+                },
+                destination_root: r.local.clone(),
+                staged_path: staging_path(job, 1),
+                expected_digest: Digest::of(b"raw"),
+                expected_size: 3,
+            },
+            destination: ArchivePath::parse("RAW/A.ORF").unwrap(),
+        })
+        .unwrap();
+    assert!(matches!(wait(&mut worker, ticket), WorkerState::Failed(_)));
+    assert!(!r.local.join("RAW").exists());
+    assert_eq!(
+        std::fs::read(r.local.join("sentinel")).unwrap(),
+        b"foreign directory"
+    );
+    assert_eq!(std::fs::read_dir(&held).unwrap().count(), 0);
+}
+#[test]
+fn configured_nas_worker_refuses_changed_state_root_before_archive_staging() {
+    use photo_sorter::{archive::*, config::Config, fs::*};
+    let r = support::TestRig::new();
+    let mut config = Config::new(r.local.clone(), r.state.clone(), r.archive.clone());
+    config.archive_id = Some(ArchiveId::new());
+    config.local_test_backend = true;
+    ArchiveStore::initialize(
+        &RootHandle::open(&r.archive, RootPolicy::TestArchive).unwrap(),
+        InitArchive {
+            archive_id: config.archive_id.unwrap(),
+            writer_id: config.writer_id,
+        },
+    )
+    .unwrap();
+    let mut worker = WorkerSupervisor::new_configured(
+        env!("CARGO_BIN_EXE_photo_sorter").into(),
+        vec![],
+        &config,
+    )
+    .unwrap();
+    std::fs::rename(&r.state, r._temp.path().join("original-state")).unwrap();
+    std::fs::create_dir(&r.state).unwrap();
+    std::fs::write(r.source.join("A.ORF"), b"raw").unwrap();
+    let job = JobId::new();
+    let staged = staging_path(job, 1);
+    let ticket = worker
+        .submit(NasCommand::StageArchive {
+            archive: config.archive_id.unwrap(),
+            writer: config.writer_id,
+            spec: TransferSpec {
+                job,
+                generation: 1,
+                source: SourceLocation {
+                    root: r.source.clone(),
+                    path: ArchivePath::parse("A.ORF").unwrap(),
+                },
+                destination_root: r.archive.clone(),
+                staged_path: staged.clone(),
+                expected_digest: Digest::of(b"raw"),
+                expected_size: 3,
+            },
+        })
+        .unwrap();
+    assert!(matches!(wait(&mut worker, ticket), WorkerState::Failed(_)));
+    assert!(!r.archive.join(staged.as_str()).exists());
+    assert_eq!(std::fs::read(r.source.join("A.ORF")).unwrap(), b"raw");
+}

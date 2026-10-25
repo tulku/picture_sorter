@@ -147,6 +147,14 @@ impl Catalog {
         if matches!(state, JobState::Cancelled) {
             tx.execute("DELETE FROM reservations WHERE job=?", [id.to_string()])?;
         }
+        if state == JobState::Complete {
+            let successful = if matches!(old.request.kind, JobKind::Qualify { .. }) {
+                tx.query_row("SELECT EXISTS(SELECT 1 FROM job_results WHERE job=? AND json_extract(result,'$.qualified')=1)",[id.to_string()],|r|r.get::<_,bool>(0))?
+            } else {
+                true
+            };
+            tx.execute("INSERT INTO completed_operations(job,successful) VALUES(?,?) ON CONFLICT(job) DO NOTHING",params![id.to_string(),successful])?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -206,5 +214,18 @@ impl Catalog {
         self.db
             .execute("DELETE FROM job_retry WHERE job=?", [job.to_string()])?;
         Ok(())
+    }
+}
+
+impl Catalog {
+    pub fn successful_operations(&self, limit: usize) -> AppResult<Vec<JobId>> {
+        if limit == 0 || limit > 128 {
+            return Err(AppError::invalid("completion page must be 1..128"));
+        }
+        let mut query=self.db.prepare("SELECT job FROM completed_operations WHERE successful=1 ORDER BY sequence DESC LIMIT ?")?;
+        query
+            .query_map([limit], |r| r.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_value(row?.into())?))
+            .collect()
     }
 }

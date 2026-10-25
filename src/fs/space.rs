@@ -20,60 +20,156 @@ pub fn state_occupied_bytes(root: &RootHandle) -> AppResult<u64> {
     root.require_local()?;
     occupied(root, true)
 }
-fn occupied(root: &RootHandle, allow_service_socket: bool) -> AppResult<u64> {
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RootUsage {
+    pub total: u64,
+    pub snapshots: u64,
+    pub staging: u64,
+    pub companions: u64,
+    pub retained: u64,
+    pub catalog: u64,
+    pub other: u64,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ManagedSpaceMeasurement {
+    pub local: RootUsage,
+    pub state: RootUsage,
+    pub filesystem_free: u64,
+    pub state_filesystem_free: u64,
+}
+pub fn measure_managed_space(
+    local: &RootHandle,
+    state: &RootHandle,
+) -> AppResult<ManagedSpaceMeasurement> {
+    local.require_local()?;
+    state.require_local()?;
+    Ok(ManagedSpaceMeasurement {
+        local: measure(local, false)?,
+        state: measure(state, true)?,
+        filesystem_free: available_bytes(local)?,
+        state_filesystem_free: available_bytes(state)?,
+    })
+}
+fn occupied(root: &RootHandle, state: bool) -> AppResult<u64> {
+    Ok(measure(root, state)?.total)
+}
+fn category(path: &str, state: bool) -> (&'static str, u8) {
+    if state && path.starts_with(".photo-sorter/snapshots/") {
+        ("snapshots", 0)
+    } else if path.starts_with(".photo-sorter/staging/")
+        || (state && path.starts_with(".photo-sorter/captures/"))
+    {
+        ("staging", 1)
+    } else if !state && path.starts_with(".photo-sorter/companions/") {
+        ("companions", 2)
+    } else if !state
+        && (path.starts_with(".photo-sorter/displaced/")
+            || path.starts_with(".photo-sorter/retained/"))
+    {
+        ("retained", 3)
+    } else if state
+        && matches!(
+            path,
+            "catalog.sqlite" | "catalog.sqlite-wal" | "catalog.sqlite-shm"
+        )
+    {
+        ("catalog", 4)
+    } else {
+        ("other", 5)
+    }
+}
+fn measure(root: &RootHandle, state: bool) -> AppResult<RootUsage> {
     use std::os::fd::AsRawFd;
-    let mut stack = vec![(
-        std::fs::File::open(format!("/proc/self/fd/{}", root.fd()))?,
-        String::new(),
-    )];
-    let mut total = 0u64;
-    let mut seen = std::collections::HashSet::new();
-    while let Some((dir, prefix)) = stack.pop() {
-        for entry in std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name
-                .to_str()
-                .ok_or_else(|| AppError::invalid("non-UTF-8 managed filename"))?;
-            let path = super::ArchivePath::parse(&format!("{prefix}{name}"))?;
-            let kind = entry.file_type()?;
-            if allow_service_socket && path.as_str() == "service.sock" {
-                use std::os::unix::fs::{FileTypeExt, MetadataExt};
-                let metadata = entry.metadata()?;
-                if !kind.is_socket()
-                    || metadata.uid() != unsafe { libc::geteuid() }
-                    || metadata.mode() & 0o777 != 0o600
-                {
-                    return Err(AppError::invalid(
-                        "unexpected state socket type, owner or permissions",
-                    ));
-                }
-                continue;
-            }
-            if kind.is_dir() {
-                stack.push((
-                    root.open_relative(&path, libc::O_RDONLY | libc::O_DIRECTORY, 0)?,
-                    format!("{}/", path.as_str()),
-                ));
-            } else if kind.is_file() {
-                let m = root.metadata_relative(&path)?;
-                if u32::from(m.stx_mode) & libc::S_IFMT != libc::S_IFREG {
-                    return Err(AppError::invalid(
-                        "managed file changed type during occupancy check",
-                    ));
-                }
-                if seen.insert((m.stx_dev_major, m.stx_dev_minor, m.stx_ino)) {
-                    total = total
-                        .checked_add(m.stx_size)
-                        .ok_or_else(|| AppError::invalid("occupancy overflow"))?;
-                }
-            } else {
+    struct Frame {
+        _dir: std::fs::File,
+        entries: std::fs::ReadDir,
+        prefix: String,
+    }
+    fn frame(directory: std::fs::File, prefix: String) -> AppResult<Frame> {
+        let entries = std::fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))?;
+        Ok(Frame {
+            _dir: directory,
+            entries,
+            prefix,
+        })
+    }
+    let directory = std::fs::File::open(format!("/proc/self/fd/{}", root.fd()))?;
+    let mut stack = vec![frame(directory, String::new())?];
+    let mut inodes = std::collections::HashMap::new();
+    while let Some(current) = stack.last_mut() {
+        let Some(entry) = current.entries.next() else {
+            stack.pop();
+            continue;
+        };
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| AppError::invalid("non-UTF-8 managed filename"))?;
+        let path = super::ArchivePath::parse(&format!("{}{name}", current.prefix))?;
+        let kind = entry.file_type()?;
+        if state && path.as_str() == "service.sock" {
+            let metadata = root.metadata_relative(&path)?;
+            if u32::from(metadata.stx_mode) & libc::S_IFMT != libc::S_IFSOCK
+                || metadata.stx_uid != unsafe { libc::geteuid() }
+                || metadata.stx_mode & 0o777 != 0o600
+            {
                 return Err(AppError::invalid(
-                    "symlink or special file in managed root; preserve and resolve before admission",
+                    "unexpected state socket type, owner or permissions",
                 ));
             }
+            continue;
+        }
+        if kind.is_dir() {
+            stack.push(frame(
+                root.open_relative(&path, libc::O_RDONLY | libc::O_DIRECTORY, 0)?,
+                format!("{}/", path.as_str()),
+            )?);
+        } else if kind.is_file() {
+            let metadata = root.metadata_relative(&path)?;
+            if u32::from(metadata.stx_mode) & libc::S_IFMT != libc::S_IFREG {
+                return Err(AppError::invalid(
+                    "managed file changed type during occupancy check",
+                ));
+            }
+            let key = (
+                metadata.stx_dev_major,
+                metadata.stx_dev_minor,
+                metadata.stx_ino,
+            );
+            let (class, priority) = category(path.as_str(), state);
+            let item = inodes
+                .entry(key)
+                .or_insert((class, priority, metadata.stx_size));
+            if priority < item.1 {
+                item.0 = class;
+                item.1 = priority;
+            }
+            item.2 = item.2.max(metadata.stx_size);
+        } else {
+            return Err(AppError::invalid(
+                "symlink or special file in managed root; preserve and resolve before admission",
+            ));
         }
     }
     root.validate_identity()?;
-    Ok(total)
+    let mut usage = RootUsage::default();
+    for (class, _, bytes) in inodes.into_values() {
+        usage.total = usage
+            .total
+            .checked_add(bytes)
+            .ok_or_else(|| AppError::invalid("occupancy overflow"))?;
+        let target = match class {
+            "snapshots" => &mut usage.snapshots,
+            "staging" => &mut usage.staging,
+            "companions" => &mut usage.companions,
+            "retained" => &mut usage.retained,
+            "catalog" => &mut usage.catalog,
+            _ => &mut usage.other,
+        };
+        *target = target
+            .checked_add(bytes)
+            .ok_or_else(|| AppError::invalid("occupancy category overflow"))?;
+    }
+    Ok(usage)
 }

@@ -109,3 +109,33 @@ fn ingestion_milestone_does_not_create_a_second_attempt_for_running_generation()
     assert!(catalog.job(job).unwrap().local_ready);
     assert_eq!(catalog.job(job).unwrap().generation, 1);
 }
+#[test]
+fn last_successful_operations_follow_completion_order_and_ignore_idempotent_retries() {
+    let r = support::TestRig::new();
+    let root = RootHandle::open(&r.state, RootPolicy::Local).unwrap();
+    let mut catalog = Catalog::open(&root).unwrap();
+    let mut jobs = vec![];
+    for _ in 0..3 {
+        jobs.push(
+            catalog
+                .enqueue(DurableRequest {
+                    operation_id: OperationId::new(),
+                    kind: JobKind::Clean,
+                })
+                .unwrap(),
+        );
+    }
+    jobs.sort();
+    catalog
+        .transition(jobs[2], 0, JobTransition::Complete)
+        .unwrap();
+    catalog
+        .transition(jobs[0], 0, JobTransition::Complete)
+        .unwrap();
+    let retried = catalog.job(jobs[2]).unwrap().request;
+    assert_eq!(catalog.enqueue(retried).unwrap(), jobs[2]);
+    assert_eq!(
+        catalog.successful_operations(2).unwrap(),
+        vec![jobs[0], jobs[2]]
+    );
+}

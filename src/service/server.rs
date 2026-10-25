@@ -230,22 +230,33 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
     }
     let mut catalog = Catalog::open(&state)?;
     let _recovery = super::ServiceRecovery::restore(&mut catalog)?;
-    let maintenance_worker = WorkerSupervisor::new_local(
-        std::env::current_exe()?,
-        vec![profile.inherit()?, work.inherit()?],
-    )?;
-    let observation_worker = WorkerSupervisor::new_local(
-        std::env::current_exe()?,
-        vec![profile.inherit()?, work.inherit()?],
-    )?;
-    let local_worker = WorkerSupervisor::new_local(
-        std::env::current_exe()?,
-        vec![profile.inherit()?, work.inherit()?],
-    )?;
-    let worker = WorkerSupervisor::new_configured(
+    let maintenance_worker = WorkerSupervisor::new_local_bound(
         std::env::current_exe()?,
         vec![profile.inherit()?, work.inherit()?],
         &config,
+        &local,
+        &state,
+    )?;
+    let observation_worker = WorkerSupervisor::new_local_bound(
+        std::env::current_exe()?,
+        vec![profile.inherit()?, work.inherit()?],
+        &config,
+        &local,
+        &state,
+    )?;
+    let local_worker = WorkerSupervisor::new_local_bound(
+        std::env::current_exe()?,
+        vec![profile.inherit()?, work.inherit()?],
+        &config,
+        &local,
+        &state,
+    )?;
+    let worker = WorkerSupervisor::new_bound(
+        std::env::current_exe()?,
+        vec![profile.inherit()?, work.inherit()?],
+        &config,
+        &local,
+        &state,
     )?;
     let listener = UnixListener::bind(&socket)?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
@@ -254,7 +265,7 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         inode: std::fs::symlink_metadata(&socket)?.ino(),
         path: socket,
     };
-    let (http, http_reason) = match super::http::AsyncImmich::new(&config) {
+    let (http, http_reason) = match super::http::AsyncImmich::new(&config, &local, &state) {
         Ok(http) => (http, None),
         Err(error) => (None, Some(error.to_string())),
     };
@@ -262,6 +273,7 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         http,
         maintenance: maintenance_worker,
         startup: super::recovery::StartupVerifier::default(),
+        space: super::space::SpaceMeter::default(),
         reader: super::archive_reader::ArchiveReader::default(),
         http_reason,
         rating_cursor: None,
@@ -424,6 +436,7 @@ struct Runtime {
     engine: ImportCoordinator,
     maintenance: WorkerSupervisor,
     startup: super::recovery::StartupVerifier,
+    space: super::space::SpaceMeter,
     reader: super::archive_reader::ArchiveReader,
     http: Option<super::http::AsyncImmich>,
     http_reason: Option<String>,
@@ -488,8 +501,7 @@ impl Runtime {
                 }
                 let mut status = StatusSnapshot::collect_page(
                     &self.engine,
-                    &self.local,
-                    &self.state,
+                    &self.space,
                     serde_json::json!({"pid":self.worker.pid(),"local_pid":self.local_transfer.worker.pid(),"observation_pid":self.observation.worker.pid(),"maintenance_pid":self.maintenance.pid(),"available":self.worker.available()?}),
                     archive_status,
                     query,
@@ -867,6 +879,8 @@ impl Runtime {
             self.http_reason = Some(error.to_string());
         }
 
+        self.space
+            .advance(&self.engine.config, &mut self.maintenance, clock.now())?;
         if let Err(error) = self.observation.advance(
             &mut self.engine,
             &self.local,

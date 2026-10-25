@@ -41,7 +41,11 @@ pub(crate) struct AsyncImmich {
     config: Config,
 }
 impl AsyncImmich {
-    pub fn new(config: &Config) -> AppResult<Option<Self>> {
+    pub fn new(
+        config: &Config,
+        local: &crate::fs::RootHandle,
+        state: &crate::fs::RootHandle,
+    ) -> AppResult<Option<Self>> {
         let Some(immich) = config.immich.clone() else {
             return Ok(None);
         };
@@ -59,13 +63,22 @@ impl AsyncImmich {
         let worker_origin = origin.clone();
         let worker_registry = registry.clone();
         let worker_config = config.clone();
+        let worker_roots = [local.try_clone()?, state.try_clone()?];
         std::thread::spawn(move || {
             let mut client: Option<ImmichClient> = None;
             while let Ok(task) = commands.recv() {
                 let configured = if client.is_some() {
                     Ok(())
                 } else {
-                    match ImmichClient::new(worker_origin.clone(), &immich.key_file) {
+                    let create = || -> AppResult<_> {
+                        let roots = worker_roots
+                            .iter()
+                            .map(|root| root.try_clone())
+                            .collect::<AppResult<Vec<_>>>()?;
+                        Ok(ImmichClient::new(worker_origin.clone(), &immich.key_file)?
+                            .with_managed_roots(roots))
+                    };
+                    match create() {
                         Ok(new) => {
                             client = Some(new.with_rating_policy(mode, worker_registry.clone()));
                             Ok(())

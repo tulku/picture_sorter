@@ -147,6 +147,9 @@ impl RootHandle {
         &self.path
     }
     pub fn validate_identity(&self) -> AppResult<()> {
+        if matches!(self.policy, RootPolicy::Local | RootPolicy::TestArchive) {
+            reject_network_root(&self.path)?;
+        }
         let current = open_root_directory(&self.path)?;
         let m = current.metadata()?;
         if m.dev() != self.device

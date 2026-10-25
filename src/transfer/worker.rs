@@ -19,6 +19,10 @@ use std::{
 const MAX_LINE: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasCommand {
+    MeasureLocalSpace {
+        local: PathBuf,
+        state: PathBuf,
+    },
     CaptureHistory {
         root: PathBuf,
         archive: crate::domain::ArchiveId,
@@ -190,6 +194,7 @@ pub enum NasCommand {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasReply {
+    LocalSpace(crate::fs::ManagedSpaceMeasurement),
     Capability(crate::qualification::CapabilityReport),
     LocalObserved {
         entries: Vec<ArchiveObservation>,
@@ -255,15 +260,95 @@ pub enum WorkerState {
 }
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct WorkerSettings {
+    #[serde(default)]
+    profile_roots: Vec<ProfileRoot>,
     local_test_backend: bool,
     state_root: Option<PathBuf>,
     capability_evidence: Vec<PathBuf>,
 }
+#[derive(Clone, Serialize, Deserialize)]
+struct ProfileRoot {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    mount: u64,
+}
 impl WorkerSettings {
+    fn configured(config: &crate::config::Config) -> AppResult<Self> {
+        config.validate()?;
+        let mut roots = Vec::new();
+        for path in [&config.working_root, &config.state_root] {
+            let root = RootHandle::open(path, RootPolicy::Local)?;
+            roots.push(ProfileRoot {
+                path: path.clone(),
+                device: root.device(),
+                inode: root.inode(),
+                mount: root.mount_number(),
+            });
+        }
+        Ok(Self {
+            profile_roots: roots,
+            local_test_backend: config.local_test_backend,
+            state_root: Some(config.state_root.clone()),
+            capability_evidence: config.capability_evidence.clone(),
+        })
+    }
+    fn bound(
+        config: &crate::config::Config,
+        local: &RootHandle,
+        state: &RootHandle,
+    ) -> AppResult<Self> {
+        local.validate_identity()?;
+        state.validate_identity()?;
+        if local.path() != config.working_root || state.path() != config.state_root {
+            return Err(AppError::invalid("worker roots differ from profile"));
+        }
+        Ok(Self {
+            profile_roots: [local, state]
+                .into_iter()
+                .map(|root| ProfileRoot {
+                    path: root.path().to_owned(),
+                    device: root.device(),
+                    inode: root.inode(),
+                    mount: root.mount_number(),
+                })
+                .collect(),
+            local_test_backend: config.local_test_backend,
+            state_root: Some(config.state_root.clone()),
+            capability_evidence: config.capability_evidence.clone(),
+        })
+    }
+    fn local_root(&self, path: &std::path::Path) -> AppResult<RootHandle> {
+        let root = RootHandle::open(path, RootPolicy::Local)?;
+        if let Some(expected) = self
+            .profile_roots
+            .iter()
+            .find(|expected| expected.path == path)
+            && (root.device() != expected.device
+                || root.inode() != expected.inode
+                || root.mount_number() != expected.mount)
+        {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "profile root identity changed; management stopped before effects",
+            ));
+        }
+        Ok(root)
+    }
+    fn validate_roots(&self) -> AppResult<()> {
+        for expected in &self.profile_roots {
+            self.local_root(&expected.path)?;
+        }
+        Ok(())
+    }
+
     fn registry(&self) -> crate::qualification::CapabilityRegistry {
         let Some(state) = &self.state_root else {
             return crate::qualification::CapabilityRegistry::default();
         };
+        if self.local_root(state).is_err() {
+            return crate::qualification::CapabilityRegistry::default();
+        }
         let config = crate::config::Config {
             state_root: state.clone(),
             capability_evidence: self.capability_evidence.clone(),
@@ -334,6 +419,18 @@ impl WorkerSupervisor {
             },
         )
     }
+    pub fn new_local_configured(
+        executable: PathBuf,
+        locks: Vec<OwnedFd>,
+        config: &crate::config::Config,
+    ) -> AppResult<Self> {
+        Self::spawn(
+            executable,
+            locks,
+            "--local-worker",
+            WorkerSettings::configured(config)?,
+        )
+    }
     pub fn new_configured(
         executable: PathBuf,
         locks: Vec<OwnedFd>,
@@ -343,11 +440,35 @@ impl WorkerSupervisor {
             executable,
             locks,
             "--nas-worker",
-            WorkerSettings {
-                local_test_backend: config.local_test_backend,
-                state_root: Some(config.state_root.clone()),
-                capability_evidence: config.capability_evidence.clone(),
-            },
+            WorkerSettings::configured(config)?,
+        )
+    }
+    pub(crate) fn new_local_bound(
+        executable: PathBuf,
+        locks: Vec<OwnedFd>,
+        config: &crate::config::Config,
+        local: &RootHandle,
+        state: &RootHandle,
+    ) -> AppResult<Self> {
+        Self::spawn(
+            executable,
+            locks,
+            "--local-worker",
+            WorkerSettings::bound(config, local, state)?,
+        )
+    }
+    pub(crate) fn new_bound(
+        executable: PathBuf,
+        locks: Vec<OwnedFd>,
+        config: &crate::config::Config,
+        local: &RootHandle,
+        state: &RootHandle,
+    ) -> AppResult<Self> {
+        Self::spawn(
+            executable,
+            locks,
+            "--nas-worker",
+            WorkerSettings::bound(config, local, state)?,
         )
     }
     fn spawn(
@@ -549,10 +670,13 @@ fn run_worker_mode(local_only: bool) -> AppResult<()> {
         .transpose()?
         .unwrap_or_default();
     let mut runtime = ArchiveRuntime {
+        settings: settings.clone(),
+        ..Default::default()
+    };
+    let mut local_runtime = LocalRuntime {
         settings,
         ..Default::default()
     };
-    let mut local_runtime = LocalRuntime::default();
     let input = std::io::stdin();
     let mut input = input.lock();
     let mut output = std::io::stdout().lock();
@@ -569,7 +693,14 @@ fn run_worker_mode(local_only: bool) -> AppResult<()> {
         }
         let message: Message = serde_json::from_slice(&bytes)?;
         let before_metrics = crate::metrics::snapshot();
-        let result = if local_only {
+        let profile_error = runtime.settings.validate_roots().err();
+        let cleanup = matches!(
+            &message.command,
+            NasCommand::EndArchive { .. } | NasCommand::ReadJournalEnd { .. }
+        );
+        let result = if profile_error.is_some() && !cleanup {
+            Err(profile_error.clone().unwrap())
+        } else if local_only {
             local_runtime.execute(message.command)
         } else {
             match message.command {
@@ -592,7 +723,7 @@ fn run_worker_mode(local_only: bool) -> AppResult<()> {
                     })
                 }
                 NasCommand::Stage(spec) if runtime.settings.local_test_backend => {
-                    let source = RootHandle::open(&spec.source.root, RootPolicy::Local)?;
+                    let source = runtime.settings.local_root(&spec.source.root)?;
                     let destination = runtime.settings.root(&spec.destination_root)?;
                     TransferEngine::stage_confined(&spec, &source, &destination)
                         .map(NasReply::Staged)
@@ -604,6 +735,12 @@ fn run_worker_mode(local_only: bool) -> AppResult<()> {
                 command => runtime.execute(command),
             }
         };
+        if let Some(error) = profile_error {
+            runtime.last_decision = Some(crate::qualification::CapabilityDecision {
+                allowed: false,
+                reason: error.to_string(),
+            });
+        }
         let nas_decision = if local_only {
             None
         } else {
@@ -669,7 +806,7 @@ impl ArchiveRuntime {
             } => {
                 let store = self.open_store(&root, archive, writer)?;
                 store.require_writable()?;
-                let local = RootHandle::open(&local, RootPolicy::Local)?;
+                let local = self.settings.local_root(&local)?;
                 let receipt = crate::edit::capture_history(&local, &store.root, &context, ceiling)?;
                 store.validate()?;
                 Ok(NasReply::Captured(receipt))
@@ -772,7 +909,7 @@ impl ArchiveRuntime {
                 spec,
             } => {
                 let store = self.open_store(&spec.source.root, archive, writer)?;
-                let dest = RootHandle::open(&spec.destination_root, RootPolicy::Local)?;
+                let dest = self.settings.local_root(&spec.destination_root)?;
                 let result = TransferEngine::stage_confined(&spec, &store.root, &dest)?;
                 store.validate()?;
                 Ok(NasReply::Staged(result))
@@ -784,7 +921,7 @@ impl ArchiveRuntime {
             } => {
                 let store = self.open_store(&spec.destination_root, archive, writer)?;
                 store.require_writable()?;
-                let source = RootHandle::open(&spec.source.root, RootPolicy::Local)?;
+                let source = self.settings.local_root(&spec.source.root)?;
                 let result = TransferEngine::stage_confined(&spec, &source, &store.root)?;
                 store.validate()?;
                 Ok(NasReply::Staged(result))
@@ -909,12 +1046,18 @@ impl ArchiveRuntime {
 
 #[derive(Default)]
 struct LocalRuntime {
+    settings: WorkerSettings,
     inventory: Option<crate::import::Inventory>,
     watcher: Option<crate::edit::LocalWatcher>,
 }
 impl LocalRuntime {
     fn execute(&mut self, command: NasCommand) -> AppResult<NasReply> {
         match command {
+            NasCommand::MeasureLocalSpace { local, state } => crate::fs::measure_managed_space(
+                &self.settings.local_root(&local)?,
+                &self.settings.local_root(&state)?,
+            )
+            .map(NasReply::LocalSpace),
             NasCommand::QualifyImmich(request) => {
                 crate::qualification::qualify_immich(request).map(NasReply::Capability)
             }
@@ -922,15 +1065,14 @@ impl LocalRuntime {
                 crate::qualification::qualify_rapidraw(request).map(NasReply::Capability)
             }
             NasCommand::BackupCatalog { state, destination } => {
-                let state = RootHandle::open(&state, RootPolicy::Local)?;
+                let state = self.settings.local_root(&state)?;
                 crate::catalog::backup_readonly(&state, &destination)?;
                 Ok(NasReply::Done)
             }
             NasCommand::LocalForensicStart { root } => {
-                self.inventory = Some(crate::import::Inventory::open_forensic(RootHandle::open(
-                    &root,
-                    RootPolicy::Local,
-                )?)?);
+                self.inventory = Some(crate::import::Inventory::open_forensic(
+                    self.settings.local_root(&root)?,
+                )?);
                 Ok(NasReply::Done)
             }
             NasCommand::LocalInventoryHashNext { limit } => {
@@ -962,7 +1104,7 @@ impl LocalRuntime {
                 receipt,
                 destination,
             } => {
-                let root = RootHandle::open(&root, RootPolicy::Local)?;
+                let root = self.settings.local_root(&root)?;
                 if let Some((parent, _)) = destination.as_str().rsplit_once('/') {
                     root.mkdir_all(&crate::domain::ArchivePath::parse(parent)?)?;
                 }
@@ -970,7 +1112,7 @@ impl LocalRuntime {
                 Ok(NasReply::Staged(receipt))
             }
             NasCommand::AuditLocal { root, objects } => {
-                let root = RootHandle::open(&root, RootPolicy::Local)?;
+                let root = self.settings.local_root(&root)?;
                 Ok(NasReply::Integrity(
                     crate::catalog::IntegrityReport::audit_objects(&root, &objects)?,
                 ))
@@ -981,8 +1123,8 @@ impl LocalRuntime {
                 context,
                 ceiling,
             } => {
-                let local = RootHandle::open(&local, RootPolicy::Local)?;
-                let state = RootHandle::open(&state, RootPolicy::Local)?;
+                let local = self.settings.local_root(&local)?;
+                let state = self.settings.local_root(&state)?;
                 Ok(NasReply::Captured(crate::edit::capture_owned(
                     &local, &state, &context, ceiling,
                 )?))
@@ -992,7 +1134,7 @@ impl LocalRuntime {
                 context,
                 ceiling,
             } => {
-                let state = RootHandle::open(&state, RootPolicy::Local)?;
+                let state = self.settings.local_root(&state)?;
                 Ok(NasReply::Captured(crate::edit::recover_capture(
                     &state, &context, ceiling,
                 )?))
@@ -1004,18 +1146,25 @@ impl LocalRuntime {
                 kind,
                 ceiling,
             } => {
-                let local = RootHandle::open(&local, RootPolicy::Local)?;
-                let state = RootHandle::open(&state, RootPolicy::Local)?;
+                let local = self.settings.local_root(&local)?;
+                let state = self.settings.local_root(&state)?;
                 Ok(NasReply::Captured(crate::edit::capture_local(
                     &local, &state, &path, kind, ceiling,
                 )?))
             }
             NasCommand::LocalTransfer { spec, destination } => {
-                TransferEngine::local_transfer(&spec, &destination).map(NasReply::Staged)
+                let source = self.settings.local_root(&spec.source.root)?;
+                let root = self.settings.local_root(&spec.destination_root)?;
+                let receipt = TransferEngine::stage_confined(&spec, &source, &root)?;
+                if let Some((parent, _)) = destination.as_str().rsplit_once('/') {
+                    root.mkdir_all(&crate::domain::ArchivePath::parse(parent)?)?;
+                }
+                crate::transfer::publish_local(&root, &receipt, &destination)?;
+                Ok(NasReply::Staged(receipt))
             }
             NasCommand::LocalInventoryStart { root } => {
                 self.inventory = Some(crate::import::Inventory::open_all(
-                    RootHandle::open(&root, RootPolicy::Local)?,
+                    self.settings.local_root(&root)?,
                     None,
                 )?);
                 Ok(NasReply::Done)
@@ -1042,7 +1191,7 @@ impl LocalRuntime {
                 })
             }
             NasCommand::WatchLocal { root } => {
-                let root = RootHandle::open(&root, RootPolicy::Local)?;
+                let root = self.settings.local_root(&root)?;
                 self.watcher = Some(crate::edit::LocalWatcher::open(&root)?);
                 Ok(NasReply::Done)
             }
