@@ -129,6 +129,10 @@ impl Catalog {
             ));
         }
         self.db.execute("INSERT INTO placements(id,group_id,path,digest,local_ready,archived) VALUES(?,?,?,?,1,?) ON CONFLICT(path,group_id) DO UPDATE SET local_ready=1,archived=max(archived,excluded.archived)",params![OperationId::new().to_string(),group.id.to_string(),member.path.as_str(),member.digest.as_str(),archived])?;
+        self.db.execute(
+            "UPDATE residency SET last_activity=? WHERE group_id=?",
+            params![SystemClock::default().now(), group.id.to_string()],
+        )?;
         Ok(())
     }
     pub fn readiness(&self, group: GroupId) -> AppResult<Readiness> {

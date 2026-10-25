@@ -63,15 +63,23 @@ impl<'a> VersionStore<'a> {
         Self { catalog, root }
     }
     pub fn record(&mut self, intent: SnapshotIntent) -> AppResult<VersionId> {
-        self.record_with_head(intent, true)
+        self.record_with_head(intent, true, &NoFaults)
     }
     pub(crate) fn record_detached(&mut self, intent: SnapshotIntent) -> AppResult<VersionId> {
-        self.record_with_head(intent, false)
+        self.record_with_head(intent, false, &NoFaults)
+    }
+    pub fn record_with_faults(
+        &mut self,
+        intent: SnapshotIntent,
+        faults: &dyn FaultInjector,
+    ) -> AppResult<VersionId> {
+        self.record_with_head(intent, true, faults)
     }
     fn record_with_head(
         &mut self,
         intent: SnapshotIntent,
         advance_head: bool,
+        faults: &dyn FaultInjector,
     ) -> AppResult<VersionId> {
         self.catalog
             .db
@@ -201,6 +209,7 @@ impl<'a> VersionStore<'a> {
                 params![digest.as_str(), target.as_str(), size],
             )?;
         }
+        faults.hit(FaultPoint::IntentSaved)?;
         let tx = self.catalog.db.transaction()?;
         tx.execute("INSERT INTO versions(id,sidecar,body,origin,operation) VALUES(?,?,?,?,?) ON CONFLICT(id) DO NOTHING",params![version.to_string(),intent.sidecar.to_string(),serde_json::to_string(&body)?,serde_json::to_string(&intent.origin)?,intent.operation.to_string()])?;
         for parent in parents {

@@ -183,6 +183,7 @@ fn capture_with_stage(
             break;
         }
         destination.write_all(&buffer[..n])?;
+        crate::metrics::hash_bytes(n as u64);
         hash.update(&buffer[..n]);
         size = size
             .checked_add(n as u64)

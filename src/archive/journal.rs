@@ -155,6 +155,8 @@ impl ArchiveStore {
         self.read_commit_readonly(relative)
     }
     pub fn read_commit_readonly(&self, relative: &ArchivePath) -> AppResult<CommitEnvelope> {
+        crate::metrics::journal_read();
+        let _timing = crate::metrics::Timer::start(crate::metrics::Stage::Journal);
         self.validate()?;
         if !relative.as_str().starts_with(".photo-sorter/commits/") {
             return Err(AppError::invalid("not a journal path"));

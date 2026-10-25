@@ -245,8 +245,11 @@ impl RefreshCoordinator<'_> {
                     params![plan.version.to_string(), plan.sidecar.to_string(), encoded],
                 )?;
                 self.catalog.db.execute("INSERT INTO local_heads(sidecar,version,dirty) VALUES(?,?,0) ON CONFLICT(sidecar) DO UPDATE SET version=excluded.version,dirty=0",params![plan.sidecar.to_string(),plan.version.to_string()])?;
+                self.catalog.db.execute("UPDATE sidecars SET protected=0 WHERE id=? AND NOT EXISTS(SELECT 1 FROM sidecar_diagnostics WHERE sidecar=?)",params![plan.sidecar.to_string(),plan.sidecar.to_string()])?;
                 report.applied.push(plan.version);
             }
+            self.catalog.refresh_protection(group)?;
+            self.catalog.db.execute("UPDATE residency SET metadata_current=NOT EXISTS(SELECT 1 FROM sidecars s LEFT JOIN projections p ON p.sidecar=s.id LEFT JOIN local_heads l ON l.sidecar=s.id WHERE s.group_id=? AND s.owner<>'jpeg-xmp-external' AND (p.pending=1 OR p.sidecar IS NULL OR l.version IS NULL OR l.dirty=1 OR (SELECT count(*) FROM heads h WHERE h.sidecar=s.id)<>1 OR NOT EXISTS(SELECT 1 FROM heads h WHERE h.sidecar=s.id AND h.version=l.version))) WHERE group_id=?",params![group.to_string(),group.to_string()])?;
         }
         Ok(report)
     }

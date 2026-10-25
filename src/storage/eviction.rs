@@ -194,7 +194,7 @@ impl Catalog {
         let group = self.canonical_group(group)?;
         let originals:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM members m LEFT JOIN placements p ON p.group_id=m.group_id AND p.path=m.path AND p.digest=m.digest WHERE m.group_id=? AND (p.archived IS NULL OR p.archived=0))",[group.to_string()],|r|r.get(0))?;
         let edits: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sidecars WHERE group_id=? AND protected=1)",
+            "SELECT EXISTS(SELECT 1 FROM sidecars s LEFT JOIN local_heads l ON l.sidecar=s.id LEFT JOIN projections p ON p.sidecar=s.id WHERE s.group_id=? AND (s.protected=1 OR l.dirty=1 OR p.pending=1 OR EXISTS(SELECT 1 FROM versions v WHERE v.sidecar=s.id AND NOT EXISTS(SELECT 1 FROM archived_versions a WHERE a.version=v.id)) OR EXISTS(SELECT 1 FROM sidecar_diagnostics d WHERE d.sidecar=s.id)))",
             [group.to_string()],
             |r| r.get(0),
         )?;

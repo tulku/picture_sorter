@@ -468,3 +468,64 @@ fn startup_invalidates_physical_readiness_until_local_worker_checks_bytes() {
     photo_sorter::service::ServiceRecovery::restore(&mut engine.catalog).unwrap();
     assert!(!engine.catalog.readiness(group).unwrap().originals_ready);
 }
+#[test]
+fn coordinator_rejection_releases_confirmed_archive_session() {
+    use photo_sorter::{archive::*, transfer::*};
+    let r = TestRig::new();
+    let archive = ArchiveId::new();
+    let mut config = Config::new(r.local.clone(), r.state.clone(), r.archive.clone());
+    config.archive_id = Some(archive);
+    config.reserve = 0;
+    ArchiveStore::initialize(
+        &RootHandle::open(&r.archive, RootPolicy::TestArchive).unwrap(),
+        InitArchive {
+            archive_id: archive,
+            writer_id: config.writer_id,
+        },
+    )
+    .unwrap();
+    std::fs::write(r.source.join("A.JPG"), b"jpeg").unwrap();
+    let state = RootHandle::open(&r.state, RootPolicy::Local).unwrap();
+    let mut engine = ImportCoordinator::new(config, Catalog::open(&state).unwrap());
+    let job = engine
+        .prepare(ImportRequest {
+            source_path: r.source.clone(),
+            strict: false,
+            dry_run: false,
+            operation_id: OperationId::new(),
+        })
+        .unwrap()
+        .job
+        .unwrap();
+    engine.advance(job).unwrap();
+    engine
+        .catalog
+        .block_record(
+            "fixture-future-record",
+            "publication remains blocked until understood",
+        )
+        .unwrap();
+    let mut worker =
+        WorkerSupervisor::new(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+    let mut driver = UploadDriver::default();
+    let deadline = std::time::Instant::now();
+    let mut rejected = false;
+    loop {
+        if driver.advance(&mut engine, &mut worker, job).is_err() {
+            rejected = true;
+        }
+        if rejected
+            && driver.active_job().is_none()
+            && !r.archive.join(".photo-sorter/locks/publication").exists()
+        {
+            break;
+        }
+        assert!(
+            deadline.elapsed() < std::time::Duration::from_secs(3),
+            "coordinator rejection stranded a live worker-owned session"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(std::fs::read(r.source.join("A.JPG")).unwrap(), b"jpeg");
+    assert_eq!(engine.report(job).unwrap().archive_committed, 0);
+}

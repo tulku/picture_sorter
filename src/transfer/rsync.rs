@@ -41,6 +41,7 @@ impl TransferReceipt {
 }
 pub struct TransferEngine;
 pub fn digest_file(file: &mut std::fs::File) -> AppResult<(Digest, u64)> {
+    let _timing = crate::metrics::Timer::start(crate::metrics::Stage::Hash);
     let mut hash = blake3::Hasher::new();
     let mut count = 0u64;
     let mut buffer = [0u8; 128 * 1024];
@@ -49,6 +50,7 @@ pub fn digest_file(file: &mut std::fs::File) -> AppResult<(Digest, u64)> {
         if n == 0 {
             break;
         }
+        crate::metrics::hash_bytes(n as u64);
         hash.update(&buffer[..n]);
         count = count
             .checked_add(n as u64)
@@ -67,6 +69,7 @@ impl TransferEngine {
     pub fn arguments(source: &str, dest: &str) -> Vec<String> {
         [
             "--checksum",
+            "--stats",
             "--copy-links",
             "--partial",
             "--no-whole-file",
@@ -104,6 +107,15 @@ impl TransferEngine {
         source: &RootHandle,
         dest: &RootHandle,
     ) -> AppResult<TransferReceipt> {
+        Self::stage_confined_with_faults(spec, source, dest, &NoFaults)
+    }
+    pub fn stage_confined_with_faults(
+        spec: &TransferSpec,
+        source: &RootHandle,
+        dest: &RootHandle,
+        faults: &dyn FaultInjector,
+    ) -> AppResult<TransferReceipt> {
+        let _timing = crate::metrics::Timer::start(crate::metrics::Stage::Transfer);
         if spec.staged_path != staging_path(spec.job, spec.generation) {
             return Err(AppError::invalid(
                 "transfer destination must be its job-owned hidden staging path",
@@ -127,6 +139,7 @@ impl TransferEngine {
             dest.mkdir_all(&ArchivePath::parse(parent)?)?;
         }
         let (parent, filename) = dest.parent(&spec.staged_path)?;
+        faults.hit(FaultPoint::StagePartial)?;
         let source_arg = format!("/proc/{}/fd/{}", std::process::id(), original.as_raw_fd());
         let dest_arg = format!(
             "/proc/{}/fd/{}/{}",
@@ -136,14 +149,16 @@ impl TransferEngine {
                 .to_str()
                 .map_err(|_| AppError::invalid("UTF-8 path required"))?
         );
-        let mut child = Command::new("rsync")
+        let child = Command::new("rsync")
             .args(Self::arguments(&source_arg, &dest_arg))
-            .stdout(Stdio::null())
+            .env("LC_ALL", "C")
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| {
                 AppError::new(ErrorCode::Unavailable, format!("rsync unavailable: {e}"))
             })?;
+        let mut child = crate::process::ChildGuard::new(child);
         let mut error = Vec::new();
         child
             .stderr
@@ -152,9 +167,17 @@ impl TransferEngine {
             .take(64 * 1024 + 1)
             .read_to_end(&mut error)?;
         if error.len() > 64 * 1024 {
-            child.kill()?;
-            child.wait()?;
             return Err(AppError::new(ErrorCode::Io, "rsync output exceeded bound"));
+        }
+        let mut statistics = Vec::new();
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| AppError::integrity("missing rsync statistics"))?
+            .take(64 * 1024 + 1)
+            .read_to_end(&mut statistics)?;
+        if statistics.len() > 64 * 1024 {
+            return Err(AppError::integrity("rsync statistics exceeded bound"));
         }
         let status = child.wait()?;
         if !status.success() {
@@ -166,6 +189,14 @@ impl TransferEngine {
                 ),
             ));
         }
+        let transferred_bytes = String::from_utf8_lossy(&statistics)
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Literal data:")
+                    .and_then(|s| s.split_whitespace().next())
+                    .and_then(|n| n.replace(',', "").parse::<u64>().ok())
+            })
+            .ok_or_else(|| AppError::integrity("rsync omitted literal-data count"))?;
         let after = original.metadata()?;
         let current = source
             .open_relative(&spec.source.path, libc::O_RDONLY | libc::O_NONBLOCK, 0)?
@@ -194,8 +225,10 @@ impl TransferEngine {
         parent.sync_all()?;
         dest.validate_identity()?;
         source.validate_identity()?;
+        faults.hit(FaultPoint::Verified)?;
+        crate::metrics::transferred(transferred_bytes);
         Ok(TransferReceipt {
-            transferred_bytes: size,
+            transferred_bytes,
             job: spec.job,
             generation: spec.generation,
             digest,

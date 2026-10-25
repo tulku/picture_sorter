@@ -39,7 +39,7 @@ pub struct ImportCoordinator {
     pub catalog: Catalog,
     extractor: Box<dyn MetadataExtractor>,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ImportItem {
     pub id: JobId,
     pub source: SourceLocation,

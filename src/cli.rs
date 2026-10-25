@@ -67,7 +67,10 @@ pub enum CliCommand {
         stage_only: bool,
     },
     Clean,
-    Status,
+    Status {
+        #[command(flatten)]
+        query: StatusQuery,
+    },
     Jobs {
         #[command(subcommand)]
         command: JobsCommand,
@@ -114,7 +117,12 @@ pub enum JobsCommand {
 }
 #[derive(Subcommand)]
 pub enum ConflictsCommand {
-    List,
+    List {
+        #[arg(long)]
+        after: Option<ConflictId>,
+        #[arg(long, default_value_t = 128)]
+        limit: usize,
+    },
     Resolve {
         #[arg(long)]
         request: PathBuf,
@@ -241,8 +249,8 @@ pub fn run(cli: Cli) -> AppResult<i32> {
         _ => {}
     }
     let command = match cli.command {
-        CliCommand::Status
-        | CliCommand::Service {
+        CliCommand::Status { query } => Command::StatusPage { query },
+        CliCommand::Service {
             command: ServiceCommand::Status,
         } => Command::Status,
         CliCommand::Import { source, strict } => Command::Import { source, strict },
@@ -276,8 +284,8 @@ pub fn run(cli: Cli) -> AppResult<i32> {
             command: JobsCommand::Cancel { job },
         } => Command::JobCancel { job },
         CliCommand::Conflicts {
-            command: ConflictsCommand::List,
-        } => Command::ConflictsList,
+            command: ConflictsCommand::List { after, limit },
+        } => Command::ConflictsPage { after, limit },
         CliCommand::Conflicts {
             command: ConflictsCommand::Resolve { request },
         } => Command::ConflictResolve {

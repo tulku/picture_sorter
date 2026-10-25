@@ -71,6 +71,7 @@ impl BootstrapDriver {
         self.active.as_ref().map(|active| active.job)
     }
 }
+#[derive(Clone)]
 struct Active {
     job: JobId,
     ticket: WorkerTicket,
@@ -93,6 +94,7 @@ enum Phase {
     Publish,
     End,
     Abort,
+    Drain,
 }
 pub struct BootstrapCoordinator<'a> {
     config: &'a Config,
@@ -173,6 +175,20 @@ impl<'a> BootstrapCoordinator<'a> {
         Ok(serde_json::from_str(&text)?)
     }
     pub fn advance(&mut self, job: JobId) -> AppResult<BootstrapReport> {
+        let backup = self.driver.active.clone();
+        let result = self.advance_inner(job);
+        if result.is_err()
+            && self.driver.active.is_none()
+            && let Some(mut active) = backup
+            && let Some(ticket) = self.worker.latest_ticket()
+        {
+            active.ticket = ticket;
+            active.phase = Phase::Drain;
+            self.driver.active = Some(active);
+        }
+        result
+    }
+    fn advance_inner(&mut self, job: JobId) -> AppResult<BootstrapReport> {
         let mut report = self.report(job)?;
         if report.complete {
             return Ok(report);
@@ -249,6 +265,17 @@ impl<'a> BootstrapCoordinator<'a> {
             WorkerState::Completed(reply) => reply,
         };
         let command = match (active.phase, reply) {
+            (Phase::Drain, reply) => {
+                if let NasReply::Session { session, .. } = reply {
+                    active.session = Some(session);
+                }
+                if let Some(session) = active.session {
+                    active.phase = Phase::Abort;
+                    NasCommand::EndArchive { session }
+                } else {
+                    return Ok(report);
+                }
+            }
             (Phase::Abort, NasReply::Done) => return Ok(report),
             (Phase::Begin, NasReply::Session { session, .. }) => {
                 active.session = Some(session);

@@ -82,6 +82,64 @@ impl Catalog {
         }
         Ok(result)
     }
+    pub fn conflicts_page(
+        &self,
+        after: Option<ConflictId>,
+        limit: usize,
+        include_resolved: bool,
+    ) -> AppResult<Vec<ConflictRecord>> {
+        if limit == 0 || limit > 128 {
+            return Err(AppError::invalid("conflict page must be 1..128"));
+        }
+        let mut query=self.db.prepare("SELECT id,kind,group_id,revision,details,resolved FROM conflicts WHERE id>? AND (resolved=0 OR ?) ORDER BY id LIMIT ?")?;
+        let mut rows = query.query(params![
+            after.map(|id| id.to_string()).unwrap_or_default(),
+            include_resolved,
+            limit
+        ])?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next()? {
+            result.push(ConflictRecord {
+                id: decode(format!("\"{}\"", row.get::<_, String>(0)?))?,
+                kind: row.get(1)?,
+                group: row
+                    .get::<_, Option<String>>(2)?
+                    .map(|id| decode(format!("\"{id}\"")))
+                    .transpose()?,
+                revision: row.get(3)?,
+                details: decode(row.get(4)?)?,
+                resolved: row.get(5)?,
+            });
+        }
+        Ok(result)
+    }
+    pub fn conflict(&self, id: ConflictId) -> AppResult<ConflictRecord> {
+        self.db
+            .query_row(
+                "SELECT kind,group_id,revision,details,resolved FROM conflicts WHERE id=?",
+                [id.to_string()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, u64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, bool>(4)?,
+                    ))
+                },
+            )
+            .map_err(Into::into)
+            .and_then(|(kind, group, revision, details, resolved)| {
+                Ok(ConflictRecord {
+                    id,
+                    kind,
+                    group: group.map(|g| decode(format!("\"{g}\""))).transpose()?,
+                    revision,
+                    details: decode(details)?,
+                    resolved,
+                })
+            })
+    }
     pub fn resolution_records(&self, request: &ResolutionRequest) -> AppResult<Vec<ArchiveRecord>> {
         validate(&self.db, request)?;
         Ok(vec![ArchiveRecord::AmbiguityResolved {

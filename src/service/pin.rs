@@ -43,6 +43,12 @@ impl PinDriver {
     pub fn verified(&self, job: JobId) -> bool {
         self.verified == Some(job)
     }
+    pub fn nas_active_job(&self) -> Option<JobId> {
+        self.active
+            .as_ref()
+            .filter(|a| matches!(a.phase, Phase::Fetch) && a.deferred.is_none())
+            .map(|a| a.job)
+    }
     pub fn active_job(&self) -> Option<JobId> {
         self.active.as_ref().map(|a| a.job)
     }
@@ -87,6 +93,7 @@ impl PinDriver {
         nas: &mut WorkerSupervisor,
         local: &mut WorkerSupervisor,
         job: JobId,
+        nas_allowed: bool,
     ) -> AppResult<Readiness> {
         self.verified = None;
         let group = pin_group(catalog, job)?;
@@ -148,7 +155,7 @@ impl PinDriver {
                         if let Some(attempt) =
                             prepare_attempt(catalog, config, job, &active.target)?
                         {
-                            if !nas.available()? {
+                            if !nas_allowed || !nas.available()? {
                                 return catalog.readiness(group);
                             }
                             active.ticket = nas.submit(NasCommand::FetchArchive {
@@ -218,7 +225,7 @@ impl PinDriver {
             )
             .optional()?;
         if let Some((spec, reservation, target)) = pending {
-            if !nas.available()? {
+            if !nas_allowed || !nas.available()? {
                 return catalog.readiness(group);
             }
             let attempt = Attempt {

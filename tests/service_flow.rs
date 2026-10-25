@@ -1,118 +1,7 @@
 mod support;
 use photo_sorter::{config::Config, domain::*};
-use std::{
-    process::{Child, Command, Stdio},
-    time::{Duration, Instant},
-};
-use support::TestRig;
-struct ServiceFixture {
-    r: TestRig,
-    profile: std::path::PathBuf,
-    child: Child,
-}
-impl ServiceFixture {
-    fn stop(&mut self) {
-        if self.child.try_wait().unwrap().is_some() {
-            return;
-        }
-        let status = self.status();
-        for name in ["pid", "local_pid", "observation_pid", "maintenance_pid"] {
-            if let Some(pid) = status["worker"][name].as_u64() {
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGKILL);
-                }
-            }
-        }
-        self.child.kill().unwrap();
-        self.child.wait().unwrap();
-    }
-    fn restart(&mut self) {
-        self.child = Command::new(env!("CARGO_BIN_EXE_photo_sorter"))
-            .arg("--config")
-            .arg(&self.profile)
-            .args(["service", "run"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now();
-        loop {
-            let out = self.cli(&["service", "status"]);
-            if out.status.success() {
-                break;
-            }
-            assert!(self.child.try_wait().unwrap().is_none());
-            assert!(deadline.elapsed() < Duration::from_secs(5));
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-    fn new() -> Self {
-        Self::with_config(|_, _| {})
-    }
-    fn with_config(update: impl FnOnce(&mut Config, &TestRig)) -> Self {
-        let r = TestRig::new();
-        let profile = r._temp.path().join("profile.toml");
-        let mut c = Config::new(r.local.clone(), r.state.clone(), r.archive.clone());
-        c.archive_id = Some(ArchiveId::new());
-        update(&mut c, &r);
-        std::fs::write(&profile, toml::to_string(&c).unwrap()).unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_photo_sorter"))
-            .arg("--config")
-            .arg(&profile)
-            .args(["service", "run"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        let start = Instant::now();
-        loop {
-            if r.state.join("service.sock").exists() {
-                break;
-            }
-            assert!(child.try_wait().unwrap().is_none());
-            assert!(start.elapsed() < Duration::from_secs(5));
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        Self { r, profile, child }
-    }
-    fn cli(&self, args: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_photo_sorter"))
-            .arg("--config")
-            .arg(&self.profile)
-            .args(args)
-            .arg("--json")
-            .output()
-            .unwrap()
-    }
-    fn status(&self) -> serde_json::Value {
-        let out = self.cli(&["status"]);
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stdout)
-        );
-        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["outcome"]["data"].clone()
-    }
-}
-impl Drop for ServiceFixture {
-    fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let out = self.cli(&["status"]);
-            let status = serde_json::from_slice::<serde_json::Value>(&out.stdout)
-                .unwrap_or_default()["outcome"]["data"]
-                .clone();
-            for name in ["pid", "local_pid", "observation_pid", "maintenance_pid"] {
-                if let Some(pid) = status["worker"][name].as_u64() {
-                    unsafe {
-                        libc::kill(-(pid as i32), libc::SIGKILL);
-                    }
-                }
-            }
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
+use std::time::{Duration, Instant};
+use support::service::ServiceFixture;
 #[test]
 fn hung_nas_status_and_local_work_respond() {
     let service = ServiceFixture::new();
@@ -299,6 +188,24 @@ fn offline_import_edit_restart_reconnect_archive_with_actual_immich_pin() {
     std::fs::write(&sidecar, later).unwrap();
     service.restart();
     std::fs::rename(&offline, &service.r.archive).unwrap();
+    if service
+        .r
+        .archive
+        .join(".photo-sorter/locks/publication")
+        .exists()
+    {
+        let out = service.cli(&[
+            "archive",
+            "recover-lock",
+            "--prior-owner-stopped",
+            "--all-writers-quiescent",
+        ]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
     let deadline = Instant::now();
     while std::fs::read(service.r.archive.join(format!("{raw}.rrdata")))
         .ok()
@@ -646,5 +553,116 @@ fn cached_pin_requires_fresh_shared_namespace_before_latest_ready() {
         service.status()["groups"][0]["readiness"]["originals_ready"]
             .as_bool()
             .unwrap()
+    );
+}
+#[test]
+fn fresh_client_reads_records_once_then_catches_up_without_refetch() {
+    let original = ServiceFixture::new();
+    assert!(original.cli(&["archive", "init"]).status.success());
+    std::fs::write(original.r.source.join("A.JPG"), b"jpeg").unwrap();
+    assert!(
+        original
+            .cli(&[
+                "import",
+                original.r.source.to_str().unwrap(),
+                "--wait-for",
+                "archived"
+            ])
+            .status
+            .success()
+    );
+    let archive: ArchiveId =
+        serde_json::from_value(original.status()["archive_id"].clone()).unwrap();
+    let peer = ServiceFixture::with_config(|config, _| {
+        config.archive_root = original.r.archive.clone();
+        config.archive_id = Some(archive);
+    });
+    let deadline = Instant::now();
+    let status = loop {
+        let status = peer.status();
+        if !status["groups"].as_array().unwrap().is_empty() {
+            break status;
+        }
+        assert!(
+            deadline.elapsed() < Duration::from_secs(7),
+            "startup did not replay shared namespace"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let group = status["groups"][0]["group"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let reads = status["session_metrics"]["journal_reads"].as_u64().unwrap();
+    assert!(reads > 0);
+    let out = peer.cli(&["pin", &group]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        peer.status()["session_metrics"]["journal_reads"]
+            .as_u64()
+            .unwrap(),
+        reads
+    );
+    assert!(peer.cli(&["pin", &group]).status.success());
+    assert_eq!(
+        peer.status()["session_metrics"]["journal_reads"]
+            .as_u64()
+            .unwrap(),
+        reads
+    );
+}
+#[test]
+fn status_and_conflicts_have_bounded_resumable_pages() {
+    let fixture = ServiceFixture::with_config(|_, r| {
+        let root =
+            photo_sorter::fs::RootHandle::open(&r.state, photo_sorter::fs::RootPolicy::Local)
+                .unwrap();
+        let mut catalog = photo_sorter::catalog::Catalog::open(&root).unwrap();
+        for n in 0..260 {
+            catalog
+                .record_ambiguity("fixture", None, serde_json::json!({"index":n}))
+                .unwrap();
+        }
+    });
+    let status = fixture.status();
+    let first = status["conflicts"].as_array().unwrap();
+    assert_eq!(first.len(), 128);
+    assert_eq!(status["pagination"]["conflicts"]["has_more"], true);
+    let after = first.last().unwrap()["id"].as_str().unwrap();
+    let out = fixture.cli(&["status", "--conflicts-after", after]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let next: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        next["outcome"]["data"]["conflicts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        128
+    );
+    assert_ne!(
+        next["outcome"]["data"]["conflicts"][0]["id"],
+        first[0]["id"]
+    );
+    let out = fixture.cli(&["conflicts", "list", "--after", after, "--limit", "128"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let next: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        next["outcome"]["data"]["conflicts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        128
     );
 }

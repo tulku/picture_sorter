@@ -67,6 +67,7 @@ pub struct Recognition {
     pub hashed_bytes: u64,
 }
 pub fn hash_source(entry: &SourceEntry) -> AppResult<Digest> {
+    let _timing = crate::metrics::Timer::start(crate::metrics::Stage::Hash);
     entry.validate()?;
     let mut file = entry
         .root
@@ -78,6 +79,7 @@ pub fn hash_source(entry: &SourceEntry) -> AppResult<Digest> {
         if n == 0 {
             break;
         }
+        crate::metrics::hash_bytes(n as u64);
         hasher.update(&buffer[..n]);
     }
     entry.validate()?;
@@ -220,7 +222,7 @@ impl MetadataExtractor for ExifToolExtractor {
             .map(|file| format!("/proc/{}/fd/{}", std::process::id(), file.as_raw_fd()))
             .collect::<Vec<_>>();
         args.extend(paths.iter().map(OsString::from));
-        let mut child = Command::new(&self.executable)
+        let child = Command::new(&self.executable)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -228,6 +230,9 @@ impl MetadataExtractor for ExifToolExtractor {
             .map_err(|e| {
                 AppError::new(ErrorCode::Unavailable, format!("ExifTool unavailable: {e}"))
             })?;
+        let mut child = crate::process::ChildGuard::new(child);
+        crate::metrics::exif_invocation();
+        let _timing = crate::metrics::Timer::start(crate::metrics::Stage::Exif);
         let mut bytes = Vec::new();
         child
             .stdout
@@ -236,8 +241,6 @@ impl MetadataExtractor for ExifToolExtractor {
             .take(8 * 1024 * 1024 + 1)
             .read_to_end(&mut bytes)?;
         if bytes.len() > 8 * 1024 * 1024 {
-            child.kill()?;
-            child.wait()?;
             return Err(AppError::integrity("EXIF response exceeds bound"));
         }
         let status = child.wait()?;

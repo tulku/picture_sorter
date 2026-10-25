@@ -22,6 +22,13 @@ pub enum PublicationReadiness {
 }
 use serde::{Deserialize, Serialize};
 impl Catalog {
+    pub fn commit_applied(&self, id: CommitId) -> AppResult<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM commits WHERE id=? AND applied=1)",
+            [id.to_string()],
+            |r| r.get(0),
+        )?)
+    }
     pub fn block_record(&mut self, id: &str, reason: &str) -> AppResult<()> {
         self.db.execute("INSERT INTO blocked_records(id,reason) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET reason=excluded.reason",params![id,reason])?;
         Ok(())
@@ -36,12 +43,20 @@ impl Catalog {
         }
     }
     pub fn apply_commit(&mut self, commit: &CommitEnvelope) -> AppResult<ApplyOutcome> {
+        self.apply_commit_with_faults(commit, &NoFaults)
+    }
+    pub fn apply_commit_with_faults(
+        &mut self,
+        commit: &CommitEnvelope,
+        faults: &dyn FaultInjector,
+    ) -> AppResult<ApplyOutcome> {
         let result = self.apply_validated(commit);
         if let Err(e) = &result {
             self.block_record(&commit.commit_id.to_string(), &e.to_string())?;
         }
         if result.is_ok() {
             self.drain_pending(128)?;
+            faults.hit(FaultPoint::LocalAck)?;
         }
         result
     }

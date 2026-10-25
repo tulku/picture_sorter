@@ -461,14 +461,40 @@ impl Runtime {
             );
         }
         match &request.command {
-            Command::Status => {
-                let mut status = StatusSnapshot::collect(
+            Command::Status | Command::StatusPage { .. } => {
+                let default = StatusQuery::default();
+                let query = if let Command::StatusPage { query } = &request.command {
+                    query
+                } else {
+                    &default
+                };
+                let mut archive_status = self.archive_status.clone();
+                archive_status["last_successful_sync"] =
+                    serde_json::to_value(self.reader.last_success)?;
+                archive_status["reason"] = serde_json::to_value(&self.reader.reason)?;
+                if self.reader.reason.is_some() {
+                    archive_status["availability"] = serde_json::json!("unavailable");
+                } else if self.reader.last_success.is_some() {
+                    archive_status["availability"] = serde_json::json!("online");
+                }
+                let mut status = StatusSnapshot::collect_page(
                     &self.engine,
                     &self.local,
                     &self.state,
                     serde_json::json!({"pid":self.worker.pid(),"local_pid":self.local_transfer.worker.pid(),"observation_pid":self.observation.worker.pid(),"maintenance_pid":self.maintenance.pid(),"available":self.worker.available()?}),
-                    self.archive_status.clone(),
+                    archive_status,
+                    query,
                 )?;
+                for metrics in [
+                    self.worker.metrics(),
+                    self.local_transfer.worker.metrics(),
+                    self.observation.worker.metrics(),
+                    self.maintenance.metrics(),
+                ] {
+                    status.session_metrics.add(&metrics);
+                }
+                status.worker["publication_reason"] =
+                    serde_json::to_value(&self.shared_publisher.reason)?;
                 status.watcher = serde_json::to_value(&self.observation.status)?;
                 data(serde_json::to_value(status)?)
             }
@@ -580,9 +606,23 @@ impl Runtime {
                 )?;
                 Ok(self.job_response(request.request_id, *job)?.outcome)
             }
-            Command::ConflictsList => {
-                data(serde_json::to_value(self.engine.catalog.conflicts(false)?)?)
+            Command::ConflictsPage { after, limit } => {
+                let conflicts = self.engine.catalog.conflicts_page(*after, *limit, false)?;
+                let next = conflicts.last().map(|c| c.id);
+                let has_more = if let Some(id) = next {
+                    !self
+                        .engine
+                        .catalog
+                        .conflicts_page(Some(id), 1, false)?
+                        .is_empty()
+                } else {
+                    false
+                };
+                data(serde_json::json!({"conflicts":conflicts,"next":next,"has_more":has_more}))
             }
+            Command::ConflictsList => data(serde_json::to_value(
+                self.engine.catalog.conflicts_page(None, 128, false)?,
+            )?),
             Command::ConflictResolve {
                 request: resolution,
             } => {
@@ -770,6 +810,8 @@ impl Runtime {
         if (self.reader.busy()
             || (self.control.is_none()
                 && self.upload.active_job().is_none()
+                && self.bootstrap.active_job().is_none()
+                && self.fetch.nas_active_job().is_none()
                 && !self.shared_publisher.busy()
                 && self.worker.available()?))
             && let Err(error) = self.reader.advance(
@@ -987,15 +1029,28 @@ impl Runtime {
                 }
             }
         }
-        if self.shared_publisher.busy()
+        if (self.shared_publisher.busy()
             || (self.control.is_none()
                 && self.upload.active_job().is_none()
-                && self.worker.available()?)
+                && self.bootstrap.active_job().is_none()
+                && self.fetch.nas_active_job().is_none()
+                && !self.reader.busy()
+                && self.worker.available()?))
+            && let Err(error) =
+                self.shared_publisher
+                    .advance(&mut self.engine, &self.state, &mut self.worker)
         {
-            self.shared_publisher
-                .advance(&mut self.engine, &self.state, &mut self.worker)?;
+            self.shared_publisher.reason = Some(error.to_string());
         }
         Ok(())
+    }
+    fn nas_job_allowed(&self, job: JobId) -> bool {
+        !self.reader.busy()
+            && !self.shared_publisher.busy()
+            && self.control.as_ref().is_none_or(|c| c.job == job)
+            && self.upload.active_job().is_none_or(|id| id == job)
+            && self.bootstrap.active_job().is_none_or(|id| id == job)
+            && self.fetch.nas_active_job().is_none_or(|id| id == job)
     }
     fn pin_shared_fresh(&mut self, job: JobId) -> AppResult<bool> {
         let required: Option<u64> = self
@@ -1053,6 +1108,7 @@ impl Runtime {
                     self.complete(job)?;
                 } else if self.upload.active_job() == Some(job)
                     || (due
+                        && self.nas_job_allowed(job)
                         && report.selected > 0
                         && self.upload.active_job().is_none()
                         && self.local_transfer.active_parent() != Some(job)
@@ -1065,6 +1121,9 @@ impl Runtime {
                 }
             }
             JobKind::Bootstrap { .. } => {
+                if !self.nas_job_allowed(job) {
+                    return Ok(());
+                }
                 let report = BootstrapCoordinator::new(
                     &config,
                     &mut self.engine.catalog,
@@ -1076,12 +1135,14 @@ impl Runtime {
             }
             JobKind::Pin { .. } => {
                 let fresh = self.pin_shared_fresh(job)?;
+                let nas_allowed = self.nas_job_allowed(job);
                 let readiness = self.fetch.advance(
                     &mut self.engine.catalog,
                     &config,
                     &mut self.worker,
                     &mut self.maintenance,
                     job,
+                    nas_allowed,
                 )?;
                 self.result(job, &readiness)?;
                 if fresh
@@ -1149,12 +1210,14 @@ impl Runtime {
                     }
                 }
                 let fresh = self.pin_shared_fresh(job)?;
+                let nas_allowed = self.nas_job_allowed(job);
                 let readiness = self.fetch.advance(
                     &mut self.engine.catalog,
                     &config,
                     &mut self.worker,
                     &mut self.maintenance,
                     job,
+                    nas_allowed,
                 )?;
                 self.result(job, &readiness)?;
                 if fresh
@@ -1235,7 +1298,7 @@ impl Runtime {
                 SnapshotGc { state: &self.state }.collect(&mut self.engine.catalog)?;
             }
             JobKind::ArchiveInit => {
-                if self.control.is_none() && self.worker.available()? {
+                if self.nas_job_allowed(job) && self.control.is_none() && self.worker.available()? {
                     let ticket = self.worker.submit(NasCommand::Initialize {
                         root: config.archive_root.clone(),
                         request: InitArchive {
@@ -1252,7 +1315,7 @@ impl Runtime {
                 prior_owner_stopped,
                 all_writers_quiescent,
             } => {
-                if self.control.is_none() && self.worker.available()? {
+                if self.nas_job_allowed(job) && self.control.is_none() && self.worker.available()? {
                     let ticket = self.worker.submit(NasCommand::RecoverArchive {
                         root: config.archive_root.clone(),
                         archive: config
@@ -1274,6 +1337,7 @@ impl Runtime {
                     self.local_control = Some(Control { job, ticket });
                 }
             }
+            JobKind::Rebuild { .. } if !self.nas_job_allowed(job) => {}
             JobKind::Rebuild { replacement } => self.reader.start_rebuild(
                 &mut self.engine,
                 &mut self.maintenance,
@@ -1297,6 +1361,9 @@ impl Runtime {
                 }
             }
             JobKind::Verify { archive: true } => {
+                if !self.nas_job_allowed(job) {
+                    return Ok(());
+                }
                 self.reader
                     .start_verify(&mut self.engine, &self.state, &mut self.worker, job)?
             }

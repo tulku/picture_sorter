@@ -220,6 +220,8 @@ struct Message {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Reply {
+    #[serde(default)]
+    metrics: crate::metrics::Metrics,
     ticket: WorkerTicket,
     result: AppResult<NasReply>,
 }
@@ -232,6 +234,7 @@ pub enum WorkerState {
     Reaped,
 }
 pub struct WorkerSupervisor {
+    metrics: crate::metrics::Metrics,
     child: Child,
     input: std::process::ChildStdin,
     output: std::process::ChildStdout,
@@ -294,6 +297,7 @@ impl WorkerSupervisor {
         nonblocking(input.as_raw_fd())?;
         nonblocking(output.as_raw_fd())?;
         Ok(Self {
+            metrics: crate::metrics::Metrics::default(),
             child,
             input,
             output,
@@ -305,6 +309,13 @@ impl WorkerSupervisor {
             _locks: locks,
             completed: None,
         })
+    }
+    pub fn latest_ticket(&self) -> Option<WorkerTicket> {
+        self.pending
+            .or(self.completed.as_ref().map(|(ticket, _)| *ticket))
+    }
+    pub fn metrics(&self) -> crate::metrics::Metrics {
+        self.metrics.clone()
     }
     pub fn available(&mut self) -> AppResult<bool> {
         Ok(self.pending.is_none() && !self.timed_out && self.child.try_wait()?.is_none())
@@ -334,7 +345,9 @@ impl WorkerSupervisor {
         self.pending = Some(ticket);
         self.started = Instant::now();
         self.completed = None;
-        self.flush()?;
+        if self.flush().is_err() {
+            self.timed_out = true;
+        }
         Ok(ticket)
     }
     fn flush(&mut self) -> AppResult<()> {
@@ -378,7 +391,10 @@ impl WorkerSupervisor {
         if self.pending != Some(ticket) {
             return Err(AppError::invalid("obsolete worker ticket"));
         }
-        self.flush()?;
+        if self.flush().is_err() {
+            self.timed_out = true;
+            return Ok(WorkerState::TimedOutStillAlive);
+        }
         let mut buffer = [0u8; 8192];
         loop {
             match self.output.read(&mut buffer) {
@@ -401,6 +417,7 @@ impl WorkerSupervisor {
                 self.cancel()?;
                 return Err(AppError::integrity("worker ticket mismatch"));
             }
+            self.metrics.add(&reply.metrics);
             let state = match reply.result {
                 Ok(value) => WorkerState::Completed(value),
                 Err(e) => WorkerState::Failed(e),
@@ -447,6 +464,7 @@ fn run_worker_mode(local_only: bool) -> AppResult<()> {
             return Err(AppError::invalid("oversized/incomplete worker command"));
         }
         let message: Message = serde_json::from_slice(&bytes)?;
+        let before_metrics = crate::metrics::snapshot();
         let result = if local_only {
             local_runtime.execute(message.command)
         } else {
@@ -474,6 +492,7 @@ fn run_worker_mode(local_only: bool) -> AppResult<()> {
             }
         };
         let reply = Reply {
+            metrics: crate::metrics::snapshot().difference(&before_metrics),
             ticket: message.ticket,
             result,
         };

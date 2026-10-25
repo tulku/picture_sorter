@@ -28,10 +28,39 @@ pub enum Milestone {
     Archived,
     Ready,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, clap::Args)]
+#[serde(default, deny_unknown_fields)]
+pub struct StatusQuery {
+    #[arg(long)]
+    pub groups_after: Option<GroupId>,
+    #[arg(long)]
+    pub jobs_after: Option<JobId>,
+    #[arg(long)]
+    pub conflicts_after: Option<ConflictId>,
+    #[arg(long, default_value_t = 128)]
+    pub limit: usize,
+}
+impl Default for StatusQuery {
+    fn default() -> Self {
+        Self {
+            groups_after: None,
+            jobs_after: None,
+            conflicts_after: None,
+            limit: 128,
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     Status,
+    StatusPage {
+        query: StatusQuery,
+    },
+    ConflictsPage {
+        after: Option<ConflictId>,
+        limit: usize,
+    },
     Import {
         source: PathBuf,
         strict: bool,

@@ -24,6 +24,7 @@ type UploadItemRow = (
 pub struct UploadDriver {
     active: Option<Active>,
 }
+#[derive(Clone)]
 struct Active {
     job: JobId,
     item: ImportItem,
@@ -45,6 +46,7 @@ enum Phase {
     Publish,
     End,
     Abort,
+    Drain,
 }
 impl ImportCoordinator {
     pub fn bind_archive(&mut self) -> AppResult<()> {
@@ -137,6 +139,25 @@ impl UploadDriver {
     }
 
     pub fn advance(
+        &mut self,
+        engine: &mut ImportCoordinator,
+        worker: &mut WorkerSupervisor,
+        job: JobId,
+    ) -> AppResult<ImportReport> {
+        let backup = self.active.clone();
+        let result = self.advance_inner(engine, worker, job);
+        if result.is_err()
+            && self.active.is_none()
+            && let Some(mut active) = backup
+            && let Some(ticket) = worker.latest_ticket()
+        {
+            active.ticket = ticket;
+            active.phase = Phase::Drain;
+            self.active = Some(active);
+        }
+        result
+    }
+    fn advance_inner(
         &mut self,
         engine: &mut ImportCoordinator,
         worker: &mut WorkerSupervisor,
@@ -263,6 +284,17 @@ impl UploadDriver {
             }
             WorkerState::Completed(reply) => {
                 let command = match (active.phase, reply) {
+                    (Phase::Drain, reply) => {
+                        if let NasReply::Session { session, .. } = reply {
+                            active.session = Some(session);
+                        }
+                        if let Some(session) = active.session {
+                            active.phase = Phase::Abort;
+                            NasCommand::EndArchive { session }
+                        } else {
+                            return engine.report(job);
+                        }
+                    }
                     (Phase::Abort, NasReply::Done) => return engine.report(job),
                     (Phase::Stage, NasReply::Staged(_)) => {
                         if matches!(active.item.role, SourceRole::Companion(_)) {
@@ -348,6 +380,9 @@ impl UploadDriver {
                         if let Some(group) = active.item.group {
                             let group = engine.catalog.canonical_group(group)?;
                             engine.catalog.db.execute("INSERT INTO placements(id,group_id,path,digest,local_ready,archived) VALUES(?,?,?,?,?,1) ON CONFLICT(path,group_id) DO UPDATE SET archived=1",params![OperationId::new().to_string(),group.to_string(),active.item.destination.as_str(),active.item.digest.as_str(),active.item.local_ready])?;
+                        }
+                        if let Some(group) = active.item.group {
+                            engine.catalog.refresh_protection(group)?;
                         }
                         let report = engine.report(active.job)?;
                         if report.archive_committed == report.selected

@@ -136,6 +136,13 @@ impl Catalog {
 }
 impl RatingSynchronizer<'_> {
     pub fn advance(&mut self, id: RatingIntentId) -> AppResult<RatingSyncReport> {
+        self.advance_with_faults(id, &NoFaults)
+    }
+    pub fn advance_with_faults(
+        &mut self,
+        id: RatingIntentId,
+        faults: &dyn FaultInjector,
+    ) -> AppResult<RatingSyncReport> {
         let intent = self.catalog.rating_intent(id)?;
         if intent.state == "superseded" {
             return Ok(RatingSyncReport {
@@ -257,12 +264,15 @@ impl RatingSynchronizer<'_> {
             "UPDATE rating_intents SET state='sent' WHERE id=? AND state='prepared'",
             [id.to_string()],
         )?;
-        match self.client.set_rating(RatingWrite {
+        let outcome = self.client.set_rating(RatingWrite {
             asset: intent.asset,
             expected: intent.expected.clone(),
             desired: intent.desired,
             jpeg_checksum: intent.jpeg.remote_checksum.clone(),
-        }) {
+        });
+        faults.hit(FaultPoint::ApiSent)?;
+        faults.hit(FaultPoint::ApiReceived)?;
+        match outcome {
             Ok(WriteOutcome::Confirmed) => {
                 self.finish(&intent, true, RatingObservation::Stars(intent.desired))
             }

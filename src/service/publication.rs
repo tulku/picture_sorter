@@ -14,6 +14,7 @@ pub(crate) struct SharedPublisher {
     active: Option<Active>,
     pub reason: Option<String>,
 }
+#[derive(Clone)]
 struct Active {
     candidate: Candidate,
     ticket: WorkerTicket,
@@ -41,12 +42,35 @@ enum Phase {
     Repair,
     End,
     Abort,
+    Drain,
 }
 impl SharedPublisher {
     pub fn busy(&self) -> bool {
         self.active.is_some()
     }
     pub fn advance(
+        &mut self,
+        engine: &mut ImportCoordinator,
+        state: &RootHandle,
+        worker: &mut WorkerSupervisor,
+    ) -> AppResult<()> {
+        let backup = self.active.clone();
+        let result = self.advance_inner(engine, state, worker);
+        if let Err(error) = &result {
+            self.reason = Some(error.to_string());
+        }
+        if result.is_err()
+            && self.active.is_none()
+            && let Some(mut active) = backup
+            && let Some(ticket) = worker.latest_ticket()
+        {
+            active.ticket = ticket;
+            active.phase = Phase::Drain;
+            self.active = Some(active);
+        }
+        result
+    }
+    fn advance_inner(
         &mut self,
         engine: &mut ImportCoordinator,
         state: &RootHandle,
@@ -150,6 +174,24 @@ impl SharedPublisher {
             WorkerState::Completed(reply) => reply,
         };
         let command = match (active.phase, reply) {
+            (Phase::Drain, reply) => {
+                if let NasReply::Session { session, .. } = reply {
+                    active.session = Some(session);
+                }
+                if let Some(session) = active.session {
+                    active.phase = Phase::Abort;
+                    NasCommand::EndArchive { session }
+                } else {
+                    defer(
+                        &mut engine.catalog,
+                        &active.candidate,
+                        self.reason
+                            .as_deref()
+                            .unwrap_or("coordinator rejected publication"),
+                    )?;
+                    return Ok(());
+                }
+            }
             (Phase::Stage, NasReply::Staged(receipt)) => {
                 let Candidate::Version(version) = active.candidate else {
                     return Err(AppError::integrity("version stage has wrong candidate"));
@@ -437,12 +479,7 @@ fn prepare(engine: &mut ImportCoordinator, candidate: &Candidate) -> AppResult<V
                     }
                 }
                 if let ArchiveRecord::AmbiguityResolved { request } = record {
-                    let conflict = engine
-                        .catalog
-                        .conflicts(true)?
-                        .into_iter()
-                        .find(|c| c.id == request.conflict)
-                        .ok_or_else(|| AppError::invalid("resolution ambiguity disappeared"))?;
+                    let conflict = engine.catalog.conflict(request.conflict)?;
                     let mut prefix = vec![];
                     for (group, _) in &request.expected_memberships {
                         if !engine.catalog.group(*group)?.members.is_empty() {
@@ -648,5 +685,20 @@ fn acknowledge(
         [candidate_key(&active.candidate)],
     )?;
     tx.commit()?;
+    let sidecar = match active.candidate {
+        Candidate::Version(version) => Some(catalog.version(version)?.sidecar),
+        Candidate::Projection(sidecar, _) => Some(sidecar),
+        Candidate::Records(_) => None,
+    };
+    if let Some(sidecar) = sidecar {
+        let group: Option<String> = catalog.db.query_row(
+            "SELECT group_id FROM sidecars WHERE id=?",
+            [sidecar.to_string()],
+            |r| r.get(0),
+        )?;
+        if let Some(group) = group {
+            catalog.refresh_protection(serde_json::from_str(&format!("\"{group}\""))?)?;
+        }
+    }
     Ok(())
 }
