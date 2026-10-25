@@ -85,3 +85,5 @@ pub(crate) fn encode<T: serde::Serialize>(value: &T) -> AppResult<String> {
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(value: String) -> AppResult<T> {
     Ok(serde_json::from_str(&value)?)
 }
+mod identity;
+pub use identity::{PairEvidence, PairFacts, Protection};
