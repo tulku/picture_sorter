@@ -14,6 +14,13 @@ pub fn available_bytes(root: &RootHandle) -> AppResult<u64> {
         .ok_or_else(|| AppError::invalid("free-space count overflow"))
 }
 pub fn occupied_bytes(root: &RootHandle) -> AppResult<u64> {
+    occupied(root, false)
+}
+pub fn state_occupied_bytes(root: &RootHandle) -> AppResult<u64> {
+    root.require_local()?;
+    occupied(root, true)
+}
+fn occupied(root: &RootHandle, allow_service_socket: bool) -> AppResult<u64> {
     use std::os::fd::AsRawFd;
     let mut stack = vec![(
         std::fs::File::open(format!("/proc/self/fd/{}", root.fd()))?,
@@ -30,6 +37,19 @@ pub fn occupied_bytes(root: &RootHandle) -> AppResult<u64> {
                 .ok_or_else(|| AppError::invalid("non-UTF-8 managed filename"))?;
             let path = super::ArchivePath::parse(&format!("{prefix}{name}"))?;
             let kind = entry.file_type()?;
+            if allow_service_socket && path.as_str() == "service.sock" {
+                use std::os::unix::fs::{FileTypeExt, MetadataExt};
+                let metadata = entry.metadata()?;
+                if !kind.is_socket()
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.mode() & 0o777 != 0o600
+                {
+                    return Err(AppError::invalid(
+                        "unexpected state socket type, owner or permissions",
+                    ));
+                }
+                continue;
+            }
             if kind.is_dir() {
                 stack.push((
                     root.open_relative(&path, libc::O_RDONLY | libc::O_DIRECTORY, 0)?,

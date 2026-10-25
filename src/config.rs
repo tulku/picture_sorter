@@ -66,8 +66,29 @@ impl Config {
         }
     }
     pub fn load(path: &Path) -> AppResult<Self> {
-        let text = std::fs::read_to_string(path)?;
-        let c: Self = toml::from_str(&text).map_err(|_| {
+        let root = crate::fs::RootHandle::open(
+            path.parent()
+                .ok_or_else(|| AppError::invalid("profile must have a local parent"))?,
+            crate::fs::RootPolicy::Local,
+        )?;
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| AppError::invalid("profile filename must be UTF-8"))?;
+        let bytes = root.read(&ArchivePath::parse(name)?, 1024 * 1024)?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| AppError::invalid("profile must be UTF-8 TOML"))?;
+        let document: toml::Value =
+            toml::from_str(text).map_err(|_| AppError::invalid("invalid profile TOML"))?;
+        if ["profile_id", "writer_id"]
+            .iter()
+            .any(|name| document.get(name).and_then(|v| v.as_str()).is_none())
+        {
+            return Err(AppError::invalid(
+                "profile must persist profile_id and writer_id; use explicit init or recovery",
+            ));
+        }
+        let c: Self = document.try_into().map_err(|_| {
             AppError::invalid("invalid profile TOML or unsupported configuration field")
         })?;
         c.validate()?;

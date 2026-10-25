@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS pending_shared_records(operation TEXT PRIMARY KEY,rec
 "#;
 pub const RATING_AUTHORITY_SCHEMA: &str = "CREATE TABLE rating_authorities(group_id TEXT PRIMARY KEY REFERENCES groups(id),server TEXT NOT NULL,asset TEXT NOT NULL,FOREIGN KEY(server,asset) REFERENCES mappings(server,asset));";
 pub const BOOTSTRAP_SCHEMA: &str = r#"
+CREATE TABLE job_results(job TEXT PRIMARY KEY REFERENCES jobs(id),result TEXT NOT NULL);
 CREATE TABLE publication_plans(operation TEXT PRIMARY KEY,plan TEXT NOT NULL);
 CREATE TABLE bootstrap_scans(job TEXT PRIMARY KEY REFERENCES jobs(id),request TEXT NOT NULL,report TEXT NOT NULL,pending TEXT);
 CREATE TABLE bootstrap_observations(job TEXT NOT NULL,path TEXT NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(job,path,digest));

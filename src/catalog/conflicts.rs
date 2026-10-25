@@ -2,7 +2,7 @@ use super::*;
 use crate::{archive::ArchiveRecord, domain::*};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ConflictResolution {
     ChooseHead { version: VersionId },
@@ -16,7 +16,7 @@ pub enum ConflictResolution {
     AssociateSidecar { sidecar: SidecarId, group: GroupId },
     RetainUnassociated { sidecar: SidecarId },
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolutionRequest {
     pub operation: OperationId,

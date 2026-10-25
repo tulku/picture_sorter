@@ -68,20 +68,32 @@ impl Catalog {
         Ok(Self { db, _root: root })
     }
     pub fn backup(&self, dest: &Path) -> AppResult<()> {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(dest)?;
+        let parent = crate::fs::RootHandle::open(
+            dest.parent()
+                .ok_or_else(|| AppError::invalid("backup requires a local parent"))?,
+            crate::fs::RootPolicy::Local,
+        )?;
+        let name = ArchivePath::parse(
+            dest.file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| AppError::invalid("backup filename must be UTF-8"))?,
+        )?;
+        let file = parent.create_new(&name)?;
         file.sync_all()?;
-        let mut target = Connection::open(dest)?;
+        vfs::register()?;
+        let mut target = Connection::open_with_flags_and_vfs(
+            format!("/proc/self/fd/{}/{}", parent.fd(), name.as_str()),
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            "photo-archive-fd",
+        )?;
         let backup = rusqlite::backup::Backup::new(&self.db, &mut target)?;
         backup.run_to_completion(128, std::time::Duration::from_millis(10), None)?;
         drop(backup);
         drop(target);
-        File::open(dest)?.sync_all()?;
-        if let Some(parent) = dest.parent() {
-            File::open(parent)?.sync_all()?;
-        }
+        file.sync_all()?;
+        parent.sync()?;
         Ok(())
     }
 }

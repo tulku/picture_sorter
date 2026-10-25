@@ -19,6 +19,13 @@ use std::{
 const MAX_LINE: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasCommand {
+    RecoverArchive {
+        root: PathBuf,
+        archive: crate::domain::ArchiveId,
+        writer: crate::domain::WriterId,
+        prior_owner_stopped: bool,
+        all_writers_quiescent: bool,
+    },
     ReadJournalStart {
         root: PathBuf,
         archive: crate::domain::ArchiveId,
@@ -393,6 +400,28 @@ struct ArchiveRuntime {
 impl ArchiveRuntime {
     fn execute(&mut self, command: NasCommand) -> AppResult<NasReply> {
         match command {
+            NasCommand::RecoverArchive {
+                root,
+                archive,
+                writer,
+                prior_owner_stopped,
+                all_writers_quiescent,
+            } => {
+                use std::os::unix::fs::MetadataExt;
+                let device = std::fs::metadata(&root)?.dev();
+                let mut store = ArchiveStore::open(
+                    RootHandle::open(
+                        &root,
+                        RootPolicy::Archive {
+                            expected_device: device,
+                        },
+                    )?,
+                    archive,
+                    writer,
+                )?;
+                store.recover_lock(prior_owner_stopped, all_writers_quiescent)?;
+                Ok(NasReply::Done)
+            }
             NasCommand::ReadJournalStart {
                 root,
                 archive,

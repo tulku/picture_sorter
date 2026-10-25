@@ -14,3 +14,6 @@ pub mod ratings;
 pub mod sidecar;
 pub mod storage;
 pub mod transfer;
+
+pub mod cli;
+pub mod service;

@@ -4,6 +4,26 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum JobKind {
+    ArchiveInit,
+    RecoverLock {
+        prior_owner_stopped: bool,
+        all_writers_quiescent: bool,
+    },
+    Backup {
+        destination: PathBuf,
+    },
+    Rebuild {
+        replacement: PathBuf,
+    },
+    ResolveAmbiguity {
+        request: super::ResolutionRequest,
+    },
+    Qualify {
+        request: serde_json::Value,
+    },
+    Unpin {
+        group: GroupId,
+    },
     Import {
         source: PathBuf,
         strict: bool,

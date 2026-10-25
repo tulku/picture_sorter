@@ -13,6 +13,7 @@ macro_rules! ids { ($($name:ident),*) => {$ (
     #[serde(transparent)]
     pub struct $name(pub uuid::Uuid);
     impl $name { pub fn new() -> Self { Self(uuid::Uuid::new_v4()) } }
+    impl std::str::FromStr for $name { type Err=AppError; fn from_str(s:&str)->AppResult<Self>{uuid::Uuid::parse_str(s).map(Self).map_err(|_|AppError::invalid("invalid UUID selector"))} }
     impl Default for $name { fn default() -> Self { Self::new() } }
     impl fmt::Display for $name { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(f) } }
 )*}; }
@@ -288,4 +289,11 @@ pub fn validate_sidecar_path(path: &ArchivePath) -> AppResult<()> {
         ));
     }
     Ok(())
+}
+
+impl std::str::FromStr for ArchivePath {
+    type Err = AppError;
+    fn from_str(s: &str) -> AppResult<Self> {
+        Self::parse(s)
+    }
 }
