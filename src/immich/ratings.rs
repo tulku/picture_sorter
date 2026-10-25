@@ -375,6 +375,7 @@ pub struct RatingScope {
 }
 #[derive(Default, Debug)]
 pub struct RatingPollReport {
+    pub retry: bool,
     pub observed: u64,
     pub pending: u64,
     pub conflicts: u64,

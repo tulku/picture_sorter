@@ -288,12 +288,26 @@ impl FavoriteSynchronizer<'_> {
                 }
                 RatingDecision::AdoptRemote(wanted) | RatingDecision::KeepPending(wanted) => {
                     let wanted = u8::from(wanted) != 0;
-                    if baseline.pending != Some(wanted)
-                        || baseline.source_version != local.version
-                        || baseline.pending_version.is_none()
+                    let outbound = baseline.pending_version.is_none()
+                        && value == Some(wanted)
+                        && baseline.pending == Some(wanted);
+                    if !outbound
+                        && (baseline.pending != Some(wanted)
+                            || baseline.source_version != local.version
+                            || baseline.pending_version.is_none())
                     {
                         match self.derive(&root, &adapter, group, &local, &baseline, wanted) {
                             Ok(version) => baseline.pending_version = version,
+                            Err(e)
+                                if matches!(
+                                    e.code,
+                                    ErrorCode::Capacity | ErrorCode::Unavailable
+                                ) =>
+                            {
+                                report.pending += 1;
+                                report.retry = true;
+                                continue;
+                            }
                             Err(e) => {
                                 self.conflict(group, serde_json::json!({"reason":e.to_string()}))?;
                                 report.conflicts += 1;
@@ -415,10 +429,10 @@ impl FavoriteSynchronizer<'_> {
             id
         };
         let heads = self.catalog.heads(sidecar)?;
-        if heads.len() > 1 {
+        if heads.len() > 128 {
             return Err(AppError::new(
-                ErrorCode::Conflict,
-                "divergent metadata heads retained",
+                ErrorCode::Unavailable,
+                "metadata heads exceed bounded favorite merge",
             ));
         }
         let mut parents = heads
@@ -483,11 +497,19 @@ impl FavoriteSynchronizer<'_> {
             doc = adapter.inspect(&serde_json::to_vec(&value)?)?;
         }
         let bytes = adapter.with_favorite(&doc, wanted)?;
+        let key = Digest::of(
+            serde_json::to_vec(&("favorite-derive-v1", sidecar, &parents, Digest::of(&bytes)))?
+                .as_slice(),
+        );
+        let hash = blake3::hash(key.as_str().as_bytes());
+        let mut id = [0; 16];
+        id.copy_from_slice(&hash.as_bytes()[..16]);
+        let operation = OperationId(uuid::Uuid::from_bytes(id));
         Ok(Some(VersionStore::new(self.catalog, root).record(
             SnapshotIntent {
                 sidecar,
                 parents,
-                operation: OperationId::new(),
+                operation,
                 payload: SnapshotPayload::Content(bytes),
                 origin: VersionOrigin::Derived,
             },
@@ -586,7 +608,14 @@ impl FavoriteSynchronizer<'_> {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            if authority.is_some_and(|a| a != (intent.server.clone(), intent.asset.to_string())) {
+            let count: u64 = self.catalog.db.query_row(
+                "SELECT count(*) FROM mappings WHERE server=? AND group_id=? AND stale=0",
+                params![intent.server, intent.group.to_string()],
+                |r| r.get(0),
+            )?;
+            if (count > 1 && authority.is_none())
+                || authority.is_some_and(|a| a != (intent.server.clone(), intent.asset.to_string()))
+            {
                 return Ok(waiting("favorite authority changed"));
             }
             if !self.client.outbound_enabled() {

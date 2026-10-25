@@ -321,3 +321,370 @@ fn favorite_agreement_journals_conflict_resolution_independently_of_stars() {
     assert!(f.c.conflict(conflict).unwrap().resolved);
     assert!(!f.c.conflict(star).unwrap().resolved);
 }
+fn start_service(
+    f: Fixture,
+    archive: bool,
+) -> (
+    support::service::ServiceFixture,
+    support::http::RatingServer,
+) {
+    use photo_sorter::config::*;
+    use std::process::{Command, Stdio};
+    *f.server.state.rating.lock().unwrap() = Some(3);
+    let v =
+        f.c.version(f.c.local_head(f.sidecar).unwrap().unwrap())
+            .unwrap();
+    let VersionBody::Content { digest, size } = v.body else {
+        panic!()
+    };
+    let bytes = RootHandle::open(&f.r.state, RootPolicy::Local)
+        .unwrap()
+        .read(&snapshot_path(&digest).unwrap(), size)
+        .unwrap();
+    std::fs::create_dir_all(f.r.local.join("RAW")).unwrap();
+    std::fs::write(f.r.local.join("RAW/a.ORF.rrdata"), bytes).unwrap();
+    let Fixture {
+        r,
+        server,
+        c,
+        client: _,
+        group,
+        sidecar: _,
+    } = f;
+    let key = r.state.join("key");
+    let report = qualify_immich(ImmichProbeRequest {
+        origin: server.origin.clone(),
+        key_file: key.clone(),
+        asset: server.asset,
+        isolated_asset_confirmed: true,
+        fixture: true,
+        favorites: true,
+    })
+    .unwrap();
+    let evidence = r._temp.path().join("favorite-evidence.json");
+    std::fs::write(&evidence, serde_json::to_vec(&report).unwrap()).unwrap();
+    std::fs::set_permissions(&evidence, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut config = Config::new(r.local.clone(), r.state.clone(), r.archive.clone());
+    config.local_test_backend = true;
+    config.poll_seconds = 1;
+    config.debounce_seconds = 1;
+    if archive {
+        use photo_sorter::archive::*;
+        let archive = ArchiveId::new();
+        config.archive_id = Some(archive);
+        let root = RootHandle::open(&r.archive, RootPolicy::TestArchive).unwrap();
+        ArchiveStore::initialize(
+            &root,
+            InitArchive {
+                archive_id: archive,
+                writer_id: config.writer_id,
+            },
+        )
+        .unwrap();
+        let store =
+            ArchiveStore::open(root.try_clone().unwrap(), archive, config.writer_id).unwrap();
+        let mut records = vec![ArchiveRecord::GroupCreated { id: group }];
+        let mut staged = vec![];
+        for (index, member) in c.group(group).unwrap().members.into_iter().enumerate() {
+            let path =
+                ArchivePath::parse(&format!(".photo-sorter/staging/fixture-{index}")).unwrap();
+            root.write_new(&path, b"fixture").unwrap();
+            records.push(ArchiveRecord::MemberAttached {
+                group,
+                member: member.clone(),
+                evidence: PairEvidence::UserSelected {
+                    reason: "generated fixture archive".into(),
+                },
+            });
+            staged.push(StagedMember {
+                member,
+                staged: path,
+            });
+        }
+        let commit = CommitEnvelope::new(archive, config.writer_id, 1, vec![], records).unwrap();
+        let mut guard = store.acquire_publication().unwrap();
+        let batch = store.journal_batch(&mut guard, 128).unwrap();
+        store.ack_journal(&mut guard, batch.token).unwrap();
+        store
+            .publish_originals(
+                &mut guard,
+                PublicationPlan {
+                    commit,
+                    staged,
+                    attempt: OperationId::new(),
+                },
+                &NoFaults,
+            )
+            .unwrap();
+        store.release(guard).unwrap();
+    }
+    drop(c);
+    config.immich = Some(ImmichConfig {
+        origin: server.origin.to_string(),
+        key_file: key,
+        library_id: None,
+        write_mode: "best_effort".into(),
+    });
+    config.capability_evidence = vec![evidence];
+    let profile = r._temp.path().join("profile.toml");
+    std::fs::write(&profile, toml::to_string(&config).unwrap()).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_photo_sorter"))
+        .arg("--config")
+        .arg(&profile)
+        .args(["service", "run"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut service = support::service::ServiceFixture { r, profile, child };
+    let deadline = std::time::Instant::now();
+    while !service.cli(&["service", "status"]).status.success() {
+        assert!(service.child.try_wait().unwrap().is_none());
+        assert!(deadline.elapsed() < std::time::Duration::from_secs(5));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    (service, server)
+}
+#[test]
+fn actual_service_sends_favorite_and_keeps_stars_untouched() {
+    use std::time::{Duration, Instant};
+    let mut f = Fixture::new();
+    f.save(serde_json::Value::Null);
+    f.poll();
+    f.save(serde_json::json!("pick"));
+    f.poll();
+    f.c.prepare_rating_write(
+        f.group,
+        f.server.asset,
+        RatingObservation::Stars(Rating::try_from(3).unwrap()),
+        Rating::try_from(4).unwrap(),
+        OperationId::new(),
+        &f.server.origin,
+    )
+    .unwrap();
+    let (service, server) = start_service(f, false);
+    let start = Instant::now();
+    while *server.state.favorite.lock().unwrap() != Some(true) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "favorite service worker did not send: {:?}",
+            service.status()
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert!(server.state.writes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn actual_cli_refresh_applies_incoming_favorite_and_preserves_edits() {
+    use std::time::{Duration, Instant};
+    let mut f = Fixture::new();
+    f.save(serde_json::Value::Null);
+    f.poll();
+    *f.server.state.favorite.lock().unwrap() = Some(true);
+    f.poll();
+    let group = f.group.to_string();
+    let incoming = f.c.favorite_pending_version(f.group).unwrap().unwrap();
+    let (service, _server) = start_service(f, true);
+    let init = service.cli(&["archive", "init"]);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stdout)
+    );
+    let start = Instant::now();
+    loop {
+        let db = rusqlite::Connection::open(service.r.state.join("catalog.sqlite")).unwrap();
+        let ready: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM projections WHERE json_extract(committed,'$.version')=? AND pending=1)",
+                [incoming.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(db);
+        if ready {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "incoming favorite was not published: {:?}",
+            service.status()
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let path = service.r.local.join("RAW/a.ORF.rrdata");
+    let before: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(before["flag"].is_null());
+    assert!(!service.r.local.join("RAW/a.ORF").exists());
+    let pinned = service.cli(&["pin", &group]);
+    let pin: serde_json::Value = serde_json::from_slice(&pinned.stdout).unwrap();
+    assert_eq!(pin["outcome"]["job"]["state"], "WaitingApplication");
+    assert_eq!(pin["outcome"]["detail"]["originals_ready"], true);
+    let refreshed = service.cli(&["refresh", &group, "--editor-closed"]);
+    assert!(
+        refreshed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refreshed.stdout)
+    );
+    let after: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(after["flag"], "pick");
+    assert_eq!(after["rating"], 3);
+    assert_eq!(after["adjustments"], before["adjustments"]);
+    assert_eq!(after["future"], 42);
+    assert_eq!(
+        std::fs::read(service.r.local.join("RAW/a.ORF")).unwrap(),
+        b"fixture"
+    );
+}
+#[test]
+fn reject_does_not_bypass_an_unrelated_identity_conflict() {
+    let mut f = Fixture::new();
+    f.save(serde_json::json!("reject"));
+    *f.server.state.favorite.lock().unwrap() = Some(true);
+    f.poll();
+    f.c.record_rating_conflict(
+        f.group,
+        "mapping_identity",
+        serde_json::json!({"reason":"changed identity"}),
+    )
+    .unwrap();
+    assert!(f.advance().waiting);
+    assert_eq!(*f.server.state.favorite.lock().unwrap(), Some(true));
+}
+#[test]
+fn stale_jpeg_binding_blocks_favorite_write() {
+    let mut f = Fixture::new();
+    f.save(serde_json::Value::Null);
+    f.poll();
+    f.save(serde_json::json!("pick"));
+    f.poll();
+    *f.server.state.checksum.lock().unwrap() = "different".into();
+    assert!(f.advance().waiting);
+    assert_eq!(*f.server.state.favorite.lock().unwrap(), Some(false));
+}
+#[test]
+fn incoming_clear_and_reject_while_remote_clear_is_pending_preserve_history() {
+    let mut f = Fixture::new();
+    f.save(serde_json::json!("pick"));
+    *f.server.state.favorite.lock().unwrap() = Some(true);
+    f.poll();
+    *f.server.state.favorite.lock().unwrap() = Some(false);
+    f.poll();
+    let clear = f.c.favorite_pending_version(f.group).unwrap().unwrap();
+    assert!(f.pending()["flag"].is_null());
+    f.save(serde_json::json!("reject"));
+    assert_eq!(f.poll().conflicts, 0);
+    let reject = f.c.favorite_pending_version(f.group).unwrap().unwrap();
+    assert!(f.c.is_ancestor(clear, reject).unwrap());
+    assert_eq!(f.pending()["flag"], "reject");
+    assert!(f.c.next_favorite_intent(0).unwrap().is_none());
+}
+#[test]
+fn changed_incoming_flag_replaces_staged_pick_without_live_echo() {
+    let mut f = Fixture::new();
+    f.save(serde_json::Value::Null);
+    f.poll();
+    *f.server.state.favorite.lock().unwrap() = Some(true);
+    f.poll();
+    let picked = f.c.favorite_pending_version(f.group).unwrap().unwrap();
+    *f.server.state.favorite.lock().unwrap() = Some(false);
+    assert_eq!(f.poll().conflicts, 0);
+    let cleared = f.c.favorite_pending_version(f.group).unwrap().unwrap();
+    assert_ne!(picked, cleared);
+    assert!(f.c.is_ancestor(picked, cleared).unwrap());
+    assert!(f.pending()["flag"].is_null());
+    assert!(f.c.next_favorite_intent(0).unwrap().is_none());
+}
+#[test]
+fn reject_after_pick_publication_settles_without_sidecar_or_favorite_conflict() {
+    use std::time::{Duration, Instant};
+    let mut f = Fixture::new();
+    f.save(serde_json::Value::Null);
+    f.poll();
+    *f.server.state.favorite.lock().unwrap() = Some(true);
+    f.poll();
+    let incoming = f.c.favorite_pending_version(f.group).unwrap().unwrap();
+    let sidecar = f.sidecar.to_string();
+    let (service, server) = start_service(f, true);
+    let start = Instant::now();
+    loop {
+        let db = rusqlite::Connection::open(service.r.state.join("catalog.sqlite")).unwrap();
+        let ready: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM heads WHERE version=?)",
+                [incoming.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(db);
+        if ready {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "incoming publication timed out"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let path = service.r.local.join("RAW/a.ORF.rrdata");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    doc["flag"] = "reject".into();
+    std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    let start = Instant::now();
+    loop {
+        let db = rusqlite::Connection::open(service.r.state.join("catalog.sqlite")).unwrap();
+        let heads: u64 = db
+            .query_row(
+                "SELECT count(*) FROM heads WHERE sidecar=?",
+                [&sidecar],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let conflicts: u64 = db
+            .query_row(
+                "SELECT count(*) FROM conflicts WHERE resolved=0 AND kind IN('favorite','sidecar')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(db);
+        if *server.state.favorite.lock().unwrap() == Some(false) && heads == 1 && conflicts == 0 {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "Reject failed to settle: {}",
+            {
+                let db =
+                    rusqlite::Connection::open(service.r.state.join("catalog.sqlite")).unwrap();
+                let baseline: String = db
+                    .query_row(
+                        "SELECT group_concat(body) FROM favorite_baselines",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let versions:String=db.query_row("SELECT json_group_array(json_object('id',id,'origin',origin,'parents',(SELECT json_group_array(parent) FROM version_parents WHERE version=v.id))) FROM versions v",[],|r|r.get(0)).unwrap();
+                format!("baseline={baseline} versions={versions}")
+            }
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved["flag"], "reject");
+}
+#[test]
+fn added_jpeg_authority_ambiguity_blocks_an_existing_favorite_intent() {
+    let mut f = Fixture::new();
+    f.save(serde_json::Value::Null);
+    f.poll();
+    f.save(serde_json::json!("pick"));
+    f.poll();
+    let mut second = f.client.asset(f.server.asset).unwrap();
+    second.id = uuid::Uuid::new_v4();
+    f.c.bind_asset(&f.server.origin, &second, f.group).unwrap();
+    assert!(f.advance().waiting);
+    assert_eq!(*f.server.state.favorite.lock().unwrap(), Some(false));
+}

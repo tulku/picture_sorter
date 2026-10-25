@@ -198,6 +198,20 @@ impl CapabilityRegistry {
                 || report.tested_version != version
                 || report.config_fingerprint != fingerprint
                 || report.results.is_empty()
+                || (favorite
+                    && ![
+                        "supported_schema",
+                        "favorite_true",
+                        "favorite_false",
+                        "restore_original",
+                    ]
+                    .iter()
+                    .all(|name| {
+                        report
+                            .results
+                            .iter()
+                            .any(|p| p.name == *name && matches!(p.outcome, ProbeOutcome::Pass))
+                    }))
                 || !report
                     .results
                     .iter()

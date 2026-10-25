@@ -351,7 +351,7 @@ impl ObservationDriver {
                 self.status.startup_complete = true;
                 return Ok(());
             }
-            return self.advance(engine, local, state, clock, false, false);
+            return Ok(());
         } else if self.events_due {
             self.events_due = false;
             (NasCommand::LocalEvents, Phase::Events)

@@ -163,3 +163,17 @@ fn unsupported_flag_is_never_coerced_to_neutral() {
         assert!(a.with_favorite(&doc, false).is_err());
     }
 }
+#[test]
+fn released_167_ordinary_folder_flag_schema_has_an_exact_source_profile() {
+    let a = RapidRawAdapter::for_version("1.6.7").unwrap();
+    assert_eq!(
+        a.source_revision,
+        "a4f2cf5cb867fa1def9f6d5ca2a16654b56fb8a8"
+    );
+    let base = a
+        .inspect(include_bytes!("fixtures/rapidraw/edited.json"))
+        .unwrap();
+    let picked = a.inspect(&a.with_favorite(&base, true).unwrap()).unwrap();
+    assert_eq!(picked.flag, PickFlag::Pick);
+    assert_eq!(picked.non_flag(), base.non_flag());
+}

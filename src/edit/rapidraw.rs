@@ -52,6 +52,7 @@ pub struct RapidRawAdapter {
 impl RapidRawAdapter {
     pub fn for_version(version: &str) -> AppResult<Self> {
         let source_revision = match version {
+            "1.6.7" => "a4f2cf5cb867fa1def9f6d5ca2a16654b56fb8a8",
             "1.6.6" => "52138689a9c9aea400e37a30c902154b47db3799",
             "872804e8a21d4dff707f31fc9dcf5d3128ca663b" => {
                 "872804e8a21d4dff707f31fc9dcf5d3128ca663b"

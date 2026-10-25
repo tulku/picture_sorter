@@ -281,6 +281,10 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         reader: super::archive_reader::ArchiveReader::default(),
         http_reason,
         rating_cursor: None,
+        favorite_cursor: None,
+        favorite_intent_cursor: 0,
+        favorite_active_intent: None,
+        favorite_turn: false,
         rating_intent_cursor: 0,
         rating_active_intent: None,
         merge_cursor: None,
@@ -463,6 +467,10 @@ struct Runtime {
     http: Option<super::http::AsyncImmich>,
     http_reason: Option<String>,
     rating_cursor: Option<Option<uuid::Uuid>>,
+    favorite_cursor: Option<Option<uuid::Uuid>>,
+    favorite_intent_cursor: i64,
+    favorite_active_intent: Option<(i64, OperationId)>,
+    favorite_turn: bool,
     rating_intent_cursor: i64,
     rating_active_intent: Option<(i64, RatingIntentId)>,
     merge_cursor: Option<SidecarId>,
@@ -1130,6 +1138,7 @@ impl Runtime {
         let timing = self.scheduler.tick(clock.now())?;
         if timing.poll_ratings {
             self.rating_cursor = Some(None);
+            self.favorite_cursor = Some(None);
         }
         if timing.poll_ratings {
             self.reader.requested = true;
@@ -1439,11 +1448,47 @@ impl Runtime {
                 .editor_identity
                 .as_ref()
                 .is_some_and(|identity| identity.decision(&self.engine.config).allowed);
+        let favorite_allowed = self.engine.config.local_test_backend
+            || self
+                .editor_identity
+                .as_ref()
+                .is_some_and(|identity| identity.pick_decision(&self.engine.config).allowed);
         if let Some(http) = &self.http {
-            if let Some(after) = self
-                .rating_cursor
-                .filter(|_| editor_allowed && self.rating_active_intent.is_none())
-            {
+            if let Some(after) = self.favorite_cursor.filter(|_| {
+                favorite_allowed
+                    && self.favorite_active_intent.is_none()
+                    && self.rating_active_intent.is_none()
+            }) {
+                let scope = crate::immich::RatingScope {
+                    state_root: self.engine.config.state_root.clone(),
+                    editor_version: self.engine.config.rapidraw_version.clone(),
+                    after,
+                    limit: 1,
+                };
+                match (crate::immich::FavoriteSynchronizer {
+                    catalog: &mut self.engine.catalog,
+                    client: http,
+                })
+                .poll(scope)
+                {
+                    Ok(report) => {
+                        if !report.retry && (report.observed > 0 || !http.in_flight()) {
+                            self.favorite_cursor = report.next.map(Some);
+                        }
+                    }
+                    Err(error) => {
+                        self.http_reason = Some(error.to_string());
+                        if error.code != ErrorCode::Capacity {
+                            self.favorite_cursor = None;
+                        }
+                    }
+                }
+            }
+            if let Some(after) = self.rating_cursor.filter(|_| {
+                editor_allowed
+                    && self.rating_active_intent.is_none()
+                    && self.favorite_active_intent.is_none()
+            }) {
                 let config = &self.engine.config;
                 let scope = crate::immich::RatingScope {
                     state_root: config.state_root.clone(),
@@ -1468,11 +1513,51 @@ impl Runtime {
                     }
                 }
             }
-            if self.rating_active_intent.is_none() && !http.in_flight() {
-                self.rating_active_intent = super::rating_queue::next_intent(
-                    &self.engine.catalog,
-                    self.rating_intent_cursor,
-                )?;
+            if self.rating_active_intent.is_none()
+                && self.favorite_active_intent.is_none()
+                && !http.in_flight()
+            {
+                self.favorite_turn = !self.favorite_turn;
+                if self.favorite_turn && favorite_allowed {
+                    self.favorite_active_intent = self
+                        .engine
+                        .catalog
+                        .next_favorite_intent(self.favorite_intent_cursor)?;
+                }
+                if self.favorite_active_intent.is_none() {
+                    self.rating_active_intent = super::rating_queue::next_intent(
+                        &self.engine.catalog,
+                        self.rating_intent_cursor,
+                    )?;
+                }
+                if self.rating_active_intent.is_none()
+                    && self.favorite_active_intent.is_none()
+                    && favorite_allowed
+                {
+                    self.favorite_active_intent = self
+                        .engine
+                        .catalog
+                        .next_favorite_intent(self.favorite_intent_cursor)?;
+                }
+            }
+            if let Some((row, id)) = self.favorite_active_intent {
+                match (crate::immich::FavoriteSynchronizer {
+                    catalog: &mut self.engine.catalog,
+                    client: http,
+                })
+                .advance(id)
+                {
+                    Ok(report) => {
+                        if let Some(reason) = report.reason {
+                            self.http_reason = Some(reason);
+                        }
+                    }
+                    Err(error) => self.http_reason = Some(error.to_string()),
+                }
+                if !http.in_flight() {
+                    self.favorite_intent_cursor = row;
+                    self.favorite_active_intent = None;
+                }
             }
             if let Some((row, id)) = self.rating_active_intent {
                 match (crate::immich::RatingSynchronizer {
@@ -1761,6 +1846,7 @@ impl Runtime {
                                 JobTransition::Start,
                             )?;
                             self.rating_cursor = Some(None);
+                            self.favorite_cursor = Some(None);
                         }
                         Err(error) => {
                             return self.wait(job, JobState::WaitingImmich, error.to_string());

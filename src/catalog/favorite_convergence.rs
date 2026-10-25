@@ -45,7 +45,7 @@ impl Catalog {
         if rows.len() > 128 {
             return Err(AppError::new(
                 ErrorCode::Unavailable,
-                "rating conflict witnesses exceed bounded convergence batch",
+                "favorite conflict witnesses exceed bounded convergence batch",
             ));
         }
         rows.into_iter()
@@ -88,6 +88,31 @@ impl Catalog {
         if validate(&self.db, &convergence, false).is_err() {
             return Ok(());
         }
+        let key = format!(
+            "favorite-converge:{}",
+            Digest::of(
+                encode(&(
+                    &convergence.group,
+                    &convergence.server,
+                    convergence.asset,
+                    convergence.local_version,
+                    convergence.favorite,
+                    &convergence.conflicts
+                ))?
+                .as_bytes()
+            )
+        );
+        let old: Option<String> = self
+            .db
+            .query_row(
+                "SELECT operation FROM rating_operations WHERE key=?",
+                [&key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if old.is_some() {
+            return Ok(());
+        }
         let records = vec![
             ArchiveRecord::FavoriteObserved {
                 operation,
@@ -99,7 +124,13 @@ impl Catalog {
                 evidence: convergence,
             },
         ];
-        self.db.execute("INSERT INTO pending_shared_records(operation,records) VALUES(?,?) ON CONFLICT DO NOTHING",params![operation.to_string(),encode(&records)?])?;
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "INSERT INTO rating_operations(key,operation) VALUES(?,?)",
+            params![key, operation.to_string()],
+        )?;
+        tx.execute("INSERT INTO pending_shared_records(operation,records) VALUES(?,?) ON CONFLICT DO NOTHING",params![operation.to_string(),encode(&records)?])?;
+        tx.commit()?;
         Ok(())
     }
     pub fn validate_favorite_convergence(&self, evidence: &FavoriteConvergence) -> AppResult<()> {
@@ -119,7 +150,7 @@ fn validate(db: &Connection, c: &FavoriteConvergence, require_observation: bool)
     if !binding || (!require_observation && uncertain) || !current {
         return Err(AppError::new(
             ErrorCode::Conflict,
-            "rating convergence identity, immutable save or uncertainty changed",
+            "favorite convergence identity, immutable save or uncertainty changed",
         ));
     }
     if require_observation {

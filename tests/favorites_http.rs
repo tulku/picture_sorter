@@ -105,3 +105,20 @@ fn star_only_report_does_not_qualify_favorite_writes() {
     );
     assert!(c.set_favorite(request(&s, false, true)).is_err());
 }
+#[test]
+fn incomplete_favorite_evidence_cannot_enable_writes() {
+    let r = support::TestRig::new();
+    let s = support::http::RatingServer::new();
+    let mut report = evidence(&r, &s);
+    report.results.retain(|p| p.name == "supported_schema");
+    let registry = CapabilityRegistry::new(vec![report]);
+    assert!(
+        !registry
+            .allows(OperationKind::FavoriteWrite {
+                origin: &s.origin,
+                asset: s.asset,
+                version: TESTED_VERSION
+            })
+            .allowed
+    );
+}

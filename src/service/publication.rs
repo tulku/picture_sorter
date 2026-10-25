@@ -498,10 +498,20 @@ fn prepare(engine: &mut ImportCoordinator, candidate: &Candidate) -> AppResult<V
             )?;
             records = serde_json::from_str(&text)?;
             for record in records.clone() {
-                if let ArchiveRecord::RatingConverged { evidence } = &record {
-                    engine.catalog.validate_rating_convergence(evidence)?;
+                let convergence = match &record {
+                    ArchiveRecord::RatingConverged { evidence } => {
+                        engine.catalog.validate_rating_convergence(evidence)?;
+                        Some(&evidence.conflicts)
+                    }
+                    ArchiveRecord::FavoriteConverged { evidence } => {
+                        engine.catalog.validate_favorite_convergence(evidence)?;
+                        Some(&evidence.conflicts)
+                    }
+                    _ => None,
+                };
+                if let Some(conflicts) = convergence {
                     let mut prefix = Vec::new();
-                    for (id, _) in &evidence.conflicts {
+                    for (id, _) in conflicts {
                         let shared: bool = engine.catalog.db.query_row(
                             "SELECT EXISTS(SELECT 1 FROM published_conflicts WHERE id=?)",
                             [id.to_string()],
@@ -641,7 +651,14 @@ fn prepare(engine: &mut ImportCoordinator, candidate: &Candidate) -> AppResult<V
                     expected: expected.clone(),
                     heads: heads.clone(),
                 });
-                if is_derived && heads == vec![version.id] {
+                let favorite_merge: bool = engine.catalog.db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM favorite_baselines WHERE pending_version=?)",
+                    [version.id.to_string()],
+                    |r| r.get(0),
+                )?;
+                if (is_derived || (favorite_merge && version.origin == VersionOrigin::Derived))
+                    && heads == vec![version.id]
+                {
                     let mut query=engine.catalog.db.prepare("SELECT id,revision,details FROM conflicts WHERE kind='sidecar' AND resolved=0 ORDER BY id LIMIT 128")?;
                     for row in query.query_map([], |r| {
                         Ok((

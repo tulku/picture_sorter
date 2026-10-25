@@ -11,7 +11,7 @@ cargo build --release --bins
 cargo test --all-targets
 ```
 
-Start with [migration](docs/migration.md), then [usage and installation](docs/usage.md). Read [recovery](docs/recovery.md) before replacing a catalog or recovering a publication lock. [Compatibility and executable qualification](docs/compatibility.md) distinguishes fixture evidence from deployment qualification. Production archive writes and outgoing ratings require explicit matching evidence; no personal archive, editor or Immich instance is qualified by the automated tests.
+Start with [migration](docs/migration.md), then [usage and installation](docs/usage.md). Read [recovery](docs/recovery.md) before replacing a catalog or recovering a publication lock. [Compatibility and executable qualification](docs/compatibility.md) distinguishes fixture evidence from deployment qualification. Production archive writes, outgoing ratings and Favorite/Pick synchronization require explicit matching evidence; no personal archive, editor or Immich instance is qualified by the automated tests.
 
 The optional integrations use source-backed RapidRAW profiles and the pinned Immich 3.3.5 API. Unknown editor formats remain opaque preserved content. GIMP projects and native Immich edits are outside the initial semantic synchronization scope. Immich rating writes require explicit best-effort mode because the API has no compare-and-set.
 

@@ -15,16 +15,19 @@ enum Key {
     Asset(uuid::Uuid),
     Server,
     Write(uuid::Uuid),
+    Favorite(uuid::Uuid),
 }
 enum Task {
     Asset(uuid::Uuid),
     Server,
     Write(RatingWrite),
+    Favorite(FavoriteWrite),
 }
 enum Reply {
     Asset(uuid::Uuid, AppResult<AssetInfo>),
     Server(AppResult<ServerInfo>),
     Write(uuid::Uuid, AppResult<WriteOutcome>),
+    Favorite(uuid::Uuid, AppResult<FavoriteOutcome>),
 }
 struct Inner {
     send: SyncSender<Task>,
@@ -33,6 +36,7 @@ struct Inner {
     assets: HashMap<uuid::Uuid, (Instant, AppResult<AssetInfo>)>,
     server: Option<(Instant, AppResult<ServerInfo>)>,
     writes: HashMap<uuid::Uuid, AppResult<WriteOutcome>>,
+    favorites: HashMap<uuid::Uuid, AppResult<FavoriteOutcome>>,
 }
 pub(crate) struct AsyncImmich {
     origin: url::Url,
@@ -94,6 +98,17 @@ impl AsyncImmich {
                     Task::Server => Reply::Server(
                         configured.and_then(|_| client.as_ref().unwrap().server_info()),
                     ),
+                    Task::Favorite(write) => {
+                        if let Some(client) = client.as_mut() {
+                            client.update_rating_registry(
+                                load_registry(&worker_config).unwrap_or_default(),
+                            );
+                        }
+                        Reply::Favorite(
+                            write.asset,
+                            configured.and_then(|_| client.as_ref().unwrap().set_favorite(write)),
+                        )
+                    }
                     Task::Write(write) => {
                         if let Some(client) = client.as_mut() {
                             client.update_rating_registry(
@@ -122,6 +137,7 @@ impl AsyncImmich {
                 assets: HashMap::new(),
                 server: None,
                 writes: HashMap::new(),
+                favorites: HashMap::new(),
             }),
         }))
     }
@@ -141,6 +157,10 @@ impl AsyncImmich {
                             }
                         }
                         Reply::Server(result) => inner.server = Some((Instant::now(), result)),
+                        Reply::Favorite(asset, result) => {
+                            inner.assets.remove(&asset);
+                            inner.favorites.insert(asset, result);
+                        }
                         Reply::Write(asset, result) => {
                             inner.assets.remove(&asset);
                             inner.writes.insert(asset, result);
@@ -208,7 +228,8 @@ impl ImmichAccess for AsyncImmich {
     }
     fn asset(&self, asset: uuid::Uuid) -> AppResult<AssetInfo> {
         self.pump()?;
-        if self.inner.borrow().active == Some(Key::Write(asset)) {
+        if matches!(self.inner.borrow().active, Some(Key::Write(id) | Key::Favorite(id)) if id == asset)
+        {
             return Err(pending());
         }
         if let Some((at, result)) = self.inner.borrow().assets.get(&asset)
@@ -221,6 +242,23 @@ impl ImmichAccess for AsyncImmich {
     }
     fn outbound_enabled(&self) -> bool {
         self.mode != RatingWriteMode::Disabled
+    }
+    fn set_favorite(&self, write: FavoriteWrite) -> AppResult<FavoriteOutcome> {
+        let info = self.server_info()?;
+        let decision =
+            load_registry(&self.config)
+                .unwrap_or_default()
+                .allows(OperationKind::FavoriteWrite {
+                    origin: &self.origin,
+                    asset: write.asset,
+                    version: &info.version,
+                });
+        if !decision.allowed || self.mode != RatingWriteMode::BestEffort {
+            return Err(AppError::new(ErrorCode::Unsupported, decision.reason));
+        }
+        self.inner.borrow_mut().assets.remove(&write.asset);
+        self.queue(Key::Favorite(write.asset), Task::Favorite(write))?;
+        Ok(FavoriteOutcome::Uncertain)
     }
     fn set_rating(&self, write: RatingWrite) -> AppResult<WriteOutcome> {
         let info = self.server_info()?;
@@ -251,6 +289,20 @@ impl ImmichAccess for AsyncImmich {
             WriteProgress::Pending
         } else {
             WriteProgress::None
+        }
+    }
+    fn favorite_progress(&self, asset: uuid::Uuid) -> FavoriteProgress {
+        if let Err(error) = self.pump() {
+            return FavoriteProgress::Finished(Err(error));
+        }
+        let mut inner = self.inner.borrow_mut();
+        if let Some(result) = inner.favorites.remove(&asset) {
+            return FavoriteProgress::Finished(result);
+        }
+        if inner.active == Some(Key::Favorite(asset)) {
+            FavoriteProgress::Pending
+        } else {
+            FavoriteProgress::None
         }
     }
 }
