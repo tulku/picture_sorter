@@ -1,7 +1,16 @@
 use clap::Parser;
 #[derive(Parser)]
 #[command(version, about = "Offline photo archive manager")]
-struct Cli {}
+struct Cli {
+    #[arg(long, hide = true)]
+    nas_worker: bool,
+}
 fn main() {
-    Cli::parse();
+    let cli = Cli::parse();
+    if cli.nas_worker {
+        if let Err(error) = photo_sorter::transfer::run_worker() {
+            eprintln!("{error}");
+            std::process::exit(5);
+        }
+    }
 }

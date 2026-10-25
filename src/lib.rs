@@ -9,3 +9,4 @@ pub mod import;
 pub mod plan;
 pub mod sidecar;
 pub mod storage;
+pub mod transfer;
