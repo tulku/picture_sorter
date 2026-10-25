@@ -33,40 +33,25 @@ impl JournalCursor {
         })
     }
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommitDescriptor {
-    pub id: CommitId,
-    pub writer: WriterId,
-    pub sequence: u64,
-    pub path: ArchivePath,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JournalBatch {
-    pub token: OperationId,
-    pub entries: Vec<CommitDescriptor>,
-    pub end: bool,
-}
-impl ArchiveStore {
-    pub fn journal_batch(
-        &self,
-        guard: &mut PublicationGuard,
+impl JournalCursor {
+    fn next(
+        &mut self,
+        root: &crate::fs::RootHandle,
         limit: usize,
-    ) -> AppResult<JournalBatch> {
-        self.validate_guard(guard)?;
-        if guard.pending.is_some() || limit == 0 || limit > 128 {
-            return Err(AppError::invalid(
-                "acknowledge previous batch; limit must be 1..128",
-            ));
+    ) -> AppResult<(Vec<CommitDescriptor>, bool)> {
+        if limit == 0 || limit > 128 {
+            return Err(AppError::invalid("journal page must be 1..128"));
         }
+        let mut end = false;
         let mut entries = Vec::new();
         while entries.len() < limit {
-            let Some(cursor) = guard.cursor.stack.last_mut() else {
-                guard.end = true;
+            let Some(cursor) = self.stack.last_mut() else {
+                end = true;
                 break;
             };
             let prefix = cursor.prefix.clone();
             let Some(entry) = cursor.entries.next() else {
-                guard.cursor.stack.pop();
+                self.stack.pop();
                 continue;
             };
             let entry = entry?;
@@ -80,11 +65,9 @@ impl ArchiveStore {
                 if prefix != ".photo-sorter/commits" || uuid::Uuid::parse_str(name).is_err() {
                     return Err(AppError::integrity("unexpected journal directory"));
                 }
-                let dir =
-                    self.root
-                        .open_relative(&relative, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+                let dir = root.open_relative(&relative, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
                 let entries = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))?;
-                guard.cursor.stack.push(Cursor {
+                self.stack.push(Cursor {
                     _dir: dir,
                     entries,
                     prefix: relative.as_str().into(),
@@ -116,6 +99,36 @@ impl ArchiveStore {
                 path: relative,
             });
         }
+        Ok((entries, end))
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitDescriptor {
+    pub id: CommitId,
+    pub writer: WriterId,
+    pub sequence: u64,
+    pub path: ArchivePath,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JournalBatch {
+    pub token: OperationId,
+    pub entries: Vec<CommitDescriptor>,
+    pub end: bool,
+}
+impl ArchiveStore {
+    pub fn journal_batch(
+        &self,
+        guard: &mut PublicationGuard,
+        limit: usize,
+    ) -> AppResult<JournalBatch> {
+        self.validate_guard(guard)?;
+        if guard.pending.is_some() || limit == 0 || limit > 128 {
+            return Err(AppError::invalid(
+                "acknowledge previous batch; limit must be 1..128",
+            ));
+        }
+        let (entries, end) = guard.cursor.next(&self.root, limit)?;
+        guard.end = end;
         let token = OperationId::new();
         guard.pending = Some(token);
         Ok(JournalBatch {
@@ -139,6 +152,10 @@ impl ArchiveStore {
         relative: &ArchivePath,
     ) -> AppResult<CommitEnvelope> {
         self.validate_guard(guard)?;
+        self.read_commit_readonly(relative)
+    }
+    pub fn read_commit_readonly(&self, relative: &ArchivePath) -> AppResult<CommitEnvelope> {
+        self.validate()?;
         if !relative.as_str().starts_with(".photo-sorter/commits/") {
             return Err(AppError::invalid("not a journal path"));
         }
@@ -192,5 +209,36 @@ impl ArchiveStore {
             }
         }
         Ok(commit)
+    }
+}
+
+pub struct ReadOnlyJournal {
+    pub id: OperationId,
+    store: ArchiveStore,
+    cursor: JournalCursor,
+}
+impl ArchiveStore {
+    pub fn read_only_journal(&self) -> AppResult<ReadOnlyJournal> {
+        let store = Self::open(self.root.try_clone()?, self.marker.archive_id, self.writer)?;
+        let cursor = JournalCursor::open(&store.root)?;
+        Ok(ReadOnlyJournal {
+            id: OperationId::new(),
+            store,
+            cursor,
+        })
+    }
+}
+impl ReadOnlyJournal {
+    pub fn next_batch(&mut self, limit: usize) -> AppResult<JournalBatch> {
+        self.store.validate()?;
+        let (entries, end) = self.cursor.next(&self.store.root, limit)?;
+        Ok(JournalBatch {
+            token: OperationId::new(),
+            entries,
+            end,
+        })
+    }
+    pub fn read(&self, path: &ArchivePath) -> AppResult<CommitEnvelope> {
+        self.store.read_commit_readonly(path)
     }
 }

@@ -148,7 +148,7 @@ impl Catalog {
         heads(&self.db, sidecar)
     }
 }
-fn heads(db: &Connection, sidecar: SidecarId) -> AppResult<Vec<VersionId>> {
+pub(crate) fn heads(db: &Connection, sidecar: SidecarId) -> AppResult<Vec<VersionId>> {
     let mut q = db.prepare("SELECT version FROM heads WHERE sidecar=? ORDER BY version")?;
     q.query_map([sidecar.to_string()], |r| r.get::<_, String>(0))?
         .map(|s| decode(format!("\"{}\"", s?)))
@@ -156,6 +156,51 @@ fn heads(db: &Connection, sidecar: SidecarId) -> AppResult<Vec<VersionId>> {
 }
 fn apply_record(db: &Connection, archive: &str, record: ArchiveRecord) -> AppResult<()> {
     match record {
+        ArchiveRecord::AmbiguityRecorded {
+            id,
+            kind,
+            group,
+            details,
+        } => {
+            let group = group
+                .map(|g| super::identity::canonical(db, g))
+                .transpose()?;
+            let previous: Option<(String, Option<String>, String)> = db
+                .query_row(
+                    "SELECT kind,group_id,details FROM conflicts WHERE id=?",
+                    [id.to_string()],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let expected = (
+                kind.clone(),
+                group.map(|g| g.to_string()),
+                encode(&details)?,
+            );
+            if previous.as_ref().is_some_and(|p| p != &expected) {
+                return Err(AppError::integrity(
+                    "ambiguity ID reused with different evidence",
+                ));
+            }
+            db.execute("INSERT INTO conflicts(id,kind,group_id,details) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",params![id.to_string(),kind,expected.1,expected.2])?;
+            if let Some(group) = group {
+                db.execute(
+                    "UPDATE residency SET conflict=1,protected=1 WHERE group_id=?",
+                    [group.to_string()],
+                )?;
+            }
+        }
+        ArchiveRecord::AmbiguityResolved { request } => {
+            super::conflicts::apply_resolution(db, request)?
+        }
+        ArchiveRecord::MetadataCached { result } => {
+            if result.extractor != crate::import::EXTRACTOR_VERSION {
+                return Err(AppError::integrity(
+                    "unsupported normalized metadata contract",
+                ));
+            }
+            db.execute("INSERT INTO metadata_cache(digest,extractor,metadata) VALUES(?,?,?) ON CONFLICT(digest,extractor) DO NOTHING",params![result.digest.as_str(),result.extractor,encode(&result)?])?;
+        }
         ArchiveRecord::ProjectionPlanned { plan } => {
             let sidecar = plan.sidecar.to_string();
             let (location, owner): (String, String) = db.query_row(
@@ -244,6 +289,8 @@ fn apply_record(db: &Connection, archive: &str, record: ArchiveRecord) -> AppRes
                     [group.to_string()],
                 )?;
             }
+            let canonical = super::identity::canonical(db, group)?;
+            db.execute("INSERT INTO placements(id,group_id,path,digest,archived) VALUES(?,?,?,?,1) ON CONFLICT(path,group_id) DO UPDATE SET archived=1",params![OperationId::new().to_string(),canonical.to_string(),member.path.as_str(),member.digest.as_str()])?;
         }
         ArchiveRecord::SidecarCreated {
             id,
@@ -303,6 +350,10 @@ fn apply_record(db: &Connection, archive: &str, record: ArchiveRecord) -> AppRes
                         "version ID reused with different identity, bytes or ancestry",
                     ));
                 }
+                db.execute(
+                    "INSERT INTO archived_versions(version) VALUES(?) ON CONFLICT DO NOTHING",
+                    [version.id.to_string()],
+                )?;
                 return Ok(());
             }
             let mut seen = std::collections::BTreeSet::new();
@@ -330,6 +381,10 @@ fn apply_record(db: &Connection, archive: &str, record: ArchiveRecord) -> AppRes
                     encode(&version.origin)?,
                     operation.to_string()
                 ],
+            )?;
+            db.execute(
+                "INSERT INTO archived_versions(version) VALUES(?) ON CONFLICT DO NOTHING",
+                [version.id.to_string()],
             )?;
             for parent in version.parents {
                 db.execute(

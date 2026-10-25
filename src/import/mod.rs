@@ -12,3 +12,5 @@ mod runner;
 pub use runner::*;
 mod upload;
 pub use upload::UploadDriver;
+mod bootstrap;
+pub use bootstrap::*;

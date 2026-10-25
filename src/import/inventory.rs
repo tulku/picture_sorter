@@ -92,6 +92,7 @@ struct Cursor {
     prefix: String,
 }
 pub struct Inventory {
+    forensic: bool,
     root: Arc<RootHandle>,
     stack: Vec<Cursor>,
     pub skipped: u64,
@@ -123,6 +124,7 @@ impl Inventory {
         let iter = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))?;
         Ok(Self {
             root,
+            forensic: false,
             stack: vec![Cursor {
                 _dir: dir,
                 iter,
@@ -131,6 +133,37 @@ impl Inventory {
             skipped: 0,
             diagnostics: vec![],
         })
+    }
+    pub fn open_all(source: RootHandle, scope: Option<&ArchivePath>) -> AppResult<Self> {
+        let root = Arc::new(source);
+        let (dir, prefix) = if let Some(scope) = scope {
+            (
+                root.open_relative(scope, libc::O_RDONLY | libc::O_DIRECTORY, 0)?,
+                format!("{}/", scope.as_str()),
+            )
+        } else {
+            (
+                File::open(format!("/proc/self/fd/{}", root.fd()))?,
+                String::new(),
+            )
+        };
+        let iter = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))?;
+        Ok(Self {
+            root,
+            forensic: false,
+            stack: vec![Cursor {
+                _dir: dir,
+                iter,
+                prefix,
+            }],
+            skipped: 0,
+            diagnostics: vec![],
+        })
+    }
+    pub fn open_forensic(source: RootHandle) -> AppResult<Self> {
+        let mut inventory = Self::open_all(source, None)?;
+        inventory.forensic = true;
+        Ok(inventory)
     }
     pub fn next_batch(&mut self, limit: usize) -> AppResult<Vec<SourceEntry>> {
         if limit == 0 || limit > 128 {
@@ -156,7 +189,9 @@ impl Inventory {
                     continue;
                 }
             };
-            if name.starts_with('.') {
+            if (name.starts_with('.') && (!self.forensic || name == ".photo-sorter"))
+                || (self.forensic && name == "working.lock")
+            {
                 self.skip("hidden entry excluded");
                 continue;
             }
@@ -178,7 +213,10 @@ impl Inventory {
                 self.skip("symlink or special file excluded");
                 continue;
             }
-            let Some(role) = source_role(name) else {
+            let Some(role) = source_role(name).or_else(|| {
+                self.forensic
+                    .then_some(SourceRole::Companion(CompanionKind::Opaque))
+            }) else {
                 self.skip("unsupported source file preserved");
                 continue;
             };

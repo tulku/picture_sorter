@@ -27,6 +27,18 @@ pub struct WireRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ArchiveRecord {
+    AmbiguityRecorded {
+        id: ConflictId,
+        kind: String,
+        group: Option<GroupId>,
+        details: serde_json::Value,
+    },
+    AmbiguityResolved {
+        request: crate::catalog::ResolutionRequest,
+    },
+    MetadataCached {
+        result: crate::import::MetadataResult,
+    },
     ProjectionPlanned {
         plan: super::ProjectionPlan,
     },

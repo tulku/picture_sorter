@@ -19,6 +19,40 @@ use std::{
 const MAX_LINE: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasCommand {
+    ReadJournalStart {
+        root: PathBuf,
+        archive: crate::domain::ArchiveId,
+        writer: crate::domain::WriterId,
+    },
+    ReadJournalNext {
+        session: OperationId,
+        limit: usize,
+    },
+    ReadJournalCommit {
+        session: OperationId,
+        path: crate::domain::ArchivePath,
+    },
+    ReadJournalEnd {
+        session: OperationId,
+    },
+    AuditArchive {
+        root: PathBuf,
+        archive: crate::domain::ArchiveId,
+        writer: crate::domain::WriterId,
+        objects: Vec<crate::catalog::VerifyObject>,
+    },
+    InventoryStart {
+        session: OperationId,
+        scope: Option<crate::domain::ArchivePath>,
+    },
+    InventoryNext {
+        session: OperationId,
+        limit: usize,
+    },
+    InventoryMetadata {
+        session: OperationId,
+        paths: Vec<crate::domain::ArchivePath>,
+    },
     Inspect {
         root: PathBuf,
     },
@@ -81,6 +115,10 @@ pub enum NasCommand {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasReply {
+    ReadSession(OperationId),
+    Integrity(crate::catalog::IntegrityReport),
+    Inventory(ArchiveInventoryBatch),
+    Metadata(Vec<crate::import::MetadataResult>),
     Root {
         device: u64,
         free: u64,
@@ -347,12 +385,100 @@ pub fn run_worker() -> AppResult<()> {
 
 #[derive(Default)]
 struct ArchiveRuntime {
+    readonly: Option<ReadOnlyJournal>,
+    inventory: Option<ArchiveInventory>,
     store: Option<ArchiveStore>,
     guard: Option<PublicationGuard>,
 }
 impl ArchiveRuntime {
     fn execute(&mut self, command: NasCommand) -> AppResult<NasReply> {
         match command {
+            NasCommand::ReadJournalStart {
+                root,
+                archive,
+                writer,
+            } => {
+                use std::os::unix::fs::MetadataExt;
+                let device = std::fs::metadata(&root)?.dev();
+                let store = ArchiveStore::open(
+                    RootHandle::open(
+                        &root,
+                        RootPolicy::Archive {
+                            expected_device: device,
+                        },
+                    )?,
+                    archive,
+                    writer,
+                )?;
+                let readonly = store.read_only_journal()?;
+                let id = readonly.id;
+                self.readonly = Some(readonly);
+                Ok(NasReply::ReadSession(id))
+            }
+            NasCommand::ReadJournalNext { session, limit } => Ok(NasReply::Journal(
+                self.read_session(session)?.next_batch(limit)?,
+            )),
+            NasCommand::ReadJournalCommit { session, path } => {
+                Ok(NasReply::Commit(self.read_session(session)?.read(&path)?))
+            }
+            NasCommand::ReadJournalEnd { session } => {
+                self.read_session(session)?;
+                self.readonly = None;
+                Ok(NasReply::Done)
+            }
+            NasCommand::AuditArchive {
+                root,
+                archive,
+                writer,
+                objects,
+            } => {
+                use std::os::unix::fs::MetadataExt;
+                let device = std::fs::metadata(&root)?.dev();
+                let store = ArchiveStore::open(
+                    RootHandle::open(
+                        &root,
+                        RootPolicy::Archive {
+                            expected_device: device,
+                        },
+                    )?,
+                    archive,
+                    writer,
+                )?;
+                let report = crate::catalog::IntegrityReport::audit_objects(&store.root, &objects)?;
+                store.validate()?;
+                Ok(NasReply::Integrity(report))
+            }
+            NasCommand::InventoryStart { session, scope } => {
+                let (store, guard) = self.session(session)?;
+                if !guard.replayed() {
+                    return Err(AppError::integrity(
+                        "bootstrap requires fresh journal replay",
+                    ));
+                }
+                let inventory = ArchiveInventory::open(store, scope.as_ref())?;
+                self.inventory = Some(inventory);
+                Ok(NasReply::Done)
+            }
+            NasCommand::InventoryNext { session, limit } => {
+                self.session(session)?;
+                let store = self
+                    .store
+                    .as_ref()
+                    .ok_or_else(|| AppError::integrity("no archive"))?;
+                let inventory = self
+                    .inventory
+                    .as_mut()
+                    .ok_or_else(|| AppError::invalid("inventory not started"))?;
+                Ok(NasReply::Inventory(inventory.next(store, limit)?))
+            }
+            NasCommand::InventoryMetadata { session, paths } => {
+                self.session(session)?;
+                let inventory = self
+                    .inventory
+                    .as_ref()
+                    .ok_or_else(|| AppError::invalid("inventory not started"))?;
+                Ok(NasReply::Metadata(inventory.metadata(&paths)?))
+            }
             NasCommand::FetchArchive {
                 archive,
                 writer,
@@ -515,6 +641,12 @@ impl ArchiveRuntime {
             }
             _ => Err(AppError::invalid("not an archive-session command")),
         }
+    }
+    fn read_session(&mut self, id: OperationId) -> AppResult<&mut ReadOnlyJournal> {
+        self.readonly
+            .as_mut()
+            .filter(|journal| journal.id == id)
+            .ok_or_else(|| AppError::invalid("obsolete read-only journal session"))
     }
     fn session(&mut self, id: OperationId) -> AppResult<(&ArchiveStore, &mut PublicationGuard)> {
         let store = self

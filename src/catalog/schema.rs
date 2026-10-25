@@ -51,3 +51,14 @@ CREATE TABLE IF NOT EXISTS rating_operations(key TEXT PRIMARY KEY,operation TEXT
 CREATE TABLE IF NOT EXISTS pending_shared_records(operation TEXT PRIMARY KEY,records TEXT NOT NULL,committed INTEGER NOT NULL DEFAULT 0);
 "#;
 pub const RATING_AUTHORITY_SCHEMA: &str = "CREATE TABLE rating_authorities(group_id TEXT PRIMARY KEY REFERENCES groups(id),server TEXT NOT NULL,asset TEXT NOT NULL,FOREIGN KEY(server,asset) REFERENCES mappings(server,asset));";
+pub const BOOTSTRAP_SCHEMA: &str = r#"
+CREATE TABLE publication_plans(operation TEXT PRIMARY KEY,plan TEXT NOT NULL);
+CREATE TABLE bootstrap_scans(job TEXT PRIMARY KEY REFERENCES jobs(id),request TEXT NOT NULL,report TEXT NOT NULL,pending TEXT);
+CREATE TABLE bootstrap_observations(job TEXT NOT NULL,path TEXT NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(job,path,digest));
+"#;
+pub const RESOLUTION_SCHEMA: &str = r#"
+CREATE TABLE resolution_receipts(operation TEXT PRIMARY KEY,request TEXT NOT NULL);
+CREATE TABLE independent_groups(group_id TEXT PRIMARY KEY REFERENCES groups(id),operation TEXT NOT NULL);
+CREATE TABLE retained_companions(sidecar TEXT PRIMARY KEY REFERENCES sidecars(id),operation TEXT NOT NULL);
+CREATE TABLE archived_versions(version TEXT PRIMARY KEY REFERENCES versions(id));
+"#;

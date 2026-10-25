@@ -58,6 +58,8 @@ impl Catalog {
             tx.execute_batch(schema::EDIT_SCHEMA)?;
             tx.execute_batch(schema::RATING_SCHEMA)?;
             tx.execute_batch(schema::RATING_AUTHORITY_SCHEMA)?;
+            tx.execute_batch(schema::BOOTSTRAP_SCHEMA)?;
+            tx.execute_batch(schema::RESOLUTION_SCHEMA)?;
             tx.commit()?;
         }
         db.pragma_update(None, "journal_mode", "WAL")?;
@@ -93,3 +95,10 @@ mod identity;
 pub use identity::{PairEvidence, PairFacts, Protection};
 mod replay;
 pub use replay::{ApplyOutcome, PublicationReadiness};
+mod maintenance;
+pub use maintenance::*;
+mod verify;
+pub use verify::*;
+mod conflicts;
+mod publication;
+pub use conflicts::*;

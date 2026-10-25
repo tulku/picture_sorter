@@ -8,3 +8,6 @@ pub use lock::*;
 pub use publish::*;
 mod projection;
 pub use projection::*;
+mod inventory;
+pub(crate) use inventory::ArchiveInventory;
+pub use inventory::{ArchiveInventoryBatch, ArchiveObservation};

@@ -67,6 +67,17 @@ impl RootHandle {
         }
         Ok(root)
     }
+    pub fn try_clone(&self) -> AppResult<Self> {
+        self.validate_identity()?;
+        Ok(Self {
+            dir: self.dir.try_clone()?,
+            path: self.path.clone(),
+            device: self.device,
+            inode: self.inode,
+            policy: self.policy,
+            mount_id: self.mount_id,
+        })
+    }
     pub fn require_local(&self) -> AppResult<()> {
         self.validate_identity()?;
         if !matches!(self.policy, RootPolicy::Local) {
@@ -78,6 +89,9 @@ impl RootHandle {
     }
     pub fn fd(&self) -> RawFd {
         self.dir.as_raw_fd()
+    }
+    pub fn inode(&self) -> u64 {
+        self.inode
     }
     pub fn device(&self) -> u64 {
         self.device
