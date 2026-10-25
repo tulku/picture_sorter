@@ -41,8 +41,8 @@ pub fn load(output_dir: &Path) -> io::Result<Option<IncrementalState>> {
         return Ok(None);
     }
     let text = fs::read_to_string(path)?;
-    let state: IncrementalState = serde_json::from_str(&text)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let state: IncrementalState =
+        serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(Some(state))
 }
 

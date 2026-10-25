@@ -97,21 +97,39 @@ mod tests {
 
     #[test]
     fn olympus_raw_and_high_res_go_to_raw() {
-        assert_eq!(classify_name("P5178617.ORF"), FileRole::Media(MediaKind::Raw));
-        assert_eq!(classify_name("P5178617.ori"), FileRole::Media(MediaKind::Raw));
+        assert_eq!(
+            classify_name("P5178617.ORF"),
+            FileRole::Media(MediaKind::Raw)
+        );
+        assert_eq!(
+            classify_name("P5178617.ori"),
+            FileRole::Media(MediaKind::Raw)
+        );
         assert_eq!(dest_tree(MediaKind::Raw), "RAW");
     }
 
     #[test]
     fn jpeg_and_still_exports_go_to_jpeg() {
-        assert_eq!(classify_name("P5178617.JPG"), FileRole::Media(MediaKind::Jpeg));
-        assert_eq!(classify_name("export.tiff"), FileRole::Media(MediaKind::Jpeg));
-        assert_eq!(classify_name("export.PNG"), FileRole::Media(MediaKind::Jpeg));
+        assert_eq!(
+            classify_name("P5178617.JPG"),
+            FileRole::Media(MediaKind::Jpeg)
+        );
+        assert_eq!(
+            classify_name("export.tiff"),
+            FileRole::Media(MediaKind::Jpeg)
+        );
+        assert_eq!(
+            classify_name("export.PNG"),
+            FileRole::Media(MediaKind::Jpeg)
+        );
     }
 
     #[test]
     fn movies_are_video() {
-        assert_eq!(classify_name("P1075977.MOV"), FileRole::Media(MediaKind::Video));
+        assert_eq!(
+            classify_name("P1075977.MOV"),
+            FileRole::Media(MediaKind::Video)
+        );
         assert_eq!(classify_name("clip.mp4"), FileRole::Media(MediaKind::Video));
         assert_eq!(dest_tree(MediaKind::Video), "VIDEO");
     }
