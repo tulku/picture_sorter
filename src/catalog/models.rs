@@ -18,6 +18,12 @@ pub enum JobKind {
         groups: Vec<GroupId>,
     },
     Clean,
+    Evict {
+        group: GroupId,
+        revision: MembershipRevision,
+        members: Vec<OriginalMember>,
+        activity: Timestamp,
+    },
     Resolve {
         conflict: ConflictId,
         expected_revision: u64,

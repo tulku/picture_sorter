@@ -226,6 +226,8 @@ impl Clock for ManualClock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FaultPoint {
     IntentSaved,
+    BeforeProjection,
+    BeforeUnlink,
     StagePartial,
     Verified,
     OriginalPublished,
