@@ -1,4 +1,3 @@
-use super::*;
 use crate::error::AppResult;
 #[derive(Debug, Clone)]
 pub struct FavoriteWrite {

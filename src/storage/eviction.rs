@@ -81,7 +81,7 @@ fn eligible_with_residency(
     if require_resident && !resident {
         return Ok(false);
     }
-    let rating_pending:bool=catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM rating_intents WHERE group_id=? AND state IN('prepared','sent'))",[group.id.to_string()],|r|r.get(0))?;
+    let rating_pending:bool=catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM rating_intents WHERE group_id=?1 AND state IN('prepared','sent')) OR EXISTS(SELECT 1 FROM favorite_intents WHERE group_id=?1 AND state IN('prepared','sent'))",[group.id.to_string()],|r|r.get(0))?;
     if rating_pending {
         return Ok(false);
     }

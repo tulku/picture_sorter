@@ -52,3 +52,6 @@ impl ImmichAccess for ImmichClient {
 
 mod favorite_api;
 pub use favorite_api::*;
+
+mod favorites;
+pub use favorites::*;

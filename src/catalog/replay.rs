@@ -560,6 +560,26 @@ fn apply_record(
             }
             db.execute("INSERT INTO mappings(server,asset,library,path,digest,group_id,remote_checksum,external_path) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",params![server,asset.to_string(),expected.0,path.as_str(),digest.as_str(),group.to_string(),remote_checksum,external_path])?;
         }
+        ArchiveRecord::FavoriteConverged { evidence } => {
+            super::favorite_convergence::apply(db, evidence)?
+        }
+        ArchiveRecord::FavoriteObserved {
+            operation,
+            group,
+            local,
+            remote,
+        } => {
+            let group = super::identity::canonical(db, group)?;
+            db.execute(
+                "INSERT INTO favorite_observations(id,group_id,local,remote) VALUES(?,?,?,?)",
+                params![
+                    operation.to_string(),
+                    group.to_string(),
+                    encode(&local)?,
+                    encode(&remote)?
+                ],
+            )?;
+        }
         ArchiveRecord::RatingConverged { evidence } => {
             super::rating_convergence::apply(db, evidence)?
         }

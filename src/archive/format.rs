@@ -100,6 +100,15 @@ pub enum ArchiveRecord {
         digest: Digest,
         group: GroupId,
     },
+    FavoriteConverged {
+        evidence: crate::catalog::FavoriteConvergence,
+    },
+    FavoriteObserved {
+        operation: OperationId,
+        group: GroupId,
+        local: bool,
+        remote: bool,
+    },
     RatingConverged {
         evidence: crate::catalog::RatingConvergence,
     },

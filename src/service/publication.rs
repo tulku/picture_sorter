@@ -621,7 +621,7 @@ fn prepare(engine: &mut ImportCoordinator, candidate: &Candidate) -> AppResult<V
                     == Some(&engine.catalog.heads(version.sidecar).unwrap_or_default())
             });
             let is_pending: bool = engine.catalog.db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM rating_baselines WHERE pending_version=?)",
+                "SELECT EXISTS(SELECT 1 FROM rating_baselines WHERE pending_version=?1) OR EXISTS(SELECT 1 FROM favorite_baselines WHERE pending_version=?1)",
                 [version.id.to_string()],
                 |r| r.get(0),
             )?;

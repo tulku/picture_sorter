@@ -74,6 +74,10 @@ impl Catalog {
             tx.execute_batch(schema::RESOLUTION_SCHEMA)?;
             tx.commit()?;
         }
+        db.execute_batch("CREATE TABLE IF NOT EXISTS favorite_baselines(group_id TEXT PRIMARY KEY REFERENCES groups(id),body TEXT NOT NULL,source_version TEXT,pending_version TEXT);
+CREATE TABLE IF NOT EXISTS favorite_observations(id TEXT PRIMARY KEY,group_id TEXT NOT NULL,local TEXT NOT NULL,remote TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS favorite_intents(id TEXT PRIMARY KEY,group_id TEXT NOT NULL,body TEXT NOT NULL,state TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS merged_favorite_evidence(group_id TEXT NOT NULL,original_group TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(group_id,original_group));")?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
         state.sync()?;
@@ -176,3 +180,6 @@ mod rating_convergence;
 pub use rating_convergence::*;
 
 mod admission;
+
+mod favorite_convergence;
+pub use favorite_convergence::*;

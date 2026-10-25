@@ -184,6 +184,8 @@ pub(crate) fn merge(
             "conflicts",
             "rating_observations",
             "rating_intents",
+            "favorite_intents",
+            "favorite_observations",
             "import_items",
             "group_facts",
             "startup_checks",
@@ -193,6 +195,37 @@ pub(crate) fn merge(
                 &format!("UPDATE {table} SET group_id=? WHERE group_id=?"),
                 params![winner, old],
             )?;
+        }
+        let favorite: Option<String> = db
+            .query_row(
+                "SELECT body FROM favorite_baselines WHERE group_id=?",
+                [&old],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(body) = favorite {
+            let current: Option<String> = db
+                .query_row(
+                    "SELECT body FROM favorite_baselines WHERE group_id=?",
+                    [&winner],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(current) = current {
+                if current != body {
+                    for (original, payload) in [(&old, &body), (&winner, &current)] {
+                        db.execute("INSERT OR IGNORE INTO merged_favorite_evidence(group_id,original_group,body) VALUES(?,?,?)",params![winner,original,payload])?;
+                    }
+                    db.execute("INSERT INTO conflicts(id,kind,group_id,details) VALUES(?,'favorite',?,?)",params![ConflictId::new().to_string(),winner,encode(&serde_json::json!({"reason":"associated groups have different favorite baselines"}))?])?;
+                    db.execute(
+                        "UPDATE residency SET conflict=1,protected=1 WHERE group_id=?",
+                        [&winner],
+                    )?;
+                }
+            } else {
+                db.execute("INSERT INTO favorite_baselines(group_id,body,source_version,pending_version) SELECT ?,body,source_version,pending_version FROM favorite_baselines WHERE group_id=?",params![winner,old])?;
+            }
+            db.execute("DELETE FROM favorite_baselines WHERE group_id=?", [&old])?;
         }
         db.execute("INSERT INTO primary_raw_choices(group_id,path,operation) SELECT ?,path,operation FROM primary_raw_choices WHERE group_id=? ON CONFLICT(group_id) DO NOTHING",params![winner,old])?;
         for table in ["rating_baselines", "rating_authorities"] {

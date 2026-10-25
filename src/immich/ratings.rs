@@ -708,7 +708,7 @@ impl RatingSynchronizer<'_> {
         Ok(report)
     }
 }
-fn primary_raw(group: &Group) -> Option<ArchivePath> {
+pub(crate) fn primary_raw(group: &Group) -> Option<ArchivePath> {
     if let Some(primary) = &group.primary_raw {
         return Some(primary.clone());
     }
@@ -783,7 +783,7 @@ fn local_rating(
         version,
     })
 }
-fn load_rating_document(
+pub(crate) fn load_rating_document(
     root: &crate::fs::RootHandle,
     version: &Version,
     adapter: &crate::edit::RapidRawAdapter,
