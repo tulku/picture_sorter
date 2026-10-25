@@ -6,3 +6,5 @@ mod publish;
 pub use journal::*;
 pub use lock::*;
 pub use publish::*;
+mod projection;
+pub use projection::*;

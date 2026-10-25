@@ -106,7 +106,7 @@ impl Inventory {
             0,
         ) {
             Ok(dir) => dir,
-            Err(e) if e.code == ErrorCode::Io && e.message.contains("No such file") => {
+            Err(e) if e.errno == Some(libc::ENOENT) => {
                 File::open(format!("/proc/self/fd/{}", root.fd()))?
             }
             Err(e) => return Err(e),

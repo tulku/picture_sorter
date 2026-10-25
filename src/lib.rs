@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod classify;
 pub mod config;
 pub mod domain;
+pub mod edit;
 pub mod error;
 pub mod fs;
 pub mod import;

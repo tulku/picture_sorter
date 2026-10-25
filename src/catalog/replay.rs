@@ -147,6 +147,29 @@ fn heads(db: &Connection, sidecar: SidecarId) -> AppResult<Vec<VersionId>> {
 }
 fn apply_record(db: &Connection, archive: &str, record: ArchiveRecord) -> AppResult<()> {
     match record {
+        ArchiveRecord::ProjectionPlanned { plan } => {
+            let sidecar = plan.sidecar.to_string();
+            let (location, owner): (String, String) = db.query_row(
+                "SELECT path,owner FROM sidecars WHERE id=?",
+                [&sidecar],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let actual: String = db.query_row(
+                "SELECT body FROM versions WHERE id=? AND sidecar=?",
+                params![plan.version.to_string(), sidecar],
+                |r| r.get(0),
+            )?;
+            if location != plan.path.as_str()
+                || owner != plan.owner
+                || decode::<VersionBody>(actual)? != plan.body
+                || heads(db, plan.sidecar)? != vec![plan.version]
+            {
+                return Err(AppError::integrity(
+                    "projection does not match unambiguous sidecar head",
+                ));
+            }
+            db.execute("INSERT INTO projections(sidecar,committed,pending) VALUES(?,?,1) ON CONFLICT(sidecar) DO UPDATE SET committed=excluded.committed,pending=1",params![sidecar,encode(&plan)?])?;
+        }
         ArchiveRecord::GroupCreated { id } => {
             db.execute("INSERT INTO groups(id,published) VALUES(?,1) ON CONFLICT(id) DO UPDATE SET published=1",[id.to_string()])?;
             db.execute(
@@ -246,10 +269,30 @@ fn apply_record(db: &Connection, archive: &str, record: ArchiveRecord) -> AppRes
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .optional()?;
-            if old.is_some() {
-                return Err(AppError::integrity(
-                    "version ID already exists in another record",
-                ));
+            if let Some((sidecar, body, origin, old_operation)) = old {
+                let mut q = db.prepare(
+                    "SELECT parent FROM version_parents WHERE version=? ORDER BY parent",
+                )?;
+                let recorded = q
+                    .query_map([version.id.to_string()], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut expected = version
+                    .parents
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                expected.sort();
+                if sidecar != version.sidecar.to_string()
+                    || decode::<VersionBody>(body)? != version.body
+                    || decode::<VersionOrigin>(origin)? != version.origin
+                    || old_operation != operation.to_string()
+                    || recorded != expected
+                {
+                    return Err(AppError::integrity(
+                        "version ID reused with different identity, bytes or ancestry",
+                    ));
+                }
+                return Ok(());
             }
             let mut seen = std::collections::BTreeSet::new();
             for parent in &version.parents {

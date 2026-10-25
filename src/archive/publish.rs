@@ -98,6 +98,9 @@ impl ArchiveStore {
             writer,
         })
     }
+    pub fn root_path(&self) -> &std::path::Path {
+        self.root.path()
+    }
     pub fn marker(&self) -> &ArchiveMarker {
         &self.marker
     }

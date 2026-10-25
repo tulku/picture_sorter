@@ -37,3 +37,8 @@ CREATE TABLE IF NOT EXISTS writer_sequences(writer TEXT PRIMARY KEY,sequence INT
 CREATE TABLE IF NOT EXISTS import_stats(job TEXT PRIMARY KEY REFERENCES jobs(id),selected INTEGER NOT NULL DEFAULT 0,recognized INTEGER NOT NULL DEFAULT 0,exif_calls INTEGER NOT NULL DEFAULT 0,transfer_bytes INTEGER NOT NULL DEFAULT 0,hash_bytes INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS group_facts(context TEXT NOT NULL,stem TEXT NOT NULL,camera TEXT NOT NULL,capture TEXT NOT NULL,group_id TEXT NOT NULL REFERENCES groups(id),PRIMARY KEY(context,stem,camera,capture));
 "#;
+pub const EDIT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS local_heads(sidecar TEXT PRIMARY KEY REFERENCES sidecars(id),version TEXT NOT NULL REFERENCES versions(id),dirty INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS snapshot_intents(operation TEXT PRIMARY KEY,version TEXT NOT NULL UNIQUE,sidecar TEXT NOT NULL,parents TEXT NOT NULL,body TEXT NOT NULL,origin TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS pending_resolutions(conflict TEXT PRIMARY KEY,version TEXT NOT NULL,expected_heads TEXT NOT NULL);
+"#;

@@ -61,6 +61,15 @@ pub enum NasCommand {
         session: OperationId,
         plan: PublicationPlan,
     },
+    PublishVersions {
+        session: OperationId,
+        plan: VersionPublication,
+    },
+    RepairProjection {
+        session: OperationId,
+        commit: CommitEnvelope,
+        plan: ProjectionPlan,
+    },
     EndArchive {
         session: OperationId,
     },
@@ -80,6 +89,7 @@ pub enum NasReply {
     Journal(JournalBatch),
     Commit(CommitEnvelope),
     Published(PublicationReceipt),
+    Projection(ProjectionOutcome),
     Done,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,6 +452,23 @@ impl ArchiveRuntime {
                     plan,
                     &crate::domain::NoFaults,
                 )?))
+            }
+            NasCommand::PublishVersions { session, plan } => {
+                let (store, guard) = self.session(session)?;
+                Ok(NasReply::Published(store.publish_versions(
+                    guard,
+                    plan,
+                    &crate::domain::NoFaults,
+                )?))
+            }
+            NasCommand::RepairProjection {
+                session,
+                commit,
+                plan,
+            } => {
+                let (store, _) = self.session(session)?;
+                let proof = store.committed_projection(&commit, &plan)?;
+                Ok(NasReply::Projection(store.apply_projection(&proof)?))
             }
             NasCommand::EndArchive { session } => {
                 self.session(session)?;

@@ -244,3 +244,26 @@ impl RootHandle {
         Ok(())
     }
 }
+impl RootHandle {
+    pub fn exchange(&self, left: &ArchivePath, right: &ArchivePath) -> AppResult<()> {
+        self.validate_identity()?;
+        let (a, x) = self.parent(left)?;
+        let (b, y) = self.parent(right)?;
+        // Atomic exchange retains the displaced bytes at the staging path even across a crash.
+        if unsafe {
+            libc::renameat2(
+                a.as_raw_fd(),
+                x.as_ptr(),
+                b.as_raw_fd(),
+                y.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        a.sync_all()?;
+        b.sync_all()?;
+        self.validate_identity()
+    }
+}

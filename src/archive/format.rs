@@ -27,6 +27,9 @@ pub struct WireRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ArchiveRecord {
+    ProjectionPlanned {
+        plan: super::ProjectionPlan,
+    },
     GroupCreated {
         id: GroupId,
     },

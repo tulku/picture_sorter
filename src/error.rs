@@ -24,6 +24,8 @@ pub struct AppError {
     pub code: ErrorCode,
     pub message: String,
     pub retry: RetryClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub errno: Option<i32>,
 }
 impl AppError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
@@ -31,6 +33,7 @@ impl AppError {
             code,
             message: message.into(),
             retry: RetryClass::Correction,
+            errno: None,
         }
     }
     pub fn invalid(message: impl Into<String>) -> Self {
@@ -52,6 +55,7 @@ impl From<std::io::Error> for AppError {
             code: ErrorCode::Io,
             message: e.to_string(),
             retry: RetryClass::Transient,
+            errno: e.raw_os_error(),
         }
     }
 }
