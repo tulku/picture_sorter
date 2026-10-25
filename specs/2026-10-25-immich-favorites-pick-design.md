@@ -1,6 +1,6 @@
 # Immich favorites and RapidRAW Pick synchronization
 
-Status: proposed extension; implementation approval pending.
+Status: approved, including the user-directed Reject precedence rule.
 
 ## Goal and approach
 
@@ -10,7 +10,7 @@ Synchronize Immich's native `isFavorite` boolean with the primary RAW sidecar's 
 
 - Favorite on in Immich corresponds to `flag: "pick"` in the mapped RAW's `.rrdata`.
 - Favorite off clears an existing Pick to the native neutral representation; clearing a Pick sends `isFavorite: false` to Immich.
-- Reject remains a distinct local flag. Incoming favorite changes never erase it, and Reject never becomes a star rating or an incidental remote favorite removal. Favorite-on versus an existing Reject is a visible conflict rather than an automatic replacement.
+- Reject remains a distinct local flag and wins over Immich Favorite. A saved Reject clears the remote favorite; incoming Favorite never replaces Reject and this pairing does not create a favorite conflict. Cancel stale pending Picks without losing other editing data.
 - Preserve ratings, adjustments, masks, tags, virtual copies and unknown metadata fields. Only the authoritative mapped JPEG/base RAW flag participates, with existing authority selection for ambiguous groups.
 - Missing API fields, unavailable sidecars and unreadable history are unobserved, never implicit false values. Establish baselines without treating absent information as a user edit.
 - Compare changes against the last agreed state and the actual applied local version. Persist pending incoming values without bouncing the old live flag back to Immich. Concurrent contradictory changes preserve both observations for explicit resolution.
@@ -20,7 +20,7 @@ Synchronize Immich's native `isFavorite` boolean with the primary RAW sidecar's 
 
 ## Validation required
 
-Both directions and clearing; initial unknown states; unchanged stars/edits/masks; Reject preservation/conflicts; changes made while incoming application is pending; identity changes; duplicate observations; offline and crash recovery; fair scheduling with star updates; real loopback `isFavorite` PUT/readback; real staged/foreground metadata application; exact-version isolated qualification with guarded restoration; regression suite and documentation.
+Both directions and clearing; initial unknown states; unchanged stars/edits/masks; Reject priority and stale pending Pick cancellation; changes made while incoming application is pending; identity changes; duplicate observations; offline and crash recovery; fair scheduling with star updates; real loopback `isFavorite` PUT/readback; real staged/foreground metadata application; exact-version isolated qualification with guarded restoration; regression suite and documentation.
 
 ## Sources inspected
 
