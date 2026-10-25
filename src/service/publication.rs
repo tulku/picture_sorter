@@ -148,6 +148,11 @@ impl SharedPublisher {
                 return Ok(());
             }
             WorkerState::Failed(error) => {
+                if matches!(active.phase, Phase::List) {
+                    engine
+                        .catalog
+                        .block_journal_enumeration(&error.to_string())?;
+                }
                 self.reason = Some(error.to_string());
                 if matches!(active.phase, Phase::Read)
                     && let Some(entry) = active

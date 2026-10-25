@@ -115,9 +115,17 @@ pub enum ArchiveCommand {
 }
 #[derive(Subcommand)]
 pub enum JobsCommand {
-    Show { job: JobId },
-    Wait { job: JobId },
-    Cancel { job: JobId },
+    Show {
+        job: JobId,
+        #[arg(long)]
+        applied_after: Option<u64>,
+    },
+    Wait {
+        job: JobId,
+    },
+    Cancel {
+        job: JobId,
+    },
 }
 #[derive(Subcommand)]
 pub enum ConflictsCommand {
@@ -294,8 +302,8 @@ pub fn run(cli: Cli) -> AppResult<i32> {
         }
         CliCommand::Clean => Command::Clean,
         CliCommand::Jobs {
-            command: JobsCommand::Show { job },
-        } => Command::JobShow { job },
+            command: JobsCommand::Show { job, applied_after },
+        } => Command::JobShow { job, applied_after },
         CliCommand::Jobs {
             command: JobsCommand::Wait { job },
         } => Command::JobWait { job },

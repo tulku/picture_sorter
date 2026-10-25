@@ -647,3 +647,74 @@ fn both_apps_agreement_journals_resolution_without_an_outgoing_write() {
     assert!(server.state.writes.lock().unwrap().is_empty());
     assert!(!rig.local.join("RAW/a.ORF").exists());
 }
+
+#[test]
+fn service_delivers_later_rating_when_oldest_intent_has_changed_server() {
+    let old = support::http::RatingServer::new();
+    let current = support::http::RatingServer::new();
+    let mut later = None;
+    let service = support::service::ServiceFixture::with_config(|config, r| {
+        let (mut catalog, _, group) = setup(r, &old);
+        catalog
+            .prepare_rating_write(
+                group,
+                old.asset,
+                stars(0),
+                Rating::try_from(3).unwrap(),
+                OperationId::new(),
+                &old.origin,
+            )
+            .unwrap();
+        catalog.set_protection(group, false, true).unwrap();
+        let db = rusqlite::Connection::open(r.state.join("catalog.sqlite")).unwrap();
+        db.execute(
+            "UPDATE members SET path='JPEG/old.JPG' WHERE group_id=?",
+            [group.to_string()],
+        )
+        .unwrap();
+        drop(db);
+        drop(catalog);
+        let (mut catalog, _, group) = setup(r, &current);
+        later = Some(
+            catalog
+                .prepare_rating_write(
+                    group,
+                    current.asset,
+                    stars(0),
+                    Rating::try_from(5).unwrap(),
+                    OperationId::new(),
+                    &current.origin,
+                )
+                .unwrap(),
+        );
+        config.immich = Some(photo_sorter::config::ImmichConfig {
+            origin: current.origin.to_string(),
+            key_file: r.state.join("key"),
+            library_id: None,
+            write_mode: "best_effort".into(),
+        });
+        persist_report(config, &evidence(&current).reports()[0]).unwrap();
+    });
+    let deadline = std::time::Instant::now();
+    loop {
+        let db = rusqlite::Connection::open(service.r.state.join("catalog.sqlite")).unwrap();
+        let state: String = db
+            .query_row(
+                "SELECT state FROM rating_intents WHERE id=?",
+                [later.unwrap().to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if state == "confirmed" {
+            break;
+        }
+        assert!(
+            deadline.elapsed() < std::time::Duration::from_secs(8),
+            "later intent remained {state}: {}",
+            service.status()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(*current.state.writes.lock().unwrap(), vec![Some(5)]);
+    assert!(old.state.writes.lock().unwrap().is_empty());
+}

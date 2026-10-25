@@ -1332,7 +1332,13 @@ fn clean_reclaims_only_quiescent_verified_duplicate_local_transfer_payload() {
         }
         result
     }
+    let db = rusqlite::Connection::open(service.r.state.join("catalog.sqlite")).unwrap();
+    let (job,generation):(String,u64)=db.query_row("SELECT a.job,a.generation FROM attempts a JOIN jobs j ON j.id=a.job WHERE json_extract(j.request,'$.kind.type')='local_transfer'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    drop(db);
     let staging = service.r.local.join(".photo-sorter/staging");
+    let duplicate = staging.join(format!("{job}/{generation}/payload"));
+    std::fs::create_dir_all(duplicate.parent().unwrap()).unwrap();
+    std::fs::write(&duplicate, body).unwrap();
     let duplicates = payloads(&staging);
     assert_eq!(duplicates.len(), 1);
     let cleaned = service.cli(&["clean"]);
@@ -1432,7 +1438,7 @@ fn explicit_nas_projection_choice_preserves_unknown_bytes_and_publishes_selected
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(std::fs::read(service.r.local.join(path)).unwrap(), desired);
+    assert_eq!(std::fs::read(service.r.local.join(&path)).unwrap(), desired);
     fn contains(root: &std::path::Path, expected: &[u8]) -> bool {
         std::fs::read_dir(root)
             .unwrap()
@@ -1478,7 +1484,11 @@ fn all_commands_have_real_handlers_for_pins_maintenance_and_inspection() {
     assert!(service.cli(&["unpin", group]).status.success());
     assert_eq!(service.status()["groups"][0]["protection"]["pinned"], false);
     let staged = service.cli(&["refresh", group, "--stage-only"]);
-    assert_eq!(staged.status.code(), Some(3));
+    assert!(
+        staged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&staged.stdout)
+    );
     let refreshed = service.cli(&["refresh", group, "--editor-closed"]);
     assert!(
         refreshed.status.success(),
@@ -1527,4 +1537,552 @@ fn all_commands_have_real_handlers_for_pins_maintenance_and_inspection() {
                 .success()
         );
     }
+}
+
+#[test]
+fn repeated_offline_import_reuses_verified_destination_without_unreserved_copy() {
+    let service = ServiceFixture::with_config(|config, _| {
+        config.budget = 2 * 1024 * 1024;
+        config.reserve = 0;
+    });
+    let source = vec![b'x'; 256 * 1024];
+    std::fs::write(service.r.source.join("repeat.ORF"), &source).unwrap();
+    let first = service.cli(&["import", service.r.source.to_str().unwrap()]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stdout)
+    );
+    let before = service.status()["session_metrics"]["transfer_bytes"]
+        .as_u64()
+        .unwrap();
+    for _ in 0..5 {
+        let output = service.cli(&["import", service.r.source.to_str().unwrap()]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            service.status()["session_metrics"]["transfer_bytes"]
+                .as_u64()
+                .unwrap(),
+            before,
+            "recognized offline original copied again"
+        );
+    }
+    fn find_original(root: &std::path::Path) -> std::path::PathBuf {
+        for entry in std::fs::read_dir(root).unwrap().map(Result::unwrap) {
+            if entry.file_type().unwrap().is_dir() {
+                let found = find_original(&entry.path());
+                if !found.as_os_str().is_empty() {
+                    return found;
+                }
+            } else if entry.path().extension().is_some_and(|ext| ext == "ORF") {
+                return entry.path();
+            }
+        }
+        std::path::PathBuf::new()
+    }
+    let path = find_original(&service.r.local);
+    assert!(!path.as_os_str().is_empty());
+    let foreign = vec![b'y'; source.len()];
+    std::fs::write(service.r.local.join(&path), &foreign).unwrap();
+    let output = service.cli(&["import", service.r.source.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(std::fs::read(service.r.local.join(&path)).unwrap(), foreign);
+    assert_eq!(
+        std::fs::read(service.r.source.join("repeat.ORF")).unwrap(),
+        source
+    );
+    assert_eq!(
+        service.status()["session_metrics"]["transfer_bytes"]
+            .as_u64()
+            .unwrap(),
+        before
+    );
+}
+
+#[test]
+fn journal_enumeration_failure_blocks_cleanup_until_corrected_read() {
+    let service = ServiceFixture::with_config(|c, _| {
+        c.activity_hold_seconds = 0;
+        c.poll_seconds = 1;
+    });
+    assert!(service.cli(&["archive", "init"]).status.success());
+    std::fs::write(service.r.source.join("A.ORF"), b"generated raw").unwrap();
+    assert!(
+        service
+            .cli(&[
+                "import",
+                service.r.source.to_str().unwrap(),
+                "--wait-for",
+                "archived"
+            ])
+            .status
+            .success()
+    );
+    let status = service.status();
+    let path = status["groups"][0]["group"]["members"][0]["path"]
+        .as_str()
+        .unwrap();
+    let unexpected = service
+        .r
+        .archive
+        .join(".photo-sorter/commits/unexpected/nested");
+    std::fs::create_dir_all(&unexpected).unwrap();
+    let audit = service.cli(&["verify", "--archive"]);
+    assert!(!audit.status.success());
+    let _ = service.cli(&["clean"]);
+    assert!(
+        service.r.local.join(path).exists(),
+        "incomplete namespace read allowed eviction"
+    );
+    std::fs::remove_dir(&unexpected).unwrap();
+    std::fs::remove_dir(unexpected.parent().unwrap()).unwrap();
+    let audit = service.cli(&["verify", "--archive"]);
+    assert!(
+        audit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&audit.stdout)
+    );
+    assert!(service.cli(&["clean"]).status.success());
+    assert!(!service.r.local.join(path).exists());
+}
+
+#[test]
+fn local_verify_skips_intentionally_nonresident_originals() {
+    let service = ServiceFixture::with_config(|c, _| c.activity_hold_seconds = 0);
+    assert!(service.cli(&["archive", "init"]).status.success());
+    std::fs::write(service.r.source.join("A.ORF"), b"generated raw").unwrap();
+    assert!(
+        service
+            .cli(&[
+                "import",
+                service.r.source.to_str().unwrap(),
+                "--wait-for",
+                "archived"
+            ])
+            .status
+            .success()
+    );
+    assert!(service.cli(&["clean"]).status.success());
+    let audit = service.cli(&["verify"]);
+    assert!(
+        audit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&audit.stdout)
+    );
+}
+
+#[test]
+fn archive_verify_checks_current_projection_not_only_saved_history() {
+    let service = ServiceFixture::new();
+    assert!(service.cli(&["archive", "init"]).status.success());
+    std::fs::write(service.r.source.join("A.ORF"), b"generated raw").unwrap();
+    assert!(
+        service
+            .cli(&[
+                "import",
+                service.r.source.to_str().unwrap(),
+                "--wait-for",
+                "archived"
+            ])
+            .status
+            .success()
+    );
+    let status = service.status();
+    let path = status["groups"][0]["group"]["members"][0]["path"]
+        .as_str()
+        .unwrap();
+    let sidecar = format!("{path}.rrdata");
+    let saved = br#"{"version":1,"rating":3,"adjustments":{},"tags":null}"#;
+    std::fs::write(service.r.local.join(&sidecar), saved).unwrap();
+    let deadline = Instant::now();
+    while std::fs::read(service.r.archive.join(&sidecar))
+        .ok()
+        .as_deref()
+        != Some(saved)
+    {
+        assert!(deadline.elapsed() < Duration::from_secs(8));
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    std::fs::write(
+        service.r.archive.join(&sidecar),
+        b"foreign current projection",
+    )
+    .unwrap();
+    let audit = service.cli(&["verify", "--archive"]);
+    assert_eq!(
+        audit.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&audit.stdout)
+    );
+    assert_eq!(
+        std::fs::read(service.r.archive.join(&sidecar)).unwrap(),
+        b"foreign current projection"
+    );
+}
+
+#[test]
+fn stage_only_refresh_persists_mode_and_completes_without_editor_assertion() {
+    let service = ServiceFixture::new();
+    let output = service.cli(&["refresh", "--stage-only"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        response["outcome"]["job"]["request"]["kind"]["stage_only"],
+        true
+    );
+}
+
+#[test]
+fn default_refresh_reaches_resident_groups_beyond_first_catalog_page() {
+    use photo_sorter::{
+        catalog::Catalog,
+        fs::{RootHandle, RootPolicy},
+    };
+    let service = ServiceFixture::with_config(|config, r| {
+        let mut catalog =
+            Catalog::open(&RootHandle::open(&config.state_root, RootPolicy::Local).unwrap())
+                .unwrap();
+        let mut groups = (0..130)
+            .map(|_| catalog.create_group(false).unwrap())
+            .collect::<Vec<_>>();
+        groups.sort();
+        for (index, group) in groups.iter().copied().enumerate() {
+            let member = OriginalMember {
+                path: ArchivePath::parse(&format!("RAW/{index}.ORF")).unwrap(),
+                digest: Digest::of(b"fixture raw"),
+                size: 11,
+                role: MediaRole::Raw,
+            };
+            catalog
+                .attach_member(
+                    group,
+                    member.clone(),
+                    photo_sorter::catalog::PairEvidence::UserSelected {
+                        reason: "fixture".into(),
+                    },
+                )
+                .unwrap();
+            if index == 129 {
+                std::fs::create_dir_all(r.local.join("RAW")).unwrap();
+                std::fs::write(r.local.join(member.path.as_str()), b"fixture raw").unwrap();
+                catalog
+                    .record_materialization(group, &member, false)
+                    .unwrap();
+            }
+        }
+    });
+    let output = service.cli(&["refresh", "--stage-only"]);
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(output.status.success(), "{response}");
+    assert_eq!(
+        response["outcome"]["detail"]["staged_groups"], 1,
+        "{response}"
+    );
+}
+
+#[test]
+fn foreground_wait_keeps_valid_connection_beyond_thirty_seconds() {
+    let service = ServiceFixture::new();
+    let pid = service.status()["worker"]["local_pid"].as_u64().unwrap() as i32;
+    std::fs::write(service.r.source.join("long.ORF"), b"generated long request").unwrap();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let output = std::fs::File::create(service.r._temp.path().join("long-wait.json")).unwrap();
+    let mut cli = std::process::Command::new(env!("CARGO_BIN_EXE_photo_sorter"))
+        .arg("--config")
+        .arg(&service.profile)
+        .arg("import")
+        .arg(&service.r.source)
+        .arg("--json")
+        .stdout(output.try_clone().unwrap())
+        .stderr(output)
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(32) {
+        assert!(
+            cli.try_wait().unwrap().is_none(),
+            "valid foreground request ended at {:?}: {}",
+            start.elapsed(),
+            std::fs::read_to_string(service.r._temp.path().join("long-wait.json")).unwrap()
+        );
+        let response_at = Instant::now();
+        let _ = service.status();
+        assert!(response_at.elapsed() < Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    let deadline = Instant::now();
+    loop {
+        if let Some(status) = cli.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "{}",
+                std::fs::read_to_string(service.r._temp.path().join("long-wait.json")).unwrap()
+            );
+            break;
+        }
+        assert!(deadline.elapsed() < Duration::from_secs(8));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn corrected_local_integrity_finding_recovers_without_archive_audit_clearing_it() {
+    let service = ServiceFixture::with_config(|c, _| {
+        c.activity_hold_seconds = 0;
+        c.poll_seconds = 1;
+    });
+    assert!(service.cli(&["archive", "init"]).status.success());
+    std::fs::write(service.r.source.join("A.ORF"), b"generated raw").unwrap();
+    assert!(
+        service
+            .cli(&[
+                "import",
+                service.r.source.to_str().unwrap(),
+                "--wait-for",
+                "archived"
+            ])
+            .status
+            .success()
+    );
+    let status = service.status();
+    let path = status["groups"][0]["group"]["members"][0]["path"]
+        .as_str()
+        .unwrap();
+    std::fs::write(service.r.local.join(path), b"foreign changed raw").unwrap();
+    assert_eq!(service.cli(&["verify"]).status.code(), Some(4));
+    std::thread::sleep(Duration::from_millis(2100));
+    let _ = service.cli(&["verify", "--archive"]);
+    let _ = service.cli(&["clean"]);
+    assert_eq!(
+        std::fs::read(service.r.local.join(path)).unwrap(),
+        b"foreign changed raw"
+    );
+    std::fs::write(service.r.local.join(path), b"generated raw").unwrap();
+    let audit = service.cli(&["verify"]);
+    assert!(
+        audit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&audit.stdout)
+    );
+    let clean = service.cli(&["clean"]);
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stdout)
+    );
+    assert!(
+        !service.r.local.join(path).exists(),
+        "corrected finding left sticky protection: {}",
+        service.status()
+    );
+}
+
+#[test]
+fn cancelled_worker_audit_drains_before_releasing_its_lease() {
+    let service = ServiceFixture::new();
+    std::fs::write(service.r.source.join("A.ORF"), b"generated raw").unwrap();
+    assert!(
+        service
+            .cli(&["import", service.r.source.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let pid = service.status()["worker"]["maintenance_pid"]
+        .as_u64()
+        .unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let output = service.cli(&["verify", "--no-wait"]);
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let job = response["outcome"]["job"].as_str().unwrap();
+    let deadline = Instant::now();
+    while service.status()["worker"]["local_audit_job"] != job {
+        assert!(deadline.elapsed() < Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = service.cli(&["jobs", "cancel", job, "--no-wait"]);
+    std::thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    let status = service.status();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let record = status["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["id"] == job)
+        .unwrap();
+    assert_eq!(
+        record["state"], "CancelRequested",
+        "audit cancellation completed before positive worker quiescence"
+    );
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    let deadline = Instant::now();
+    loop {
+        let status = service.status();
+        if status["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["id"] == job && record["state"] == "Cancelled")
+        {
+            break;
+        }
+        assert!(deadline.elapsed() < Duration::from_secs(4));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let audit = service.cli(&["verify"]);
+    assert!(
+        audit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&audit.stdout)
+    );
+}
+
+#[test]
+fn zero_allocation_reuse_cannot_fall_back_to_copy_when_destination_vanishes() {
+    let service = ServiceFixture::with_config(|config, _| {
+        config.budget = 2 * 1024 * 1024;
+        config.reserve = 0;
+    });
+    let body = vec![b'x'; 128 * 1024];
+    std::fs::write(service.r.source.join("A.ORF"), &body).unwrap();
+    assert!(
+        service
+            .cli(&["import", service.r.source.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let db = rusqlite::Connection::open(service.r.state.join("catalog.sqlite")).unwrap();
+    let path: String = db
+        .query_row(
+            "SELECT destination FROM import_items WHERE local_ready=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let before = service.status()["session_metrics"]["transfer_bytes"]
+        .as_u64()
+        .unwrap();
+    let pid = service.status()["worker"]["local_pid"].as_u64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let output = service.cli(&["import", service.r.source.to_str().unwrap(), "--no-wait"]);
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let parent = response["outcome"]["job"].as_str().unwrap();
+    let deadline = Instant::now();
+    loop {
+        let admitted:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM reservations r JOIN jobs j ON j.id=r.job WHERE json_extract(j.request,'$.kind.parent')=? AND r.remaining=0)",[parent],|r|r.get(0)).unwrap();
+        if admitted {
+            break;
+        }
+        assert!(deadline.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::remove_file(service.r.local.join(&path)).unwrap();
+    std::fs::write(
+        service.r.local.join("generated-filler.bin"),
+        vec![0u8; 2 * 1024 * 1024],
+    )
+    .unwrap();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    let deadline = Instant::now();
+    loop {
+        let status = service.status();
+        let record = status["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|j| j["id"] == parent)
+            .unwrap();
+        if matches!(
+            record["state"].as_str(),
+            Some("WaitingSource" | "WaitingCapacity" | "WaitingNas")
+        ) {
+            break;
+        }
+        assert!(deadline.elapsed() < Duration::from_secs(5), "{status}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!service.r.local.join(&path).exists());
+    assert_eq!(
+        service.status()["session_metrics"]["transfer_bytes"]
+            .as_u64()
+            .unwrap(),
+        before
+    );
+    assert_eq!(std::fs::read(service.r.source.join("A.ORF")).unwrap(), body);
+}
+
+#[test]
+fn refresh_application_results_have_durable_bounded_cli_pages() {
+    use photo_sorter::{catalog::*, fs::*};
+    let mut job = None;
+    let service = ServiceFixture::with_config(|config, r| {
+        let mut catalog =
+            Catalog::open(&RootHandle::open(&config.state_root, RootPolicy::Local).unwrap())
+                .unwrap();
+        let id = catalog
+            .enqueue(DurableRequest {
+                operation_id: OperationId::new(),
+                kind: JobKind::Refresh {
+                    groups: vec![],
+                    stage_only: true,
+                },
+            })
+            .unwrap();
+        job = Some(id);
+        let db = rusqlite::Connection::open(r.state.join("catalog.sqlite")).unwrap();
+        for _ in 0..130 {
+            db.execute(
+                "INSERT INTO refresh_application_receipts(job,sidecar,version) VALUES(?,?,?)",
+                rusqlite::params![
+                    id.to_string(),
+                    SidecarId::new().to_string(),
+                    VersionId::new().to_string()
+                ],
+            )
+            .unwrap();
+        }
+    });
+    let id = job.unwrap().to_string();
+    let deadline = Instant::now();
+    while !service.status()["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|j| j["id"] == id && j["state"] == "Complete")
+    {
+        assert!(deadline.elapsed() < Duration::from_secs(4));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let first = service.cli(&["jobs", "show", &id]);
+    assert!(first.status.success());
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let detail = &first["outcome"]["detail"];
+    assert_eq!(detail["applied_count"], 130);
+    assert_eq!(detail["applied"].as_array().unwrap().len(), 128);
+    assert_eq!(detail["applied_page"]["has_more"], true);
+    let cursor = detail["applied_page"]["next"].as_u64().unwrap().to_string();
+    let next = service.cli(&["jobs", "show", &id, "--applied-after", &cursor]);
+    assert!(next.status.success());
+    let next: serde_json::Value = serde_json::from_slice(&next.stdout).unwrap();
+    let next = &next["outcome"]["detail"];
+    assert_eq!(next["applied"].as_array().unwrap().len(), 2);
+    assert_eq!(next["applied_page"]["has_more"], false);
+    assert!(
+        next["applied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|id| !detail["applied"].as_array().unwrap().contains(id))
+    );
 }

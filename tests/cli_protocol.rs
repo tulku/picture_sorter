@@ -263,6 +263,17 @@ fn cli_reports_integrity_and_operation_failures_without_changing_bytes() {
         },
     )
     .unwrap();
+    cat.record_materialization(
+        group,
+        &OriginalMember {
+            path: ArchivePath::parse("A.ORF").unwrap(),
+            digest: Digest::of(b"good"),
+            size: 4,
+            role: MediaRole::Raw,
+        },
+        false,
+    )
+    .unwrap();
     drop(cat);
     std::fs::write(r.local.join("A.ORF"), b"evil").unwrap();
     let _service = start(&p, &r.state);

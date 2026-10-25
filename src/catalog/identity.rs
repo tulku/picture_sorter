@@ -289,7 +289,7 @@ pub(crate) fn merge(
         let mut request: DurableRequest = decode(request)?;
         match &mut request.kind {
             JobKind::Pin { group } => *group = canonical(db, *group)?,
-            JobKind::Refresh { groups } => {
+            JobKind::Refresh { groups, .. } => {
                 for group in groups.iter_mut() {
                     *group = canonical(db, *group)?;
                 }

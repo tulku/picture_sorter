@@ -180,7 +180,7 @@ impl Catalog {
                 [chosen.sidecar.to_string()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            if owner == "rapidraw-base" || owner == "preserved-source-companion" {
+            if crate::archive::owns_projection(&owner, &ArchivePath::parse(&path)?) {
                 let conflict = self.conflict(request.conflict)?;
                 let previous: Option<String> = self
                     .db
@@ -908,7 +908,7 @@ mod tests {
                 sidecar,
                 None,
                 ArchivePath::parse("A.ORF.rrdata").unwrap(),
-                "unassociated",
+                "rapidraw-virtual",
             )
             .unwrap();
             for version in [v1, v2] {
@@ -1038,6 +1038,14 @@ mod tests {
             stale.expected_revision = 1;
             assert!(cat.resolution_records(&stale).is_err());
             let records = cat.resolution_records(&request).unwrap();
+            if case == 0 {
+                assert!(
+                    records
+                        .iter()
+                        .any(|record| matches!(record, ArchiveRecord::ProjectionPlanned { .. })),
+                    "owned virtual metadata choice needs a projection"
+                );
+            }
             let commit =
                 CommitEnvelope::new(ArchiveId::new(), WriterId::new(), 1, vec![], records).unwrap();
             cat.apply_commit(&commit).unwrap();

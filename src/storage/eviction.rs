@@ -199,21 +199,22 @@ impl Evictor<'_> {
                     "eviction invalidated immediately before unlink",
                 ));
             }
-            let file =
-                match self
-                    .local
-                    .open_relative(&member.path, libc::O_RDONLY | libc::O_NONBLOCK, 0)
-                {
-                    Ok(file) => file,
-                    Err(e) if e.errno == Some(libc::ENOENT) => {
-                        self.catalog.db.execute(
-                            "UPDATE placements SET local_ready=0 WHERE group_id=? AND path=?",
-                            params![group.id.to_string(), member.path.as_str()],
-                        )?;
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
+            let file = match self.local.open_relative(
+                &member.path,
+                libc::O_RDONLY | libc::O_NONBLOCK,
+                0,
+            ) {
+                Ok(file) => file,
+                Err(e) if e.errno == Some(libc::ENOENT) => {
+                    self.catalog.db.execute(
+                        "UPDATE placements SET local_ready=0 WHERE group_id=? AND path=?",
+                        params![group.id.to_string(), member.path.as_str()],
+                    )?;
+                    self.catalog.db.execute("DELETE FROM local_residency_expectations WHERE placement IN(SELECT id FROM placements WHERE group_id=? AND path=?)",params![group.id.to_string(),member.path.as_str()])?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let mut file = file;
             let current_stamp = crate::edit::SnapshotStamp::of(&file.metadata()?);
             let verified = match proof {
@@ -227,10 +228,12 @@ impl Evictor<'_> {
                 return Err(AppError::integrity("changed local original retained"));
             }
             self.local.unlink(&member.path, false)?;
+            self.catalog.invalidate_admission()?;
             self.catalog.db.execute(
                 "UPDATE placements SET local_ready=0 WHERE group_id=? AND path=?",
                 params![group.id.to_string(), member.path.as_str()],
             )?;
+            self.catalog.db.execute("DELETE FROM local_residency_expectations WHERE placement IN(SELECT id FROM placements WHERE group_id=? AND path=?)",params![group.id.to_string(),member.path.as_str()])?;
             report.removed += 1;
             faults.hit(FaultPoint::UnlinkMember)?;
         }

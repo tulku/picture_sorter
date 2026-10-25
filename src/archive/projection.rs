@@ -16,6 +16,9 @@ pub struct ProjectionPlan {
     pub body: VersionBody,
     pub owner: String,
 }
+pub fn owns_projection(owner: &str, path: &ArchivePath) -> bool {
+    owner != "jpeg-xmp-external" && !path.as_str().starts_with(".photo-sorter/")
+}
 pub struct CommittedProjection {
     plan: ProjectionPlan,
 }
@@ -67,7 +70,7 @@ impl ArchiveStore {
         let plan = &proof.plan;
         validate_sidecar_path(&plan.path)?;
         self.validate()?;
-        if plan.owner == "jpeg-xmp-external" || plan.path.as_str().starts_with(".photo-sorter/") {
+        if !owns_projection(&plan.owner, &plan.path) {
             return Err(AppError::new(
                 ErrorCode::Unsupported,
                 "projection is not a tool-owned live sidecar",

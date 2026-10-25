@@ -209,6 +209,7 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
     let state = RootHandle::open(&config.state_root, RootPolicy::Local)?;
     let profile = OwnershipLock::acquire(&state, "profile.lock")?;
     let local = RootHandle::open(&config.working_root, RootPolicy::Local)?;
+    ensure_disjoint_roots(&local, &state)?;
     let work = OwnershipLock::acquire(&local, "working.lock")?;
     bind_root(&state, config.profile_id, ".photo-sorter/profile.json")?;
     bind_root(&local, config.profile_id, ".photo-sorter/working-root.json")?;
@@ -274,10 +275,14 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         maintenance: maintenance_worker,
         startup: super::recovery::StartupVerifier::default(),
         space: super::space::SpaceMeter::default(),
+        local_audit: super::verify::LocalAudit::default(),
+        refresh_application: super::refresh::RefreshApplication::default(),
         cleanup: super::cleanup::CleanupDriver::default(),
         reader: super::archive_reader::ArchiveReader::default(),
         http_reason,
         rating_cursor: None,
+        rating_intent_cursor: 0,
+        rating_active_intent: None,
         merge_cursor: None,
         job_cursor: None,
         engine: ImportCoordinator::new(config.clone(), catalog),
@@ -304,6 +309,11 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         last_tick: Instant::now(),
     };
     runtime.engine.bind_archive()?;
+    runtime.engine.catalog.enable_async_admission();
+    runtime
+        .engine
+        .catalog
+        .set_admission_limits(runtime.engine.config.budget, runtime.engine.config.reserve);
     let mut peers: Vec<Connection> = vec![];
     loop {
         for _ in 0..32 {
@@ -353,7 +363,11 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
                                     }
                                 ) && !peer.closed
                                 {
-                                    match runtime.sessions.authorize(true, request.no_wait) {
+                                    match runtime.sessions.authorize_peer(
+                                        true,
+                                        request.no_wait,
+                                        &peer.stream,
+                                    ) {
                                         Ok(authorization) => {
                                             peer.authorization = Some(authorization)
                                         }
@@ -413,13 +427,6 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
             if peer.flush().is_err() {
                 peer.closed = true;
             }
-            if peer.opened.elapsed() > Duration::from_secs(25)
-                && peer.waiting.is_some()
-                && let (Some(job), Some(request)) = (peer.waiting, peer.request.as_ref())
-            {
-                let response = runtime.job_response(request.request_id, job)?;
-                peer.respond(response)?;
-            }
         }
         peers.retain(|peer| {
             !peer.closed
@@ -428,6 +435,17 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         });
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct RefreshProgress {
+    cursor: Option<GroupId>,
+    index: usize,
+    child: Option<JobId>,
+    current_group: Option<GroupId>,
+    staged_groups: u64,
+    applied: Vec<VersionId>,
+    conflicts: Vec<SidecarId>,
+    waiting_application: bool,
 }
 struct Control {
     job: JobId,
@@ -438,11 +456,15 @@ struct Runtime {
     maintenance: WorkerSupervisor,
     startup: super::recovery::StartupVerifier,
     space: super::space::SpaceMeter,
+    local_audit: super::verify::LocalAudit,
+    refresh_application: super::refresh::RefreshApplication,
     cleanup: super::cleanup::CleanupDriver,
     reader: super::archive_reader::ArchiveReader,
     http: Option<super::http::AsyncImmich>,
     http_reason: Option<String>,
     rating_cursor: Option<Option<uuid::Uuid>>,
+    rating_intent_cursor: i64,
+    rating_active_intent: Option<(i64, RatingIntentId)>,
     merge_cursor: Option<SidecarId>,
     job_cursor: Option<JobId>,
     local: RootHandle,
@@ -485,6 +507,21 @@ impl Runtime {
             );
         }
         match &request.command {
+            Command::CheckApplication { job, session } => {
+                let authorized = self.authorizations.get(job) == Some(session)
+                    && self.sessions.authorized(*session)
+                    && self.engine.catalog.job(*job).is_ok_and(|record| {
+                        !record.cancel_requested
+                            && matches!(
+                                record.request.kind,
+                                JobKind::Refresh {
+                                    stage_only: false,
+                                    ..
+                                }
+                            )
+                    });
+                data(serde_json::json!({"authorized":authorized}))
+            }
             Command::Status | Command::StatusPage { .. } => {
                 let default = StatusQuery::default();
                 let query = if let Command::StatusPage { query } = &request.command {
@@ -504,7 +541,7 @@ impl Runtime {
                 let mut status = StatusSnapshot::collect_page(
                     &self.engine,
                     &self.space,
-                    serde_json::json!({"pid":self.worker.pid(),"local_pid":self.local_transfer.worker.pid(),"observation_pid":self.observation.worker.pid(),"maintenance_pid":self.maintenance.pid(),"available":self.worker.available()?,"control_job":self.control.as_ref().map(|control|control.job)}),
+                    serde_json::json!({"pid":self.worker.pid(),"local_pid":self.local_transfer.worker.pid(),"observation_pid":self.observation.worker.pid(),"maintenance_pid":self.maintenance.pid(),"available":self.worker.available()?,"control_job":self.control.as_ref().map(|control|control.job),"refresh_application_job":self.refresh_application.active_job(),"local_audit_job":self.local_audit.active_job()}),
                     archive_status,
                     query,
                 )?;
@@ -598,26 +635,17 @@ impl Runtime {
                         "applying refresh requires a foreground connection",
                     ));
                 }
-                let groups = if groups.is_empty() {
-                    self.engine
-                        .catalog
-                        .group_batch(None, 128)?
-                        .into_iter()
-                        .filter(|g| {
-                            self.engine
-                                .catalog
-                                .readiness(g.id)
-                                .is_ok_and(|r| r.originals_ready)
-                        })
-                        .map(|g| g.id)
-                        .collect()
-                } else {
-                    groups
-                        .iter()
-                        .map(|g| self.engine.catalog.canonical_group(*g))
-                        .collect::<AppResult<Vec<_>>>()?
-                };
-                let outcome = self.enqueue(request, JobKind::Refresh { groups })?;
+                let groups = groups
+                    .iter()
+                    .map(|group| self.engine.catalog.canonical_group(*group))
+                    .collect::<AppResult<Vec<_>>>()?;
+                let outcome = self.enqueue(
+                    request,
+                    JobKind::Refresh {
+                        groups,
+                        stage_only: *stage_only,
+                    },
+                )?;
                 if let (ResponseOutcome::Accepted { job }, Some(session)) =
                     (&outcome, authorization)
                 {
@@ -626,8 +654,9 @@ impl Runtime {
                 Ok(outcome)
             }
             Command::Clean => self.enqueue(request, JobKind::Clean),
-            Command::JobShow { job } => {
-                let response = self.job_response(request.request_id, *job)?;
+            Command::JobShow { job, applied_after } => {
+                let response =
+                    self.job_response_page(request.request_id, *job, applied_after.unwrap_or(0))?;
                 Ok(response.outcome)
             }
             Command::JobWait { job } => {
@@ -720,8 +749,14 @@ impl Runtime {
         }
     }
     fn job_response(&self, id: OperationId, job: JobId) -> AppResult<Response> {
+        self.job_response_page(id, job, 0)
+    }
+    fn job_response_page(&self, id: OperationId, job: JobId, after: u64) -> AppResult<Response> {
+        if after > i64::MAX as u64 {
+            return Err(AppError::invalid("application cursor out of range"));
+        }
         let record = self.engine.catalog.job(job)?;
-        let detail = match record.request.kind {
+        let mut detail = match record.request.kind {
             JobKind::Import { .. } => serde_json::to_value(self.engine.report(job).ok())?,
             _ => {
                 let text: Option<String> = self
@@ -739,6 +774,36 @@ impl Runtime {
                     .unwrap_or(serde_json::Value::Null)
             }
         };
+        if matches!(record.request.kind, JobKind::Refresh { .. }) {
+            if !detail.is_object() {
+                detail = serde_json::json!({});
+            }
+            let mut query=self.engine.catalog.db.prepare("SELECT rowid,version FROM refresh_application_receipts WHERE job=? AND rowid>? ORDER BY rowid LIMIT 129")?;
+            let mut rows = query
+                .query_map(params![job.to_string(), after], |r| {
+                    Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let more = rows.len() > 128;
+            rows.truncate(128);
+            let next = if more {
+                rows.last().map(|(row, _)| *row)
+            } else {
+                None
+            };
+            let count: u64 = self.engine.catalog.db.query_row(
+                "SELECT count(*) FROM refresh_application_receipts WHERE job=?",
+                [job.to_string()],
+                |r| r.get(0),
+            )?;
+            detail["applied"] = serde_json::to_value(
+                rows.into_iter()
+                    .map(|(_, version)| version)
+                    .collect::<Vec<_>>(),
+            )?;
+            detail["applied_count"] = serde_json::json!(count);
+            detail["applied_page"] = serde_json::json!({"next":next,"has_more":more});
+        }
         Ok(Response {
             protocol_version: 1,
             request_id: id,
@@ -768,6 +833,14 @@ impl Runtime {
                 .http
                 .as_ref()
                 .is_some_and(|http| !http.asset_failed(asset))
+        {
+            return Ok(None);
+        }
+        if record.state == JobState::WaitingCapacity
+            && record
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("fresh worker capacity measurement pending"))
         {
             return Ok(None);
         }
@@ -837,6 +910,193 @@ impl Runtime {
         }
         self.complete(job)
     }
+    fn advance_refresh(
+        &mut self,
+        record: &JobRecord,
+        groups: &[GroupId],
+        stage_only: bool,
+    ) -> AppResult<()> {
+        let job = record.id;
+        let encoded: Option<String> = self
+            .engine
+            .catalog
+            .db
+            .query_row(
+                "SELECT result FROM job_results WHERE job=?",
+                [job.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut progress: RefreshProgress = encoded
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?
+            .unwrap_or_default();
+        if groups.is_empty() && progress.current_group.is_none() {
+            let checking: bool = self.engine.catalog.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM startup_checks)",
+                [],
+                |r| r.get(0),
+            )?;
+            if checking {
+                return Ok(());
+            }
+        }
+        let group = if let Some(group) = progress.current_group {
+            self.engine.catalog.canonical_group(group)?
+        } else if groups.is_empty() {
+            let page = self.engine.catalog.group_batch(progress.cursor, 128)?;
+            if page.is_empty() {
+                self.result(job, &progress)?;
+                self.complete(job)?;
+                self.authorizations.remove(&job);
+                return Ok(());
+            }
+            let candidate = page
+                .iter()
+                .find(|g| {
+                    self.engine
+                        .catalog
+                        .readiness(g.id)
+                        .is_ok_and(|r| r.originals_ready)
+                })
+                .map(|g| g.id);
+            if let Some(group) = candidate {
+                group
+            } else {
+                progress.cursor = page.last().map(|g| g.id);
+                self.result(job, progress)?;
+                return Ok(());
+            }
+        } else if let Some(group) = groups.get(progress.index) {
+            *group
+        } else {
+            self.result(job, &progress)?;
+            self.complete(job)?;
+            self.authorizations.remove(&job);
+            return Ok(());
+        };
+        let child = if let Some(child) = progress.child {
+            child
+        } else {
+            let child = self.engine.catalog.enqueue(DurableRequest {
+                operation_id: OperationId::new(),
+                kind: JobKind::MetadataFetch {
+                    group,
+                    versions: vec![],
+                },
+            })?;
+            progress.current_group = Some(group);
+            progress.child = Some(child);
+            self.result(job, &progress)?;
+            child
+        };
+        let staged = self.engine.catalog.job(child)?;
+        if staged.state != JobState::Complete {
+            if matches!(
+                staged.state,
+                JobState::Conflict
+                    | JobState::Failed
+                    | JobState::WaitingNas
+                    | JobState::WaitingCapacity
+            ) {
+                self.wait(
+                    job,
+                    staged.state,
+                    staged
+                        .reason
+                        .unwrap_or_else(|| "metadata staging pending".into()),
+                )?;
+            }
+            return Ok(());
+        }
+        if !stage_only {
+            let report = if self.refresh_application.active_job() == Some(job) {
+                let Some(report) = self.refresh_application.poll(
+                    &mut self.engine.catalog,
+                    &mut self.maintenance,
+                    job,
+                )?
+                else {
+                    return Ok(());
+                };
+                report
+            } else {
+                let Some(session) = self
+                    .authorizations
+                    .get(&job)
+                    .copied()
+                    .filter(|s| self.sessions.authorized(*s))
+                else {
+                    return self.wait(job,JobState::WaitingApplication,"metadata staged; a fresh foreground refresh --editor-closed is required before live metadata application".into());
+                };
+                let pending:Option<(String,String)>=self.engine.catalog.db.query_row("SELECT json_extract(j.state,'$'),coalesce(j.reason,'saved local capture is in progress') FROM capture_requests c JOIN sidecars s ON s.id=json_extract(c.context,'$.owner.id') JOIN jobs j ON j.id=c.job WHERE c.done=0 AND s.group_id=? LIMIT 1",[group.to_string()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+                if let Some((state, reason)) = pending {
+                    if matches!(state.as_str(), "Queued" | "Running") {
+                        return Ok(());
+                    }
+                    return self.wait(job,JobState::WaitingApplication,format!("saved local metadata must finish preservation before application: {reason}"));
+                }
+                if !self.engine.catalog.readiness(group)?.originals_ready {
+                    let checking: bool = self.engine.catalog.db.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM startup_checks WHERE group_id=?)",
+                        [group.to_string()],
+                        |r| r.get(0),
+                    )?;
+                    if checking {
+                        return Ok(());
+                    }
+                    return self.wait(
+                        job,
+                        JobState::WaitingSource,
+                        "originals must be resident before live metadata application".into(),
+                    );
+                }
+                self.refresh_application.start(
+                    &mut self.engine.catalog,
+                    &self.engine.config,
+                    &mut self.maintenance,
+                    job,
+                    RefreshRequest {
+                        groups: vec![group],
+                        application_session: session,
+                        operation_id: record.request.operation_id,
+                    },
+                )?;
+                return Ok(());
+            };
+            let has_more = report.has_more;
+            let remaining = 128usize.saturating_sub(progress.applied.len());
+            progress
+                .applied
+                .extend(report.applied.into_iter().take(remaining));
+            progress.conflicts.extend(report.conflicts);
+            progress.waiting_application = report.waiting_application;
+            if !progress.conflicts.is_empty() || progress.waiting_application {
+                self.result(job, &progress)?;
+                self.authorizations.remove(&job);
+                return self.wait(
+                    job,
+                    if progress.waiting_application {
+                        JobState::WaitingApplication
+                    } else {
+                        JobState::Conflict
+                    },
+                    "refresh stopped at application boundary; bytes preserved".into(),
+                );
+            }
+            if has_more {
+                self.result(job, &progress)?;
+                return Ok(());
+            }
+        }
+        progress.staged_groups += 1;
+        progress.index += 1;
+        progress.cursor = Some(group);
+        progress.child = None;
+        progress.current_group = None;
+        self.result(job, progress)?;
+        Ok(())
+    }
     fn result(&mut self, job: JobId, value: impl serde::Serialize) -> AppResult<()> {
         self.engine.catalog.db.execute("INSERT INTO job_results(job,result) VALUES(?,?) ON CONFLICT(job) DO UPDATE SET result=excluded.result",params![job.to_string(),serde_json::to_string(&value)?])?;
         Ok(())
@@ -889,8 +1149,17 @@ impl Runtime {
         ) {
             self.cleanup.reason = Some(error.to_string());
         }
-        self.space
-            .advance(&self.engine.config, &mut self.maintenance, clock.now())?;
+        self.space.advance(
+            &self.engine.config,
+            &self.engine.catalog,
+            &mut self.maintenance,
+            clock.now(),
+        )?;
+        self.observation.blocked_group = self
+            .refresh_application
+            .active_group()
+            .map(|group| self.engine.catalog.canonical_group(group))
+            .transpose()?;
         if let Err(error) = self.observation.advance(
             &mut self.engine,
             &self.local,
@@ -1018,6 +1287,8 @@ impl Runtime {
             self.fetch.active_job(),
             self.bootstrap.active_job(),
             self.reader.active_job(),
+            self.refresh_application.active_job(),
+            self.local_audit.active_job(),
         ];
         for job in active.into_iter().flatten() {
             if !jobs.iter().any(|record| record.id == job) {
@@ -1063,6 +1334,14 @@ impl Runtime {
                         context.cleanup(&self.state)?;
                     }
                 }
+                if self.refresh_application.active_job() == Some(record.id) {
+                    let _ = self.refresh_application.poll(
+                        &mut self.engine.catalog,
+                        &mut self.maintenance,
+                        record.id,
+                    )?;
+                }
+                self.local_audit.cancel(&mut self.maintenance, record.id)?;
                 self.scan.cancel(record.id)?;
                 self.upload.cancel(&mut self.worker, record.id)?;
                 self.bootstrap.cancel(&mut self.worker, record.id)?;
@@ -1082,6 +1361,8 @@ impl Runtime {
                     self.fetch.active_job(),
                     self.local_transfer.active_parent(),
                     self.reader.active_job(),
+                    self.refresh_application.active_job(),
+                    self.local_audit.active_job(),
                     self.control.as_ref().map(|c| c.job),
                     self.local_control.as_ref().map(|c| c.job),
                 ]
@@ -1132,6 +1413,9 @@ impl Runtime {
             }
             let current = self.engine.catalog.job(record.id)?;
             if was_due
+                && !current.reason.as_deref().is_some_and(|reason| {
+                    reason.contains("fresh worker capacity measurement pending")
+                })
                 && matches!(
                     current.state,
                     JobState::WaitingNas
@@ -1156,7 +1440,10 @@ impl Runtime {
                 .as_ref()
                 .is_some_and(|identity| identity.decision(&self.engine.config).allowed);
         if let Some(http) = &self.http {
-            if let Some(after) = self.rating_cursor.filter(|_| editor_allowed) {
+            if let Some(after) = self
+                .rating_cursor
+                .filter(|_| editor_allowed && self.rating_active_intent.is_none())
+            {
                 let config = &self.engine.config;
                 let scope = crate::immich::RatingScope {
                     state_root: config.state_root.clone(),
@@ -1181,9 +1468,13 @@ impl Runtime {
                     }
                 }
             }
-            let intent:Option<String>=self.engine.catalog.db.query_row("SELECT id FROM rating_intents WHERE state IN('prepared','sent') ORDER BY rowid LIMIT 1",[],|r|r.get(0)).optional()?;
-            if let Some(id) = intent {
-                let id = serde_json::from_str(&format!("\"{id}\""))?;
+            if self.rating_active_intent.is_none() && !http.in_flight() {
+                self.rating_active_intent = super::rating_queue::next_intent(
+                    &self.engine.catalog,
+                    self.rating_intent_cursor,
+                )?;
+            }
+            if let Some((row, id)) = self.rating_active_intent {
                 match (crate::immich::RatingSynchronizer {
                     catalog: &mut self.engine.catalog,
                     client: http,
@@ -1196,6 +1487,10 @@ impl Runtime {
                         }
                     }
                     Err(error) => self.http_reason = Some(error.to_string()),
+                }
+                if !http.in_flight() {
+                    self.rating_intent_cursor = row;
+                    self.rating_active_intent = None;
                 }
             }
         }
@@ -1295,6 +1590,19 @@ impl Runtime {
                     && self.worker.available()?
                 {
                     let context: CaptureContext = serde_json::from_value(context.clone())?;
+                    if let Some(group) = self.refresh_application.active_group() {
+                        let blocked: bool = self.engine.catalog.db.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM sidecars WHERE id=? AND group_id=?)",
+                            params![
+                                context.owner.id.to_string(),
+                                self.engine.catalog.canonical_group(group)?.to_string()
+                            ],
+                            |r| r.get(0),
+                        )?;
+                        if blocked {
+                            return Ok(());
+                        }
+                    }
                     let ticket = self.worker.submit(NasCommand::CaptureHistory {
                         root: config.archive_root.clone(),
                         archive: config
@@ -1486,48 +1794,8 @@ impl Runtime {
                 self.engine.catalog.unpin(*group)?;
                 self.complete(job)?;
             }
-            JobKind::Refresh { groups } => {
-                let Some(session) = self
-                    .authorizations
-                    .get(&job)
-                    .copied()
-                    .filter(|s| self.sessions.authorized(*s))
-                else {
-                    return self.wait(job,JobState::WaitingApplication,"a fresh foreground refresh --editor-closed is required before live metadata application".into());
-                };
-                let report = RefreshCoordinator {
-                    catalog: &mut self.engine.catalog,
-                    local: &self.local,
-                    state: &self.state,
-                    sessions: &self.sessions,
-                }
-                .apply(
-                    RefreshRequest {
-                        groups: groups.clone(),
-                        application_session: session,
-                        operation_id: record.request.operation_id,
-                    },
-                    &NoFaults,
-                )?;
-                self.result(job,serde_json::json!({"applied":report.applied,"conflicts":report.conflicts,"waiting_application":report.waiting_application}))?;
-                if !report.conflicts.is_empty() {
-                    self.authorizations.remove(&job);
-                    self.wait(
-                        job,
-                        JobState::Conflict,
-                        "local edits diverged during refresh; bytes preserved".into(),
-                    )?;
-                } else if report.waiting_application {
-                    self.authorizations.remove(&job);
-                    self.wait(
-                        job,
-                        JobState::WaitingApplication,
-                        "refresh authorization expired".into(),
-                    )?;
-                } else {
-                    self.complete(job)?;
-                    self.authorizations.remove(&job);
-                }
+            JobKind::Refresh { groups, stage_only } => {
+                self.advance_refresh(record, groups, *stage_only)?;
             }
             JobKind::Clean => {
                 self.cleanup.request_clean(&mut self.engine, job)?;
@@ -1597,20 +1865,12 @@ impl Runtime {
                 replacement,
             )?,
             JobKind::Verify { archive: false } => {
-                let report = IntegrityVerifier::new(&self.engine.catalog, &self.local)
-                    .audit(VerifyScope::Originals)?;
-                self.engine.catalog.protect_integrity(&report)?;
-                let bad = !report.findings.is_empty();
-                self.result(job, report)?;
-                if bad {
-                    self.wait(
-                        job,
-                        JobState::Conflict,
-                        "integrity findings require review; no repairs performed".into(),
-                    )?;
-                } else {
-                    self.complete(job)?;
-                }
+                self.local_audit.advance(
+                    &mut self.engine.catalog,
+                    &config,
+                    &mut self.maintenance,
+                    job,
+                )?;
             }
             JobKind::Verify { archive: true } => {
                 if !self.nas_job_allowed(job) {

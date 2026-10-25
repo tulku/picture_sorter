@@ -271,6 +271,45 @@ pub fn publish_local(
     Ok(())
 }
 impl TransferEngine {
+    pub fn reuse_local_destination(
+        spec: &TransferSpec,
+        dest: &RootHandle,
+        destination: &ArchivePath,
+    ) -> AppResult<Option<TransferReceipt>> {
+        match dest.open_relative(destination, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+            Ok(mut file) => {
+                let before = crate::edit::SnapshotStamp::of(&file.metadata()?);
+                let actual = digest_file(&mut file)?;
+                let current =
+                    dest.open_relative(destination, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+                if before != crate::edit::SnapshotStamp::of(&file.metadata()?)
+                    || before != crate::edit::SnapshotStamp::of(&current.metadata()?)
+                {
+                    return Err(AppError::new(
+                        ErrorCode::SourceChanged,
+                        "reuse destination changed during verification",
+                    ));
+                }
+                if actual != (spec.expected_digest.clone(), spec.expected_size) {
+                    return Err(AppError::new(
+                        ErrorCode::Conflict,
+                        "different local bytes at destination; preserved",
+                    ));
+                }
+                return Ok(Some(TransferReceipt {
+                    transferred_bytes: 0,
+                    job: spec.job,
+                    generation: spec.generation,
+                    digest: spec.expected_digest.clone(),
+                    size: spec.expected_size,
+                    staged_path: spec.staged_path.clone(),
+                }));
+            }
+            Err(e) if e.errno == Some(libc::ENOENT) => {}
+            Err(e) => return Err(e),
+        }
+        Ok(None)
+    }
     pub fn local_transfer(
         spec: &TransferSpec,
         destination: &ArchivePath,
@@ -285,25 +324,8 @@ impl TransferEngine {
                 "local case collision; bytes preserved",
             ));
         }
-        match dest.open_relative(destination, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
-            Ok(mut file) => {
-                if digest_file(&mut file)? != (spec.expected_digest.clone(), spec.expected_size) {
-                    return Err(AppError::new(
-                        ErrorCode::Conflict,
-                        "different local bytes at destination; preserved",
-                    ));
-                }
-                return Ok(TransferReceipt {
-                    transferred_bytes: 0,
-                    job: spec.job,
-                    generation: spec.generation,
-                    digest: spec.expected_digest.clone(),
-                    size: spec.expected_size,
-                    staged_path: spec.staged_path.clone(),
-                });
-            }
-            Err(e) if e.errno == Some(libc::ENOENT) => {}
-            Err(e) => return Err(e),
+        if let Some(receipt) = Self::reuse_local_destination(spec, &dest, destination)? {
+            return Ok(receipt);
         }
         let source = RootHandle::open(&spec.source.root, RootPolicy::Local)?;
         let receipt = Self::stage_confined(spec, &source, &dest)?;

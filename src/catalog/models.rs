@@ -51,6 +51,8 @@ pub enum JobKind {
     },
     Refresh {
         groups: Vec<GroupId>,
+        #[serde(default)]
+        stage_only: bool,
     },
     PinUrl {
         server: String,

@@ -45,6 +45,20 @@ pub enum NasCommand {
         receipt: TransferReceipt,
         destination: crate::domain::ArchivePath,
     },
+    AuditTargets {
+        root: PathBuf,
+        archive: Option<crate::domain::ArchiveId>,
+        writer: crate::domain::WriterId,
+        targets: Vec<crate::catalog::VerificationTarget>,
+    },
+    ApplyRefresh {
+        local: PathBuf,
+        state: PathBuf,
+        group: crate::domain::GroupId,
+        job: crate::domain::JobId,
+        session: crate::domain::ApplicationSessionId,
+        operation: OperationId,
+    },
     AuditLocal {
         root: PathBuf,
         objects: Vec<crate::catalog::VerifyObject>,
@@ -90,6 +104,7 @@ pub enum NasCommand {
     LocalTransfer {
         spec: TransferSpec,
         destination: crate::domain::ArchivePath,
+        reuse_only: bool,
     },
     RecoverArchive {
         root: PathBuf,
@@ -194,6 +209,7 @@ pub enum NasCommand {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasReply {
+    Refreshed(crate::edit::RefreshReport),
     LocalSpace(crate::fs::ManagedSpaceMeasurement),
     Capability(crate::qualification::CapabilityReport),
     LocalObserved {
@@ -357,7 +373,7 @@ impl WorkerSettings {
         crate::qualification::load_registry(&config).unwrap_or_default()
     }
     fn root(&self, path: &std::path::Path) -> AppResult<RootHandle> {
-        if self.local_test_backend {
+        let root = if self.local_test_backend {
             RootHandle::open(path, RootPolicy::TestArchive)
         } else {
             use std::os::unix::fs::MetadataExt;
@@ -367,7 +383,11 @@ impl WorkerSettings {
                     expected_device: std::fs::metadata(path)?.dev(),
                 },
             )
+        }?;
+        for expected in &self.profile_roots {
+            crate::fs::ensure_disjoint_roots(&root, &self.local_root(&expected.path)?)?;
         }
+        Ok(root)
     }
 }
 pub struct WorkerSupervisor {
@@ -861,6 +881,24 @@ impl ArchiveRuntime {
                 self.readonly = None;
                 Ok(NasReply::Done)
             }
+            NasCommand::AuditTargets {
+                root,
+                archive,
+                writer,
+                targets,
+            } => {
+                let report = if let Some(archive) = archive {
+                    let store = self.open_store(&root, archive, writer)?;
+                    let report =
+                        crate::catalog::IntegrityReport::audit_targets(&store.root, &targets)?;
+                    store.validate()?;
+                    report
+                } else {
+                    let root = self.settings.local_root(&root)?;
+                    crate::catalog::IntegrityReport::audit_targets(&root, &targets)?
+                };
+                Ok(NasReply::Integrity(report))
+            }
             NasCommand::AuditArchive {
                 root,
                 archive,
@@ -1053,6 +1091,41 @@ struct LocalRuntime {
 impl LocalRuntime {
     fn execute(&mut self, command: NasCommand) -> AppResult<NasReply> {
         match command {
+            NasCommand::ApplyRefresh {
+                local,
+                state,
+                group,
+                job,
+                session,
+                operation,
+            } => {
+                crate::metrics::refresh_application();
+                let local = self.settings.local_root(&local)?;
+                let state = self.settings.local_root(&state)?;
+                let mut catalog = crate::catalog::Catalog::open(&state)?;
+                let sessions = crate::edit::ApplicationSessions::worker_authority(
+                    state.try_clone()?,
+                    job,
+                    session,
+                );
+                let report = crate::edit::RefreshCoordinator {
+                    catalog: &mut catalog,
+                    local: &local,
+                    state: &state,
+                    sessions: &sessions,
+                }
+                .apply_batch(
+                    crate::edit::RefreshRequest {
+                        groups: vec![group],
+                        application_session: session,
+                        operation_id: operation,
+                    },
+                    &crate::domain::NoFaults,
+                    128,
+                    Some(job),
+                )?;
+                Ok(NasReply::Refreshed(report))
+            }
             NasCommand::MeasureLocalSpace { local, state } => crate::fs::measure_managed_space(
                 &self.settings.local_root(&local)?,
                 &self.settings.local_root(&state)?,
@@ -1111,6 +1184,17 @@ impl LocalRuntime {
                 crate::transfer::publish_local(&root, &receipt, &destination)?;
                 Ok(NasReply::Staged(receipt))
             }
+            NasCommand::AuditTargets {
+                root,
+                archive: None,
+                targets,
+                ..
+            } => {
+                let root = self.settings.local_root(&root)?;
+                Ok(NasReply::Integrity(
+                    crate::catalog::IntegrityReport::audit_targets(&root, &targets)?,
+                ))
+            }
             NasCommand::AuditLocal { root, objects } => {
                 let root = self.settings.local_root(&root)?;
                 Ok(NasReply::Integrity(
@@ -1152,9 +1236,24 @@ impl LocalRuntime {
                     &local, &state, &path, kind, ceiling,
                 )?))
             }
-            NasCommand::LocalTransfer { spec, destination } => {
-                let source = self.settings.local_root(&spec.source.root)?;
+            NasCommand::LocalTransfer {
+                spec,
+                destination,
+                reuse_only,
+            } => {
                 let root = self.settings.local_root(&spec.destination_root)?;
+                if let Some(receipt) =
+                    TransferEngine::reuse_local_destination(&spec, &root, &destination)?
+                {
+                    return Ok(NasReply::Staged(receipt));
+                }
+                if reuse_only {
+                    return Err(AppError::new(
+                        ErrorCode::SourceChanged,
+                        "reuse destination vanished; no copy was reserved",
+                    ));
+                }
+                let source = self.settings.local_root(&spec.source.root)?;
                 let receipt = TransferEngine::stage_confined(&spec, &source, &root)?;
                 if let Some((parent, _)) = destination.as_str().rsplit_once('/') {
                     root.mkdir_all(&crate::domain::ArchivePath::parse(parent)?)?;

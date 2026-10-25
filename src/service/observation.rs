@@ -29,6 +29,7 @@ pub(crate) struct ObservationDriver {
     queue: VecDeque<SidecarOwner>,
     events_due: bool,
     pub status: ObservationStatus,
+    pub blocked_group: Option<GroupId>,
 }
 struct CaptureResult {
     owner: SidecarOwner,
@@ -59,6 +60,7 @@ impl ObservationDriver {
             queue: VecDeque::new(),
             events_due: false,
             status: ObservationStatus::default(),
+            blocked_group: None,
         }
     }
     pub fn advance(
@@ -219,7 +221,9 @@ impl ObservationDriver {
                 },
                 Phase::Watch,
             )
-        } else if let Some(owner) = self.queue.pop_front() {
+        } else if let Some(owner) =
+            next_unblocked(&mut self.queue, &engine.catalog, self.blocked_group)?
+        {
             let pending:bool=engine.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM capture_requests WHERE done=0 AND json_extract(context,'$.owner.id')=?)",[owner.id.to_string()],|r|r.get(0))?;
             if pending {
                 return Ok(());
@@ -232,9 +236,18 @@ impl ObservationDriver {
                     return Ok(());
                 }
             };
-            let occupied = crate::fs::occupied_bytes(local)?
-                .checked_add(crate::fs::state_occupied_bytes(state)?)
-                .ok_or_else(|| AppError::invalid("snapshot occupancy overflow"))?;
+            let measurement = match engine.catalog.admission_measurement(local, state) {
+                Ok(measurement) => measurement,
+                Err(error) => {
+                    self.queue.push_front(owner);
+                    return Err(error);
+                }
+            };
+            let occupied = measurement
+                .local
+                .total
+                .checked_add(measurement.state.total)
+                .ok_or_else(|| AppError::invalid("occupancy overflow"))?;
             let admitted = crate::storage::admit_with_budget_reservations(
                 &crate::storage::AdmissionInput {
                     budget: engine.config.budget,
@@ -242,7 +255,7 @@ impl ObservationDriver {
                     reserved: engine
                         .catalog
                         .remaining_reservations(crate::storage::FilesystemId(state.device()))?,
-                    available: crate::fs::available_bytes(state)?,
+                    available: measurement.state_filesystem_free,
                     reserve: engine.config.reserve,
                     required: size,
                     existing: 0,
@@ -740,4 +753,79 @@ fn fail_capture(catalog: &mut Catalog, context: &CaptureContext, reason: &str) -
         }
     }
     Ok(())
+}
+
+fn next_unblocked(
+    queue: &mut VecDeque<SidecarOwner>,
+    catalog: &Catalog,
+    blocked: Option<GroupId>,
+) -> AppResult<Option<SidecarOwner>> {
+    for _ in 0..queue.len() {
+        let Some(owner) = queue.pop_front() else {
+            break;
+        };
+        let defer = if let Some(group) = blocked {
+            catalog.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sidecars WHERE id=? AND group_id=?)",
+                params![owner.id.to_string(), group.to_string()],
+                |r| r.get::<_, bool>(0),
+            )?
+        } else {
+            false
+        };
+        if defer {
+            queue.push_back(owner);
+        } else {
+            return Ok(Some(owner));
+        }
+    }
+    Ok(None)
+}
+#[cfg(test)]
+mod application_serialization_tests {
+    use super::*;
+    use crate::fs::RootPolicy;
+    #[test]
+    fn application_defers_its_group_capture_without_starving_other_saved_edits() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut catalog =
+            Catalog::open(&RootHandle::open(temp.path(), RootPolicy::Local).unwrap()).unwrap();
+        let groups = [
+            catalog.create_group(false).unwrap(),
+            catalog.create_group(false).unwrap(),
+        ];
+        let mut queue = VecDeque::new();
+        for (index, group) in groups.into_iter().enumerate() {
+            let owner = SidecarOwner {
+                id: SidecarId::new(),
+                group: Some(group),
+                path: ArchivePath::parse(&format!("RAW/{index}.ORF.rrdata")).unwrap(),
+                kind: SidecarKind::RapidRaw,
+                virtual_copy: None,
+            };
+            catalog
+                .register_sidecar(owner.id, owner.group, owner.path.clone(), "rapidraw-base")
+                .unwrap();
+            queue.push_back(owner);
+        }
+        assert_eq!(
+            next_unblocked(&mut queue, &catalog, Some(groups[0]))
+                .unwrap()
+                .unwrap()
+                .group,
+            Some(groups[1])
+        );
+        assert!(
+            next_unblocked(&mut queue, &catalog, Some(groups[0]))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            next_unblocked(&mut queue, &catalog, None)
+                .unwrap()
+                .unwrap()
+                .group,
+            Some(groups[0])
+        );
+    }
 }

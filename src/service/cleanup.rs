@@ -284,6 +284,7 @@ impl CleanupDriver {
             Err(error) if error.errno == Some(libc::ENOENT) => {}
             Err(error) => return Err(error),
         }
+        engine.catalog.invalidate_admission()?;
         if kind == "snapshot" {
             engine.catalog.db.execute(
                 "DELETE FROM snapshots WHERE digest=? AND refs=0",

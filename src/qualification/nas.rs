@@ -237,6 +237,7 @@ pub fn qualify_nas(request: NasProbeRequest) -> AppResult<CapabilityReport> {
     }
     let archive = open_root(&archive_path, request.local_test_backend)?;
     let scratch = open_root(&scratch_path, request.local_test_backend)?;
+    crate::fs::ensure_disjoint_roots(&archive, &scratch)?;
     if archive.mount_number() != scratch.mount_number() || archive.device() != scratch.device() {
         return Err(AppError::invalid(
             "scratch must use the same mounted filesystem as the target archive",

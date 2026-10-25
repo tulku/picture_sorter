@@ -13,8 +13,13 @@ pub struct Client {
 }
 impl Client {
     pub fn connect(config: &Config) -> AppResult<Self> {
-        crate::fs::RootHandle::open(&config.state_root, crate::fs::RootPolicy::Local)?;
-        let socket = config.state_root.join("service.sock");
+        let state = crate::fs::RootHandle::open(&config.state_root, crate::fs::RootPolicy::Local)?;
+        Self::connect_state(&state)
+    }
+    pub(crate) fn connect_state(state: &crate::fs::RootHandle) -> AppResult<Self> {
+        state.require_local()?;
+        state.validate_identity()?;
+        let socket = std::path::PathBuf::from(format!("/proc/self/fd/{}/service.sock", state.fd()));
         let metadata = std::fs::symlink_metadata(&socket)?;
         // Private socket ownership and kernel peer credentials must agree before sending a request.
         if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o600 {
@@ -25,7 +30,7 @@ impl Client {
         }
         let stream = UnixStream::connect(socket)?;
         super::server::check_peer(&stream)?;
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        stream.set_read_timeout(None)?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         Ok(Self { stream })
     }

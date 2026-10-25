@@ -25,6 +25,7 @@ pub struct LocalImportAttempt {
     pub parent: JobId,
     pub item: JobId,
     pub reservation: ReservationId,
+    pub reuse_only: bool,
     group: Option<GroupId>,
     role: SourceRole,
 }
@@ -88,7 +89,7 @@ impl ImportCoordinator {
                 Err(e) if e.errno == Some(libc::ENOENT) => 0,
                 Err(e) => return Err(e),
             };
-        let existing: Option<(String, u64)> = self
+        let mut existing: Option<(String, u64)> = self
             .catalog
             .db
             .query_row(
@@ -97,19 +98,27 @@ impl ImportCoordinator {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
+        if let Some((id, bytes)) = &mut existing {
+            *bytes = self
+                .catalog
+                .reservation_charge(serde_json::from_value(id.clone().into())?)?;
+        }
         let reserved = self
             .catalog
             .remaining_reservations(FilesystemId(local.device()))?
             .checked_sub(existing.as_ref().map_or(0, |r| r.1))
             .ok_or_else(|| AppError::integrity("reservation accounting mismatch"))?;
-        let occupied = occupied_bytes(&local)?
-            .checked_add(state_occupied_bytes(&state)?)
+        let measurement = self.catalog.admission_measurement(&local, &state)?;
+        let occupied = measurement
+            .local
+            .total
+            .checked_add(measurement.state.total)
             .ok_or_else(|| AppError::invalid("occupancy overflow"))?;
         let input = AdmissionInput {
             budget: self.config.budget,
             occupied,
             reserved,
-            available: available_bytes(&local)?,
+            available: measurement.filesystem_free,
             reserve: self.config.reserve,
             required: size,
             existing: 0,
@@ -151,7 +160,9 @@ impl ImportCoordinator {
             self.catalog.transition(job,record.generation,JobTransition::Wait(JobState::WaitingCapacity,"local budget or filesystem reserve unavailable; source retained while direct archive publication is considered".into()))?;
             return Ok(None);
         };
-        if state.device() != local.device() && available_bytes(&state)? < self.config.reserve {
+        if state.device() != local.device()
+            && measurement.state_filesystem_free < self.config.reserve
+        {
             return Ok(None);
         }
         let reservation = if let Some((id, _)) = existing {
@@ -162,12 +173,18 @@ impl ImportCoordinator {
             self.catalog
                 .reserve(transfer, FilesystemId(local.device()), additional_bytes)?
         };
+        self.catalog
+            .transition(job, record.generation, JobTransition::Resume)?;
+        self.catalog
+            .db
+            .execute("DELETE FROM job_retry WHERE job=?", [job.to_string()])?;
         Ok(Some(LocalImportAttempt {
             spec,
             destination: ArchivePath::parse(&destination)?,
             parent: job,
             item,
             reservation,
+            reuse_only: destination_exists,
             group: group
                 .map(|g| serde_json::from_str(&format!("\"{g}\"")))
                 .transpose()?,
@@ -176,11 +193,8 @@ impl ImportCoordinator {
     }
     pub fn reconcile_local_reservation(&mut self, attempt: &LocalImportAttempt) -> AppResult<()> {
         let root = RootHandle::open(&attempt.spec.destination_root, RootPolicy::Local)?;
-        if root
-            .open_relative(&attempt.destination, libc::O_RDONLY | libc::O_NONBLOCK, 0)
-            .is_ok()
-        {
-            return self.catalog.update_reservation(attempt.reservation, 0);
+        if attempt.reuse_only {
+            return Ok(());
         }
         let size = match root.open_relative(
             &attempt.spec.staged_path,
@@ -287,6 +301,7 @@ impl ImportCoordinator {
         error: &AppError,
     ) -> AppResult<()> {
         self.catalog.update_reservation(attempt.reservation, 0)?;
+        self.catalog.invalidate_admission()?;
         self.catalog.db.execute(
             "UPDATE attempts SET state=? WHERE job=? AND generation=?",
             params![

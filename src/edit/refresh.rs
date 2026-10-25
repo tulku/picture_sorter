@@ -15,11 +15,16 @@ use std::{
 };
 #[derive(Default)]
 pub struct ApplicationSessions {
-    sessions: Mutex<HashMap<ApplicationSessionId, Weak<AtomicBool>>>,
+    sessions: Mutex<HashMap<ApplicationSessionId, Weak<Authorization>>>,
+    remote: Option<(RootHandle, JobId, ApplicationSessionId)>,
 }
 pub struct ApplicationSession {
     id: ApplicationSessionId,
-    authorized: Arc<AtomicBool>,
+    authorized: Arc<Authorization>,
+}
+struct Authorization {
+    flag: AtomicBool,
+    peer: Option<std::os::unix::net::UnixStream>,
 }
 impl ApplicationSession {
     pub fn id(&self) -> ApplicationSessionId {
@@ -28,18 +33,47 @@ impl ApplicationSession {
 }
 impl Drop for ApplicationSession {
     fn drop(&mut self) {
-        self.authorized.store(false, Ordering::SeqCst);
+        self.authorized.flag.store(false, Ordering::SeqCst);
     }
 }
 impl ApplicationSessions {
+    pub(crate) fn worker_authority(
+        state: RootHandle,
+        job: JobId,
+        session: ApplicationSessionId,
+    ) -> Self {
+        Self {
+            remote: Some((state, job, session)),
+            ..Self::default()
+        }
+    }
     pub fn authorize(&self, editor_closed: bool, no_wait: bool) -> AppResult<ApplicationSession> {
+        self.authorize_bound(editor_closed, no_wait, None)
+    }
+    pub fn authorize_peer(
+        &self,
+        editor_closed: bool,
+        no_wait: bool,
+        peer: &std::os::unix::net::UnixStream,
+    ) -> AppResult<ApplicationSession> {
+        self.authorize_bound(editor_closed, no_wait, Some(peer.try_clone()?))
+    }
+    fn authorize_bound(
+        &self,
+        editor_closed: bool,
+        no_wait: bool,
+        peer: Option<std::os::unix::net::UnixStream>,
+    ) -> AppResult<ApplicationSession> {
         if !editor_closed || no_wait {
             return Err(AppError::invalid(
                 "applying refresh requires a foreground editor-closed assertion",
             ));
         }
         let id = ApplicationSessionId::new();
-        let authorized = Arc::new(AtomicBool::new(true));
+        let authorized = Arc::new(Authorization {
+            flag: AtomicBool::new(true),
+            peer,
+        });
         let mut map = self
             .sessions
             .lock()
@@ -49,17 +83,60 @@ impl ApplicationSessions {
         Ok(ApplicationSession { id, authorized })
     }
     pub fn authorized(&self, id: ApplicationSessionId) -> bool {
+        if let Some((state, job, session)) = &self.remote {
+            if *session != id {
+                return false;
+            }
+            let check = || -> AppResult<bool> {
+                use crate::service::{Client, protocol::*};
+                let response = Client::connect_state(state)?.send(Request {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: OperationId::new(),
+                    command: Command::CheckApplication {
+                        job: *job,
+                        session: *session,
+                    },
+                    dry_run: false,
+                    no_wait: false,
+                    wait_for: Milestone::Ingested,
+                })?;
+                Ok(
+                    matches!(response.outcome,ResponseOutcome::Data{data} if data["authorized"]==true),
+                )
+            };
+            return check().unwrap_or(false);
+        }
         self.sessions
             .lock()
             .ok()
             .and_then(|s| s.get(&id).and_then(Weak::upgrade))
-            .is_some_and(|s| s.load(Ordering::SeqCst))
+            .is_some_and(|s| {
+                if !s.flag.load(Ordering::SeqCst) {
+                    return false;
+                }
+                let Some(peer) = &s.peer else {
+                    return true;
+                };
+                use std::os::fd::AsRawFd;
+                let mut byte = 0u8;
+                let result = unsafe {
+                    libc::recv(
+                        peer.as_raw_fd(),
+                        (&mut byte as *mut u8).cast(),
+                        1,
+                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                    )
+                };
+                result > 0
+                    || (result < 0
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock)
+            })
     }
     pub fn revoke(&self, id: ApplicationSessionId) {
         if let Ok(sessions) = self.sessions.lock()
             && let Some(state) = sessions.get(&id).and_then(Weak::upgrade)
         {
-            state.store(false, Ordering::SeqCst);
+            state.flag.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -68,11 +145,13 @@ pub struct RefreshRequest {
     pub application_session: ApplicationSessionId,
     pub operation_id: OperationId,
 }
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RefreshReport {
     pub applied: Vec<VersionId>,
     pub conflicts: Vec<SidecarId>,
     pub waiting_application: bool,
+    #[serde(default)]
+    pub has_more: bool,
 }
 pub struct RefreshCoordinator<'a> {
     pub catalog: &'a mut Catalog,
@@ -114,6 +193,15 @@ impl RefreshCoordinator<'_> {
         request: RefreshRequest,
         faults: &dyn FaultInjector,
     ) -> AppResult<RefreshReport> {
+        self.apply_batch(request, faults, usize::MAX, None)
+    }
+    pub(crate) fn apply_batch(
+        &mut self,
+        request: RefreshRequest,
+        faults: &dyn FaultInjector,
+        limit: usize,
+        job: Option<JobId>,
+    ) -> AppResult<RefreshReport> {
         self.local.require_local()?;
         self.state.require_local()?;
         let mut report = RefreshReport::default();
@@ -123,18 +211,28 @@ impl RefreshCoordinator<'_> {
         }
         for group in request.groups {
             let group = self.catalog.canonical_group(group)?;
-            let mut q=self.catalog.db.prepare("SELECT p.committed FROM projections p JOIN sidecars s ON s.id=p.sidecar WHERE s.group_id=? AND p.pending=1 AND p.committed IS NOT NULL")?;
+            let mut q=self.catalog.db.prepare("SELECT p.committed FROM projections p JOIN sidecars s ON s.id=p.sidecar WHERE s.group_id=? AND p.pending=1 AND p.committed IS NOT NULL ORDER BY p.sidecar LIMIT ?")?;
             let plans = q
-                .query_map([group.to_string()], |r| r.get::<_, String>(0))?
+                .query_map(
+                    params![
+                        group.to_string(),
+                        limit.saturating_add(1).min(i64::MAX as usize) as i64
+                    ],
+                    |r| r.get::<_, String>(0),
+                )?
                 .collect::<Result<Vec<_>, _>>()?;
             drop(q);
             for encoded in plans {
+                if report.applied.len() >= limit {
+                    report.has_more = true;
+                    return Ok(report);
+                }
                 if !self.sessions.authorized(request.application_session) {
                     report.waiting_application = true;
                     return Ok(report);
                 }
                 let plan: ProjectionPlan = serde_json::from_str(&encoded)?;
-                if plan.owner == "jpeg-xmp-external" {
+                if !crate::archive::owns_projection(&plan.owner, &plan.path) {
                     continue;
                 }
                 let observed = observed_body(self.local, &plan.path)?;
@@ -169,13 +267,21 @@ impl RefreshCoordinator<'_> {
                         ".photo-sorter/snapshots/{}",
                         &digest.as_str()[7..]
                     ))?;
-                    match root.create_new(&target) {
-                        Ok(mut destination) => {
-                            std::io::copy(&mut file, &mut destination)?;
-                            destination.sync_all()?;
+                    root.mkdir_all(&ArchivePath::parse(".photo-sorter/refresh")?)?;
+                    let temporary = ArchivePath::parse(&format!(
+                        ".photo-sorter/refresh/preserved-{}",
+                        OperationId::new()
+                    ))?;
+                    copy_exact(&mut file, &mut root.create_new(&temporary)?, digest, *size)?;
+                    if publish_noreplace(root, &temporary, &target)? == PublishOutcome::Exists {
+                        let mut existing =
+                            root.open_relative(&target, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+                        if crate::transfer::digest_file(&mut existing)? != (digest.clone(), *size) {
+                            return Err(AppError::integrity(
+                                "preserved refresh snapshot differs from its immutable identity",
+                            ));
                         }
-                        Err(e) if e.errno == Some(libc::EEXIST) => {}
-                        Err(e) => return Err(e),
+                        root.unlink(&temporary, false)?;
                     }
                     self.catalog.db.execute("INSERT INTO snapshots(digest,path,size) VALUES(?,?,?) ON CONFLICT DO NOTHING",params![digest.as_str(),target.as_str(),size])?;
                 }
@@ -197,8 +303,7 @@ impl RefreshCoordinator<'_> {
                     use std::io::{Seek, SeekFrom};
                     history.seek(SeekFrom::Start(0))?;
                     let mut file = self.local.create_new(&staged)?;
-                    std::io::copy(&mut history, &mut file)?;
-                    file.sync_all()?;
+                    copy_exact(&mut history, &mut file, digest, *size)?;
                 }
                 self.catalog.db.execute("INSERT INTO observations(path,tool_digest) VALUES(?,?) ON CONFLICT(path) DO UPDATE SET tool_digest=excluded.tool_digest",params![plan.path.as_str(),serde_json::to_string(&plan.body)?])?;
                 faults.hit(FaultPoint::BeforeProjection)?;
@@ -240,12 +345,17 @@ impl RefreshCoordinator<'_> {
                         }
                     }
                 }
-                self.catalog.db.execute(
+                let tx = self.catalog.db.transaction()?;
+                tx.execute(
                     "UPDATE projections SET pending=0,applied=? WHERE sidecar=? AND committed=?",
                     params![plan.version.to_string(), plan.sidecar.to_string(), encoded],
                 )?;
-                self.catalog.db.execute("INSERT INTO local_heads(sidecar,version,dirty) VALUES(?,?,0) ON CONFLICT(sidecar) DO UPDATE SET version=excluded.version,dirty=0",params![plan.sidecar.to_string(),plan.version.to_string()])?;
-                self.catalog.db.execute("UPDATE sidecars SET protected=0 WHERE id=? AND NOT EXISTS(SELECT 1 FROM sidecar_diagnostics WHERE sidecar=?)",params![plan.sidecar.to_string(),plan.sidecar.to_string()])?;
+                tx.execute("INSERT INTO local_heads(sidecar,version,dirty) VALUES(?,?,0) ON CONFLICT(sidecar) DO UPDATE SET version=excluded.version,dirty=0",params![plan.sidecar.to_string(),plan.version.to_string()])?;
+                tx.execute("UPDATE sidecars SET protected=0 WHERE id=? AND NOT EXISTS(SELECT 1 FROM sidecar_diagnostics WHERE sidecar=?)",params![plan.sidecar.to_string(),plan.sidecar.to_string()])?;
+                if let Some(job) = job {
+                    tx.execute("INSERT INTO refresh_application_receipts(job,sidecar,version) VALUES(?,?,?) ON CONFLICT(job,sidecar,version) DO NOTHING",params![job.to_string(),plan.sidecar.to_string(),plan.version.to_string()])?;
+                }
+                tx.commit()?;
                 report.applied.push(plan.version);
             }
             self.catalog.refresh_protection(group)?;
@@ -263,4 +373,39 @@ fn observed_body(root: &RootHandle, path: &ArchivePath) -> AppResult<VersionBody
         Err(e) if e.errno == Some(libc::ENOENT) => Ok(VersionBody::Reset),
         Err(e) => Err(e),
     }
+}
+
+fn copy_exact(
+    source: &mut std::fs::File,
+    destination: &mut std::fs::File,
+    digest: &Digest,
+    size: u64,
+) -> AppResult<()> {
+    use std::io::{Read, Write};
+    let mut remaining = size
+        .checked_add(1)
+        .ok_or_else(|| AppError::invalid("refresh copy size overflow"))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut copied = 0u64;
+    let mut buffer = [0u8; 128 * 1024];
+    while remaining > 0 {
+        let limit = remaining.min(buffer.len() as u64) as usize;
+        let n = source.read(&mut buffer[..limit])?;
+        if n == 0 {
+            break;
+        }
+        destination.write_all(&buffer[..n])?;
+        hasher.update(&buffer[..n]);
+        copied += n as u64;
+        remaining -= n as u64;
+    }
+    destination.sync_all()?;
+    if copied != size
+        || Digest::parse(&format!("blake3:{}", hasher.finalize().to_hex()))? != *digest
+    {
+        return Err(AppError::integrity(
+            "refresh copy changed; retained bytes require inspection",
+        ));
+    }
+    Ok(())
 }

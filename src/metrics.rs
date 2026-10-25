@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
-static COUNTERS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static COUNTERS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metrics {
     pub streamed_hash_bytes: u64,
@@ -14,9 +14,11 @@ pub struct Metrics {
     pub exif_micros: u64,
     pub transfer_micros: u64,
     pub journal_micros: u64,
+    #[serde(default)]
+    pub refresh_applications: u64,
 }
 impl Metrics {
-    fn values(&self) -> [u64; 8] {
+    fn values(&self) -> [u64; 9] {
         [
             self.streamed_hash_bytes,
             self.exif_invocations,
@@ -26,9 +28,10 @@ impl Metrics {
             self.exif_micros,
             self.transfer_micros,
             self.journal_micros,
+            self.refresh_applications,
         ]
     }
-    fn from_values(v: [u64; 8]) -> Self {
+    fn from_values(v: [u64; 9]) -> Self {
         Self {
             streamed_hash_bytes: v[0],
             exif_invocations: v[1],
@@ -38,6 +41,7 @@ impl Metrics {
             exif_micros: v[5],
             transfer_micros: v[6],
             journal_micros: v[7],
+            refresh_applications: v[8],
         }
     }
     pub fn difference(&self, before: &Self) -> Self {
@@ -96,4 +100,8 @@ impl Drop for Timer {
             Ordering::Relaxed,
         );
     }
+}
+
+pub(crate) fn refresh_application() {
+    COUNTERS[8].fetch_add(1, Ordering::Relaxed);
 }

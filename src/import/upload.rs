@@ -245,6 +245,11 @@ impl UploadDriver {
                 ));
             }
             WorkerState::Failed(error) => {
+                if matches!(active.phase, Phase::List) {
+                    engine
+                        .catalog
+                        .block_journal_enumeration(&error.to_string())?;
+                }
                 if matches!(active.phase, Phase::Read)
                     && matches!(error.code, ErrorCode::Integrity | ErrorCode::Unsupported)
                     && let Some(entry) = active
@@ -565,7 +570,8 @@ fn prepare_plan(engine: &mut ImportCoordinator, active: &Active) -> AppResult<Pu
                     kind: "sidecar".into(),
                     heads,
                 });
-            } else if group.is_some() && owner_name != "jpeg-xmp-external" {
+            } else if group.is_some() && crate::archive::owns_projection(&owner_name, &sidecar_path)
+            {
                 records.push(ArchiveRecord::ProjectionPlanned {
                     plan: ProjectionPlan {
                         sidecar,

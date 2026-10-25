@@ -416,15 +416,22 @@ fn prepare_attempt(
     let local = RootHandle::open(&config.working_root, RootPolicy::Local)?;
     let state = RootHandle::open(&config.state_root, RootPolicy::Local)?;
     let root = if target.metadata { &state } else { &local };
-    let occupied = occupied_bytes(&local)?
-        .checked_add(state_occupied_bytes(&state)?)
+    let measurement = catalog.admission_measurement(&local, &state)?;
+    let occupied = measurement
+        .local
+        .total
+        .checked_add(measurement.state.total)
         .ok_or_else(|| AppError::invalid("occupancy overflow"))?;
     let decision = admit_with_budget_reservations(
         &AdmissionInput {
             budget: config.budget,
             occupied,
             reserved: catalog.remaining_reservations(FilesystemId(root.device()))?,
-            available: available_bytes(root)?,
+            available: if root.device() == local.device() {
+                measurement.filesystem_free
+            } else {
+                measurement.state_filesystem_free
+            },
             reserve: config.reserve,
             required: target.member.size,
             existing: 0,
@@ -504,24 +511,27 @@ fn readmit_attempt(catalog: &mut Catalog, config: &Config, attempt: &Attempt) ->
     let local = RootHandle::open(&config.working_root, RootPolicy::Local)?;
     let state = RootHandle::open(&config.state_root, RootPolicy::Local)?;
     let root = RootHandle::open(&attempt.spec.destination_root, RootPolicy::Local)?;
-    let own: u64 = catalog.db.query_row(
-        "SELECT remaining FROM reservations WHERE id=?",
-        [attempt.reservation.to_string()],
-        |r| r.get(0),
-    )?;
+    let own = catalog.reservation_charge(attempt.reservation)?;
     let reserved = catalog
         .remaining_reservations(FilesystemId(root.device()))?
         .checked_sub(own)
         .ok_or_else(|| AppError::integrity("pin reservation filesystem mismatch"))?;
-    let occupied = occupied_bytes(&local)?
-        .checked_add(state_occupied_bytes(&state)?)
+    let measurement = catalog.admission_measurement(&local, &state)?;
+    let occupied = measurement
+        .local
+        .total
+        .checked_add(measurement.state.total)
         .ok_or_else(|| AppError::invalid("occupancy overflow"))?;
     let decision = admit_with_budget_reservations(
         &AdmissionInput {
             budget: config.budget,
             occupied,
             reserved,
-            available: available_bytes(&root)?,
+            available: if root.device() == local.device() {
+                measurement.filesystem_free
+            } else {
+                measurement.state_filesystem_free
+            },
             reserve: config.reserve,
             required: attempt.spec.expected_size,
             existing: 0,
@@ -557,7 +567,7 @@ impl Catalog {
                 group: requested,
                 versions,
             } => {
-                if requested != group || versions.len() > 3 || versions.is_empty() {
+                if requested != group || versions.len() > 3 {
                     return Err(AppError::invalid(
                         "metadata merge fetch requires one to three exact versions of its group",
                     ));
@@ -575,7 +585,7 @@ impl Catalog {
                         ));
                     }
                 }
-                (true, versions)
+                (!versions.is_empty(), versions)
             }
             _ => (false, vec![]),
         };

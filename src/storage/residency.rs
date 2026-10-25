@@ -94,6 +94,9 @@ impl Catalog {
         Ok(id)
     }
     pub fn total_remaining_reservations(&self) -> AppResult<u64> {
+        if self.async_admission {
+            return self.conservative_reservations(None);
+        }
         let mut query = self.db.prepare("SELECT remaining FROM reservations")?;
         let mut sum = 0u64;
         for row in query.query_map([], |r| r.get::<_, u64>(0))? {
@@ -104,6 +107,9 @@ impl Catalog {
         Ok(sum)
     }
     pub fn remaining_reservations(&self, filesystem: FilesystemId) -> AppResult<u64> {
+        if self.async_admission {
+            return self.conservative_reservations(Some(filesystem));
+        }
         let mut q = self
             .db
             .prepare("SELECT remaining FROM reservations WHERE filesystem=?")?;

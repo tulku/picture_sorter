@@ -30,6 +30,7 @@ struct Active {
     report: IntegrityReport,
     object_cursor: i64,
     objects_done: bool,
+    projection_cursor: String,
     deferred: Option<(NasCommand, bool)>,
 }
 enum Mode {
@@ -112,6 +113,7 @@ impl ArchiveReader {
             report: IntegrityReport::default(),
             object_cursor: 0,
             objects_done: false,
+            projection_cursor: String::new(),
             deferred: None,
         });
         Ok(())
@@ -209,6 +211,7 @@ impl ArchiveReader {
             report: IntegrityReport::default(),
             object_cursor: 0,
             objects_done: false,
+            projection_cursor: String::new(),
             deferred: None,
         });
         Ok(())
@@ -239,6 +242,7 @@ impl ArchiveReader {
                 report: IntegrityReport::default(),
                 object_cursor: 0,
                 objects_done: true,
+                projection_cursor: String::new(),
                 deferred: None,
             });
             return Ok(());
@@ -286,6 +290,11 @@ impl ArchiveReader {
             }
             WorkerState::Failed(error) => {
                 self.reason = Some(error.to_string());
+                if matches!(active.phase, Phase::List) {
+                    engine
+                        .catalog
+                        .block_journal_enumeration(&error.to_string())?;
+                }
                 if matches!(active.phase, Phase::Read) {
                     let entry = active
                         .batch
@@ -372,12 +381,18 @@ impl ArchiveReader {
             }
             (Phase::Objects, NasReply::Integrity(report)) => {
                 active.report.checked += report.checked;
+                engine
+                    .catalog
+                    .protect_integrity_scoped("archive", &report)?;
                 for finding in report.findings {
                     record_finding(engine, &mut active, finding)?;
                 }
                 (next_objects(&engine.catalog, &mut active)?, false)
             }
             (Phase::End, NasReply::Done) => {
+                if active.report.findings.is_empty() {
+                    engine.catalog.clear_journal_enumeration_block()?;
+                }
                 let readiness = match &mut active.mode {
                     Mode::Sync => {
                         engine.catalog.drain_pending(128)?;
@@ -389,21 +404,23 @@ impl ArchiveReader {
                     }
                 };
                 if let PublicationReadiness::Blocked(reasons) = readiness {
+                    if !matches!(active.mode, Mode::Sync) {
+                        engine.catalog.block_journal_enumeration("fresh journal audit has unresolved dependencies or unsupported records")?;
+                    }
                     for reason in reasons.into_iter().take(128) {
-                        record_finding(
-                            engine,
-                            &mut active,
-                            IntegrityFinding {
+                        if active.report.findings.len() < 128 {
+                            active.report.findings.push(IntegrityFinding {
                                 path: ArchivePath::parse(".photo-sorter/journal")?,
                                 status: IntegrityStatus::Unknown,
                                 reason,
-                            },
-                        )?;
+                            });
+                        }
                     }
                 }
                 match &mut active.mode {
                     Mode::Sync => {
                         if active.report.findings.is_empty() {
+                            engine.catalog.clear_journal_enumeration_block()?;
                             self.last_success = Some(now);
                             self.completed_syncs += 1;
                             self.reason = None;
@@ -552,6 +569,10 @@ fn next_read(main: &Catalog, active: &mut Active) -> AppResult<NasCommand> {
 }
 fn next_objects(main: &Catalog, active: &mut Active) -> AppResult<NasCommand> {
     let config = active.config.clone();
+    let audit_catalog = match &active.mode {
+        Mode::Verify { catalog, .. } => catalog,
+        _ => main,
+    };
     let session = active
         .session
         .ok_or_else(|| AppError::integrity("read session missing"))?;
@@ -560,7 +581,7 @@ fn next_objects(main: &Catalog, active: &mut Active) -> AppResult<NasCommand> {
         return Ok(NasCommand::ReadJournalEnd { session });
     }
     let mut objects = vec![];
-    let mut query=main.db.prepare("SELECT p.rowid,p.path,p.digest,b.size FROM placements p JOIN blobs b ON b.digest=p.digest WHERE archived=1 AND p.rowid>? ORDER BY p.rowid LIMIT 128")?;
+    let mut query=audit_catalog.db.prepare("SELECT p.rowid,p.path,p.digest,b.size FROM placements p JOIN blobs b ON b.digest=p.digest WHERE archived=1 AND p.rowid>? ORDER BY p.rowid LIMIT 128")?;
     let mut rows = query.query([active.object_cursor])?;
     while let Some(row) = rows.next()? {
         active.object_cursor = row.get(0)?;
@@ -571,6 +592,18 @@ fn next_objects(main: &Catalog, active: &mut Active) -> AppResult<NasCommand> {
         });
     }
     if objects.is_empty() {
+        let batch =
+            audit_catalog.verification_batch("archive_projections", &active.projection_cursor)?;
+        if let Some((last, _)) = batch.last() {
+            active.projection_cursor = last.clone();
+            active.phase = Phase::Objects;
+            return Ok(NasCommand::AuditTargets {
+                root: config.archive_root.clone(),
+                archive: config.archive_id,
+                writer: config.writer_id,
+                targets: batch.into_iter().map(|(_, target)| target).collect(),
+            });
+        }
         active.objects_done = true;
         active.phase = Phase::End;
         return Ok(NasCommand::ReadJournalEnd { session });
@@ -602,9 +635,12 @@ fn record_finding(
     let report = IntegrityReport {
         verified: vec![],
         checked: 0,
+        verified_absent: vec![],
         findings: vec![finding.clone()],
     };
-    engine.catalog.protect_integrity(&report)?;
+    engine
+        .catalog
+        .protect_integrity_scoped("archive", &report)?;
     if active.report.findings.len() < 128 {
         active.report.findings.push(finding);
     }

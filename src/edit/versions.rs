@@ -109,6 +109,11 @@ impl<'a> VersionStore<'a> {
             }
         }
         let old:Option<(String,String,String,String,String)>=self.catalog.db.query_row("SELECT version,sidecar,parents,body,origin FROM snapshot_intents WHERE operation=?",[intent.operation.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        let fresh_intent = old.is_none();
+        if fresh_intent && let SnapshotPayload::Content(bytes) = &intent.payload {
+            self.catalog
+                .admit_inline_snapshot(self.root, bytes.len() as u64)?;
+        }
         let version = if let Some((
             version,
             sidecar,
@@ -149,6 +154,8 @@ impl<'a> VersionStore<'a> {
             stored.register(self.root, self.catalog)?;
         }
         if let SnapshotPayload::Content(bytes) = &intent.payload {
+            self.catalog
+                .admit_inline_snapshot(self.root, bytes.len() as u64)?;
             let digest = Digest::of(bytes);
             self.root
                 .mkdir_all(&ArchivePath::parse(".photo-sorter/snapshots")?)?;

@@ -235,6 +235,9 @@ impl<'a> BootstrapCoordinator<'a> {
                 return Ok(report);
             }
             WorkerState::Failed(e) => {
+                if matches!(active.phase, Phase::List) {
+                    self.catalog.block_journal_enumeration(&e.to_string())?;
+                }
                 report.reason = Some(e.to_string());
                 let record = self.catalog.job(job)?;
                 self.catalog.transition(

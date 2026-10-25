@@ -158,6 +158,7 @@ fn configured_local_worker_refuses_replaced_profile_root_before_writing() {
                 expected_size: 3,
             },
             destination: ArchivePath::parse("RAW/A.ORF").unwrap(),
+            reuse_only: false,
         })
         .unwrap();
     assert!(matches!(wait(&mut worker, ticket), WorkerState::Failed(_)));
@@ -215,4 +216,98 @@ fn configured_nas_worker_refuses_changed_state_root_before_archive_staging() {
     assert!(matches!(wait(&mut worker, ticket), WorkerState::Failed(_)));
     assert!(!r.archive.join(staged.as_str()).exists());
     assert_eq!(std::fs::read(r.source.join("A.ORF")).unwrap(), b"raw");
+}
+
+#[test]
+fn archive_worker_rejects_physical_working_root_overlap_before_marker_creation() {
+    use photo_sorter::{archive::*, config::Config};
+    use std::process::Command;
+    if std::env::var_os("PHOTO_ARCHIVE_BIND_CHILD").is_none() {
+        let output = Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "archive_worker_rejects_physical_working_root_overlap_before_marker_creation",
+                "--nocapture",
+            ])
+            .env("PHOTO_ARCHIVE_BIND_CHILD", "1")
+            .output()
+            .unwrap();
+        if !output.status.success()
+            && String::from_utf8_lossy(&output.stderr)
+                .contains("unshare failed: Operation not permitted")
+        {
+            eprintln!(
+                "UNRUN: private mount namespace unavailable; physical mount-coordinate unit tests still apply"
+            );
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    struct Bind(std::path::PathBuf);
+    impl Drop for Bind {
+        fn drop(&mut self) {
+            assert!(
+                Command::new("umount")
+                    .arg(&self.0)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+    for nested in [false, true] {
+        let rig = support::TestRig::new();
+        let source = if nested {
+            let p = rig.local.join("nested");
+            std::fs::create_dir(&p).unwrap();
+            p
+        } else {
+            rig.local.clone()
+        };
+        std::fs::write(source.join("sentinel"), b"generated archive bytes").unwrap();
+        assert!(
+            Command::new("mount")
+                .arg("--bind")
+                .arg(&source)
+                .arg(&rig.archive)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _binding = Bind(rig.archive.clone());
+        let mut config = Config::new(rig.local.clone(), rig.state.clone(), rig.archive.clone());
+        config.local_test_backend = true;
+        let mut worker = WorkerSupervisor::new_configured(
+            env!("CARGO_BIN_EXE_photo_sorter").into(),
+            vec![],
+            &config,
+        )
+        .unwrap();
+        let ticket = worker
+            .submit(NasCommand::Initialize {
+                root: rig.archive.clone(),
+                request: InitArchive {
+                    archive_id: ArchiveId::new(),
+                    writer_id: config.writer_id,
+                },
+            })
+            .unwrap();
+        assert!(
+            matches!(wait(&mut worker, ticket), WorkerState::Failed(_)),
+            "physically overlapping archive root was admitted"
+        );
+        assert!(!rig.archive.join(".photo-sorter/archive.json").exists());
+        assert_eq!(
+            std::fs::read(source.join("sentinel")).unwrap(),
+            b"generated archive bytes"
+        );
+    }
 }

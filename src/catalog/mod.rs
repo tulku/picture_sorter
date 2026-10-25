@@ -13,6 +13,11 @@ use std::{fs::File, os::fd::AsRawFd, path::Path};
 pub struct Catalog {
     pub(crate) db: Connection,
     _root: File,
+    pub(crate) async_admission: bool,
+    admission_limits: Option<(u64, u64)>,
+    admission_observed: std::cell::Cell<Option<std::time::Instant>>,
+    admission_requested: std::cell::Cell<bool>,
+    admission_proof: std::cell::RefCell<Option<(u64, crate::fs::ManagedSpaceMeasurement)>>,
 }
 impl Catalog {
     pub fn open(state: &RootHandle) -> AppResult<Self> {
@@ -72,7 +77,29 @@ impl Catalog {
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
         state.sync()?;
-        Ok(Self { db, _root: root })
+        db.execute_batch("CREATE TABLE IF NOT EXISTS admission_epoch(value INTEGER NOT NULL); INSERT INTO admission_epoch SELECT 0 WHERE NOT EXISTS(SELECT 1 FROM admission_epoch);
+CREATE TABLE IF NOT EXISTS refresh_application_receipts(job TEXT NOT NULL REFERENCES jobs(id),sidecar TEXT NOT NULL,version TEXT NOT NULL,UNIQUE(job,sidecar,version));
+CREATE TABLE IF NOT EXISTS local_residency_expectations(placement TEXT PRIMARY KEY);
+INSERT OR IGNORE INTO local_residency_expectations SELECT id FROM placements WHERE local_ready=1;
+DROP TRIGGER IF EXISTS residency_expected_insert;
+DROP TRIGGER IF EXISTS residency_expected_update;
+CREATE TRIGGER IF NOT EXISTS residency_expected_insert_v2 AFTER INSERT ON placements WHEN new.local_ready=1 BEGIN INSERT INTO local_residency_expectations SELECT new.id WHERE NOT EXISTS(SELECT 1 FROM local_residency_expectations WHERE placement=new.id); END;
+CREATE TRIGGER IF NOT EXISTS residency_expected_update_v2 AFTER UPDATE OF local_ready ON placements WHEN new.local_ready=1 BEGIN INSERT INTO local_residency_expectations SELECT new.id WHERE NOT EXISTS(SELECT 1 FROM local_residency_expectations WHERE placement=new.id); END;
+CREATE TRIGGER IF NOT EXISTS residency_expected_delete AFTER DELETE ON placements BEGIN DELETE FROM local_residency_expectations WHERE placement=old.id; END;
+CREATE TABLE IF NOT EXISTS reservation_ceilings(id TEXT PRIMARY KEY,bytes INTEGER NOT NULL);
+INSERT OR IGNORE INTO reservation_ceilings SELECT id,remaining FROM reservations;
+CREATE TRIGGER IF NOT EXISTS admission_insert AFTER INSERT ON reservations BEGIN UPDATE admission_epoch SET value=value+1; INSERT INTO reservation_ceilings VALUES(new.id,new.remaining); END;
+CREATE TRIGGER IF NOT EXISTS admission_update AFTER UPDATE OF remaining ON reservations WHEN old.remaining<>new.remaining BEGIN UPDATE admission_epoch SET value=value+1; UPDATE reservation_ceilings SET bytes=max(bytes,new.remaining) WHERE id=new.id; END;
+CREATE TRIGGER IF NOT EXISTS admission_delete AFTER DELETE ON reservations BEGIN UPDATE admission_epoch SET value=value+1; DELETE FROM reservation_ceilings WHERE id=old.id; END;")?;
+        Ok(Self {
+            db,
+            _root: root,
+            async_admission: false,
+            admission_limits: None,
+            admission_observed: std::cell::Cell::new(None),
+            admission_requested: std::cell::Cell::new(false),
+            admission_proof: std::cell::RefCell::new(None),
+        })
     }
     pub fn backup(&self, dest: &Path) -> AppResult<()> {
         backup_connection(&self.db, dest)
@@ -147,3 +174,5 @@ pub(crate) fn backup_readonly(state: &RootHandle, dest: &Path) -> AppResult<()> 
 
 mod rating_convergence;
 pub use rating_convergence::*;
+
+mod admission;

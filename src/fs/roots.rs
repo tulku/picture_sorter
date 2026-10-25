@@ -386,6 +386,76 @@ fn open_root_directory(path: &Path) -> AppResult<File> {
     // A successful openat2 returns a new owned directory descriptor.
     Ok(unsafe { File::from_raw_fd(fd as RawFd) })
 }
+pub fn ensure_disjoint_roots(left: &RootHandle, right: &RootHandle) -> AppResult<()> {
+    left.validate_identity()?;
+    right.validate_identity()?;
+    if left.device() != right.device() {
+        return Ok(());
+    }
+    let info = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let a = physical_mount_path(&info, left.mount_number(), left.path())?;
+    let b = physical_mount_path(&info, right.mount_number(), right.path())?;
+    if left.inode() == right.inode() || a.starts_with(&b) || b.starts_with(&a) {
+        return Err(AppError::new(
+            ErrorCode::Conflict,
+            "managed roots physically overlap; archive and cache bytes must be independent",
+        ));
+    }
+    Ok(())
+}
+fn decode_mount_path(value: &str) -> AppResult<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let input = value.as_bytes();
+    let mut output = Vec::new();
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] == b'\\'
+            && index + 3 < input.len()
+            && input[index + 1..index + 4]
+                .iter()
+                .all(|b| (b'0'..=b'7').contains(b))
+        {
+            let value = u16::from(input[index + 1] - b'0') * 64
+                + u16::from(input[index + 2] - b'0') * 8
+                + u16::from(input[index + 3] - b'0');
+            output.push(
+                u8::try_from(value).map_err(|_| AppError::integrity("invalid mount escape"))?,
+            );
+            index += 4;
+        } else {
+            output.push(input[index]);
+            index += 1;
+        }
+    }
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(output)))
+}
+fn physical_mount_path(info: &str, id: u64, path: &Path) -> AppResult<PathBuf> {
+    let line = info
+        .lines()
+        .find(|line| {
+            line.split_whitespace()
+                .next()
+                .and_then(|id| id.parse::<u64>().ok())
+                == Some(id)
+        })
+        .ok_or_else(|| AppError::integrity("held root mount is absent"))?;
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    if fields.len() < 6 {
+        return Err(AppError::integrity("incomplete mount identity"));
+    }
+    let filesystem_root = decode_mount_path(fields[3])?;
+    let mountpoint = decode_mount_path(fields[4])?;
+    let relative = path
+        .strip_prefix(&mountpoint)
+        .map_err(|_| AppError::integrity("held path is outside its mount identity"))?;
+    if relative
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(AppError::integrity("non-canonical physical root path"));
+    }
+    Ok(filesystem_root.join(relative))
+}
 fn reject_network_root(path: &Path) -> AppResult<()> {
     use std::os::unix::ffi::OsStringExt;
     let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
@@ -436,4 +506,24 @@ fn reject_network_root(path: &Path) -> AppResult<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod physical_root_tests {
+    use super::*;
+    #[test]
+    fn mount_coordinates_identify_bind_aliases_and_nested_overlap() {
+        let info = "10 1 8:1 / / rw - ext4 /dev/fixture rw\n20 10 8:1 /photos /cache rw - ext4 /dev/fixture rw\n30 10 8:1 /photos /archive rw - ext4 /dev/fixture rw\n40 10 8:1 /photos/nested /other rw - ext4 /dev/fixture rw\n";
+        let cache = physical_mount_path(info, 20, Path::new("/cache")).unwrap();
+        assert_eq!(
+            cache,
+            physical_mount_path(info, 30, Path::new("/archive")).unwrap()
+        );
+        assert!(
+            physical_mount_path(info, 40, Path::new("/other"))
+                .unwrap()
+                .starts_with(cache)
+        );
+        assert_eq!(decode_mount_path("/a\\040b").unwrap(), Path::new("/a b"));
+    }
 }

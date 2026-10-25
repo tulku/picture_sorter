@@ -74,6 +74,10 @@ pub enum Command {
     Unpin {
         group: GroupId,
     },
+    CheckApplication {
+        job: JobId,
+        session: ApplicationSessionId,
+    },
     Refresh {
         groups: Vec<GroupId>,
         editor_closed: bool,
@@ -82,6 +86,8 @@ pub enum Command {
     Clean,
     JobShow {
         job: JobId,
+        #[serde(default)]
+        applied_after: Option<u64>,
     },
     JobWait {
         job: JobId,

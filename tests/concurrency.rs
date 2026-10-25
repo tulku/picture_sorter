@@ -241,3 +241,139 @@ fn concurrent_scenario(mergeable: bool) {
         );
     }
 }
+
+#[test]
+fn stage_only_refresh_fetches_remote_history_without_raw_or_live_metadata() {
+    let first = ServiceFixture::new();
+    assert!(first.cli(&["archive", "init"]).status.success());
+    std::fs::write(first.r.source.join("A.ORF"), b"generated stage raw").unwrap();
+    assert!(
+        first
+            .cli(&[
+                "import",
+                first.r.source.to_str().unwrap(),
+                "--wait-for",
+                "archived"
+            ])
+            .status
+            .success()
+    );
+    let (group, path) = raw(&first.status());
+    let saved = br#"{"version":1,"rating":3,"adjustments":{"exposure":2},"tags":null}"#;
+    std::fs::write(first.r.local.join(format!("{path}.rrdata")), saved).unwrap();
+    let deadline = Instant::now();
+    while std::fs::read(first.r.archive.join(format!("{path}.rrdata")))
+        .ok()
+        .as_deref()
+        != Some(saved)
+    {
+        assert!(deadline.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let archive = serde_json::from_value(first.status()["archive_id"].clone()).unwrap();
+    let second = ServiceFixture::with_config(|config, _| {
+        config.archive_id = Some(archive);
+        config.archive_root = first.r.archive.clone();
+        config.reconcile_seconds = 1;
+    });
+    let deadline = Instant::now();
+    while second.status()["groups"].as_array().unwrap().is_empty() {
+        assert!(deadline.elapsed() < Duration::from_secs(8));
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let output = second.cli(&["refresh", &group, "--stage-only", "--no-wait"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let job = response["outcome"]["job"].as_str().unwrap();
+    let output = second.cli(&["jobs", "wait", job]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let digest = Digest::of(saved);
+    assert_eq!(
+        std::fs::read(
+            second
+                .r
+                .state
+                .join(photo_sorter::edit::snapshot_path(&digest).unwrap().as_str())
+        )
+        .unwrap(),
+        saved
+    );
+    assert!(!second.r.local.join(&path).exists());
+    assert!(!second.r.local.join(format!("{path}.rrdata")).exists());
+    let status = second.status();
+    assert!(status["groups"][0]["readiness"]["metadata_current"] != true);
+    let original = second.r.local.join(&path);
+    std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+    std::fs::write(&original, b"generated stage raw").unwrap();
+    let deadline = Instant::now();
+    while second.status()["groups"][0]["readiness"]["originals_ready"] != true {
+        assert!(deadline.elapsed() < Duration::from_secs(8));
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let pid = second.status()["worker"]["maintenance_pid"]
+        .as_u64()
+        .unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let foreground_log = second.r._temp.path().join("foreground.json");
+    let mut foreground = std::process::Command::new(env!("CARGO_BIN_EXE_photo_sorter"))
+        .arg("--config")
+        .arg(&second.profile)
+        .args(["refresh", &group, "--editor-closed", "--json"])
+        .stdout(std::fs::File::create(&foreground_log).unwrap())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let check = Instant::now();
+    let _ = second.status();
+    assert!(check.elapsed() < Duration::from_secs(1));
+    assert!(
+        !second.r.local.join(format!("{path}.rrdata")).exists(),
+        "foreground bulk application bypassed local worker"
+    );
+    assert!(foreground.try_wait().unwrap().is_none());
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    let deadline = Instant::now();
+    loop {
+        if let Some(status) = foreground.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "{}",
+                std::fs::read_to_string(&foreground_log).unwrap()
+            );
+            break;
+        }
+        assert!(deadline.elapsed() < Duration::from_secs(8));
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert_eq!(
+        std::fs::read(second.r.local.join(format!("{path}.rrdata"))).unwrap(),
+        saved
+    );
+    assert!(
+        second.status()["session_metrics"]["refresh_applications"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "actual foreground refresh bypassed worker application"
+    );
+    let response: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&foreground_log).unwrap()).unwrap();
+    assert_eq!(
+        response["outcome"]["detail"]["applied_count"], 1,
+        "{response}"
+    );
+    assert_eq!(
+        response["outcome"]["detail"]["applied"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}

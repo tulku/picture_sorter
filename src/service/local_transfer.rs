@@ -52,6 +52,7 @@ impl LocalTransferDriver {
             let ticket = self.worker.submit(NasCommand::LocalTransfer {
                 spec: attempt.spec.clone(),
                 destination: attempt.destination.clone(),
+                reuse_only: attempt.reuse_only,
             })?;
             self.active = Some((attempt, ticket));
         }

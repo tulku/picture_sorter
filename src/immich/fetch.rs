@@ -173,19 +173,20 @@ impl PinFetchDriver {
                 catalog.record_materialization(group, member, false)?;
                 continue;
             }
-            let occupied = occupied_bytes(&local)?
-                .checked_add(crate::fs::state_occupied_bytes(&RootHandle::open(
-                    &config.state_root,
-                    RootPolicy::Local,
-                )?)?)
-                .ok_or_else(|| AppError::invalid("pin occupancy overflow"))?;
+            let state = RootHandle::open(&config.state_root, RootPolicy::Local)?;
+            let measurement = catalog.admission_measurement(&local, &state)?;
+            let occupied = measurement
+                .local
+                .total
+                .checked_add(measurement.state.total)
+                .ok_or_else(|| AppError::invalid("occupancy overflow"))?;
             let decision = crate::storage::admit_with_budget_reservations(
                 &crate::storage::AdmissionInput {
                     budget: config.budget,
                     occupied,
                     reserved: catalog
                         .remaining_reservations(crate::storage::FilesystemId(local.device()))?,
-                    available: available_bytes(&local)?,
+                    available: measurement.filesystem_free,
                     reserve: config.reserve,
                     required: member.size,
                     existing: 0,
@@ -273,8 +274,11 @@ impl PinFetchDriver {
             if !worker.available()? {
                 return catalog.readiness(group);
             }
-            let occupied = occupied_bytes(&local)?
-                .checked_add(crate::fs::state_occupied_bytes(&state)?)
+            let measurement = catalog.admission_measurement(&local, &state)?;
+            let occupied = measurement
+                .local
+                .total
+                .checked_add(measurement.state.total)
                 .ok_or_else(|| AppError::invalid("occupancy overflow"))?;
             if !matches!(
                 crate::storage::admit_with_budget_reservations(
@@ -283,7 +287,7 @@ impl PinFetchDriver {
                         occupied,
                         reserved: catalog
                             .remaining_reservations(crate::storage::FilesystemId(state.device()))?,
-                        available: available_bytes(&state)?,
+                        available: measurement.state_filesystem_free,
                         reserve: config.reserve,
                         required: size,
                         existing: 0,

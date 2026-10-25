@@ -66,3 +66,9 @@ mod metadata_merge;
 mod space;
 
 mod cleanup;
+
+mod verify;
+
+mod rating_queue;
+
+mod refresh;

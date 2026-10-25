@@ -252,3 +252,74 @@ fn watcher_expected_write_not_new_edit() {
     ));
     assert!(!c.snapshot_dirty(sidecar).unwrap());
 }
+
+#[test]
+fn peer_disconnect_revokes_application_without_dropping_local_guard() {
+    let (service, client) = std::os::unix::net::UnixStream::pair().unwrap();
+    let sessions = ApplicationSessions::default();
+    let guard = sessions.authorize_peer(true, false, &service).unwrap();
+    assert!(sessions.authorized(guard.id()));
+    drop(client);
+    assert!(
+        !sessions.authorized(guard.id()),
+        "stale coordinator flag authorized another file after disconnect"
+    );
+}
+
+#[test]
+fn failed_application_acknowledgment_keeps_projection_pending_atomically() {
+    use photo_sorter::fs::*;
+    let r = support::TestRig::new();
+    let (mut catalog, group, _, incoming) = setup(&r);
+    let local = RootHandle::open(&r.local, RootPolicy::Local).unwrap();
+    let state = RootHandle::open(&r.state, RootPolicy::Local).unwrap();
+    let sessions = ApplicationSessions::default();
+    let guard = sessions.authorize(true, false).unwrap();
+    let db = rusqlite::Connection::open(r.state.join("catalog.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER reject_refresh_ack BEFORE INSERT ON local_heads BEGIN SELECT RAISE(ABORT,'injected acknowledgment failure'); END;").unwrap();
+    let mut refresh = RefreshCoordinator {
+        catalog: &mut catalog,
+        local: &local,
+        state: &state,
+        sessions: &sessions,
+    };
+    refresh.stage(incoming, br#"{"rating":5}"#).unwrap();
+    assert!(
+        refresh
+            .apply(
+                RefreshRequest {
+                    groups: vec![group],
+                    application_session: guard.id(),
+                    operation_id: OperationId::new()
+                },
+                &NoFaults
+            )
+            .is_err()
+    );
+    assert!(
+        db.query_row("SELECT pending FROM projections", [], |r| r
+            .get::<_, bool>(0))
+            .unwrap(),
+        "partial acknowledgment lost the retryable application intent"
+    );
+    assert_eq!(
+        std::fs::read(r.local.join("RAW/a.ORF.rrdata")).unwrap(),
+        br#"{"rating":5}"#
+    );
+    db.execute_batch("DROP TRIGGER reject_refresh_ack;")
+        .unwrap();
+    assert_eq!(
+        refresh
+            .apply(
+                RefreshRequest {
+                    groups: vec![group],
+                    application_session: guard.id(),
+                    operation_id: OperationId::new()
+                },
+                &NoFaults
+            )
+            .unwrap()
+            .applied,
+        vec![incoming]
+    );
+}

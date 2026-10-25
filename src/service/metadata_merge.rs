@@ -179,15 +179,18 @@ fn ensure_merge_capacity(
             required = required.max(size);
         }
     }
-    let occupied = crate::fs::occupied_bytes(&local)?
-        .checked_add(crate::fs::state_occupied_bytes(state)?)
-        .ok_or_else(|| AppError::invalid("derived snapshot occupancy overflow"))?;
+    let measurement = catalog.admission_measurement(&local, state)?;
+    let occupied = measurement
+        .local
+        .total
+        .checked_add(measurement.state.total)
+        .ok_or_else(|| AppError::invalid("occupancy overflow"))?;
     let decision = admit_with_budget_reservations(
         &AdmissionInput {
             budget: config.budget,
             occupied,
             reserved: catalog.remaining_reservations(FilesystemId(state.device()))?,
-            available: crate::fs::available_bytes(state)?,
+            available: measurement.state_filesystem_free,
             reserve: config.reserve,
             required,
             existing: 0,
