@@ -10,3 +10,5 @@ mod watch;
 pub use watch::*;
 mod refresh;
 pub use refresh::*;
+mod rapidraw;
+pub use rapidraw::*;

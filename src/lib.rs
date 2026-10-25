@@ -9,6 +9,7 @@ pub mod fs;
 pub mod immich;
 pub mod import;
 pub mod plan;
+pub mod ratings;
 pub mod sidecar;
 pub mod storage;
 pub mod transfer;
