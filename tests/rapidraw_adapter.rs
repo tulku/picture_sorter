@@ -109,3 +109,57 @@ fn divergent_adjustments_conflict() {
             .is_err()
     );
 }
+#[test]
+fn favorite_round_trip_preserves_every_non_flag_field() {
+    let a = adapter();
+    let base = a
+        .inspect(include_bytes!("fixtures/rapidraw/edited.json"))
+        .unwrap();
+    for favorite in [true, false, true] {
+        let result = a
+            .inspect(&a.with_favorite(&base, favorite).unwrap())
+            .unwrap();
+        assert_eq!(
+            result.flag,
+            if favorite {
+                PickFlag::Pick
+            } else {
+                PickFlag::Neutral
+            }
+        );
+        assert_eq!(result.non_flag(), base.non_flag());
+    }
+}
+#[test]
+fn reject_wins_over_incoming_favorite_and_clear() {
+    let a = adapter();
+    let base = a
+        .inspect(
+            br#"{"version":1,"rating":3,"flag":"reject","adjustments":{"masks":[1]},"future":42}"#,
+        )
+        .unwrap();
+    for favorite in [true, false] {
+        let result = a
+            .inspect(&a.with_favorite(&base, favorite).unwrap())
+            .unwrap();
+        assert_eq!(result.flag, PickFlag::Reject);
+        assert_eq!(result.value(), base.value());
+    }
+}
+#[test]
+fn unsupported_flag_is_never_coerced_to_neutral() {
+    let a = adapter();
+    for flag in [
+        serde_json::json!("future"),
+        serde_json::json!(3),
+        serde_json::json!({}),
+    ] {
+        let bytes = serde_json::to_vec(
+            &serde_json::json!({"version":1,"rating":3,"flag":flag,"adjustments":null}),
+        )
+        .unwrap();
+        let doc = a.inspect(&bytes).unwrap();
+        assert_eq!(doc.flag, PickFlag::Unsupported);
+        assert!(a.with_favorite(&doc, false).is_err());
+    }
+}

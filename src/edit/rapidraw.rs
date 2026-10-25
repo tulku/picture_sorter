@@ -3,10 +3,27 @@ use crate::{
     error::{AppError, AppResult, ErrorCode},
 };
 use serde_json::Value;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PickFlag {
+    Neutral,
+    Pick,
+    Reject,
+    Unsupported,
+}
+impl PickFlag {
+    pub fn favorite(self) -> Option<bool> {
+        match self {
+            Self::Pick => Some(true),
+            Self::Neutral | Self::Reject => Some(false),
+            Self::Unsupported => None,
+        }
+    }
+}
 #[derive(Debug, Clone)]
 pub struct EditDocument {
     root: Value,
     pub rating: RatingObservation,
+    pub flag: PickFlag,
     source: Vec<u8>,
 }
 impl EditDocument {
@@ -15,6 +32,11 @@ impl EditDocument {
     }
     pub fn source_bytes(&self) -> &[u8] {
         &self.source
+    }
+    pub fn non_flag(&self) -> Value {
+        let mut value = self.root.clone();
+        value.as_object_mut().unwrap().remove("flag");
+        value
     }
     pub fn non_rating(&self) -> Value {
         let mut value = self.root.clone();
@@ -66,6 +88,12 @@ impl RapidRawAdapter {
                 "missing or non-integral native rating",
             )
         })?;
+        let flag = match root.get("flag") {
+            None | Some(Value::Null) => PickFlag::Neutral,
+            Some(Value::String(s)) if s == "pick" => PickFlag::Pick,
+            Some(Value::String(s)) if s == "reject" => PickFlag::Reject,
+            _ => PickFlag::Unsupported,
+        };
         let rating = if n > 5 {
             RatingObservation::Unsupported("native rating outside 0..5".into())
         } else {
@@ -78,8 +106,24 @@ impl RapidRawAdapter {
         Ok(EditDocument {
             root,
             rating,
+            flag,
             source: bytes.to_vec(),
         })
+    }
+    pub fn with_favorite(&self, document: &EditDocument, favorite: bool) -> AppResult<Vec<u8>> {
+        if document.flag == PickFlag::Unsupported {
+            return Err(AppError::new(ErrorCode::Unsupported, "unknown native flag"));
+        }
+        if document.flag == PickFlag::Reject {
+            return Ok(document.source.clone());
+        }
+        let mut value = document.root.clone();
+        value["flag"] = if favorite {
+            Value::String("pick".into())
+        } else {
+            Value::Null
+        };
+        Ok(serde_json::to_vec(&value)?)
     }
     pub fn with_rating(&self, document: &EditDocument, rating: Rating) -> AppResult<Vec<u8>> {
         if matches!(
