@@ -77,3 +77,26 @@ fn one_sided_equal_and_divergent_changes() {
         RatingDecision::Conflict { .. }
     ));
 }
+#[test]
+fn newer_remote_value_supersedes_unapplied_previous_remote() {
+    let mut i = input();
+    i.last_common = stars(5);
+    i.remote = stars(4);
+    i.pending_canonical = Some(Rating::try_from(5).unwrap());
+    assert_eq!(
+        reconcile_rating(&i),
+        RatingDecision::AdoptRemote(Rating::try_from(4).unwrap())
+    );
+}
+#[test]
+fn both_agree_on_new_stars_over_old_pending() {
+    let mut i = input();
+    i.last_common = stars(5);
+    i.local = stars(4);
+    i.remote = stars(4);
+    i.pending_canonical = Some(Rating::try_from(5).unwrap());
+    assert_eq!(
+        reconcile_rating(&i),
+        RatingDecision::Converge(Rating::try_from(4).unwrap())
+    );
+}

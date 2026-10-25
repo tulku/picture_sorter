@@ -68,7 +68,7 @@ fn startup_recovers_saved_edit() {
         SnapshotObservation::StableContent { changed: true, .. }
     ));
     drop(c);
-    let mut c = Catalog::open(&RootHandle::open(&r.state, RootPolicy::Local).unwrap()).unwrap();
+    let c = Catalog::open(&RootHandle::open(&r.state, RootPolicy::Local).unwrap()).unwrap();
     assert!(c.snapshot_dirty(o.id).unwrap());
 }
 #[test]

@@ -20,7 +20,7 @@ fn store(r: &support::TestRig) -> ArchiveStore {
 #[test]
 fn expired_lock_not_stolen() {
     let r = support::TestRig::new();
-    let mut s = store(&r);
+    let s = store(&r);
     let guard = s.acquire_publication().unwrap();
     drop(guard);
     assert!(s.acquire_publication().is_err());
@@ -38,12 +38,12 @@ fn recover_lock_requires_quiescence() {
 #[test]
 fn lock_held_across_replay_and_publish() {
     let r = support::TestRig::new();
-    let mut s = store(&r);
+    let s = store(&r);
     let mut guard = s.acquire_publication().unwrap();
     let batch = s.journal_batch(&mut guard, 128).unwrap();
     s.ack_journal(&mut guard, batch.token).unwrap();
     let root = RootHandle::open(&r.archive, RootPolicy::TestArchive).unwrap();
-    let mut other = ArchiveStore::open(root, s.marker().archive_id, s.marker().writer_id).unwrap();
+    let other = ArchiveStore::open(root, s.marker().archive_id, s.marker().writer_id).unwrap();
     assert!(other.acquire_publication().is_err());
     s.release(guard).unwrap();
     assert!(other.acquire_publication().is_ok());
@@ -51,7 +51,7 @@ fn lock_held_across_replay_and_publish() {
 #[test]
 fn reacquire_requires_new_replay() {
     let r = support::TestRig::new();
-    let mut s = store(&r);
+    let s = store(&r);
     let mut g = s.acquire_publication().unwrap();
     let batch = s.journal_batch(&mut g, 128).unwrap();
     s.ack_journal(&mut g, batch.token).unwrap();

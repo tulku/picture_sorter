@@ -44,3 +44,10 @@ CREATE TABLE IF NOT EXISTS local_heads(sidecar TEXT PRIMARY KEY REFERENCES sidec
 CREATE TABLE IF NOT EXISTS snapshot_intents(operation TEXT PRIMARY KEY,version TEXT NOT NULL UNIQUE,sidecar TEXT NOT NULL,parents TEXT NOT NULL,body TEXT NOT NULL,origin TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pending_resolutions(conflict TEXT PRIMARY KEY,version TEXT NOT NULL,expected_heads TEXT NOT NULL);
 "#;
+pub const RATING_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS rating_baselines(group_id TEXT PRIMARY KEY REFERENCES groups(id),common TEXT NOT NULL,applied_local TEXT NOT NULL,pending INTEGER,pending_version TEXT,source_version TEXT,remote_observation TEXT);
+CREATE TABLE IF NOT EXISTS rating_remote_state(server TEXT NOT NULL,asset TEXT NOT NULL,value TEXT NOT NULL,observation TEXT NOT NULL,PRIMARY KEY(server,asset));
+CREATE TABLE IF NOT EXISTS rating_operations(key TEXT PRIMARY KEY,operation TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS pending_shared_records(operation TEXT PRIMARY KEY,records TEXT NOT NULL,committed INTEGER NOT NULL DEFAULT 0);
+"#;
+pub const RATING_AUTHORITY_SCHEMA: &str = "CREATE TABLE rating_authorities(group_id TEXT PRIMARY KEY REFERENCES groups(id),server TEXT NOT NULL,asset TEXT NOT NULL,FOREIGN KEY(server,asset) REFERENCES mappings(server,asset));";

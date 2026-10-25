@@ -4,3 +4,5 @@ pub use client::*;
 pub use mapping::*;
 mod fetch;
 pub use fetch::*;
+mod ratings;
+pub use ratings::*;

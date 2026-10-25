@@ -215,7 +215,7 @@ fn pending_url_retry_resolves_into_same_job() {
         origin: origin.clone(),
         mappings: &[],
     }
-    .request(&[url.clone()], operation)
+    .request(std::slice::from_ref(&url), operation)
     .unwrap()
     .remove(0);
     c.bind_asset(&origin, &asset, group).unwrap();

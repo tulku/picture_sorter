@@ -41,6 +41,25 @@ pub fn reconcile_rating(input: &RatingInputs) -> RatingDecision {
     let applied = stars(&input.last_applied_local);
     let local_changed = local.is_some() && local != applied;
     if let Some(pending) = input.pending_canonical {
+        if let (Some(local), Some(remote), true) = (local, remote, local_changed)
+            && local == remote
+        {
+            return RatingDecision::Converge(local);
+        }
+        if let Some(remote) = remote
+            && !local_changed
+            && Some(remote) != common
+            && remote != pending
+        {
+            return if Some(pending) == common {
+                RatingDecision::AdoptRemote(remote)
+            } else {
+                RatingDecision::Conflict {
+                    local: pending,
+                    remote,
+                }
+            };
+        }
         return match (local, local_changed) {
             (Some(local), true) if local != pending => RatingDecision::Conflict {
                 local,

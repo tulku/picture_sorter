@@ -58,10 +58,10 @@ pub fn classify_name(filename: &str) -> FileRole {
         return FileRole::Media(kind);
     }
     if is_sidecar_ext(last) {
-        if parts.len() >= 3 {
-            if let Some(kind) = ext_kind(parts[parts.len() - 2]) {
-                return FileRole::Sidecar(kind);
-            }
+        if parts.len() >= 3
+            && let Some(kind) = ext_kind(parts[parts.len() - 2])
+        {
+            return FileRole::Sidecar(kind);
         }
         return FileRole::SidecarUnknown;
     }

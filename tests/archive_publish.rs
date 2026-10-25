@@ -3,7 +3,6 @@ use photo_sorter::{
     archive::*,
     domain::*,
     fs::{RootHandle, RootPolicy},
-    transfer::*,
 };
 fn store(r: &support::TestRig) -> ArchiveStore {
     let root = RootHandle::open(&r.archive, RootPolicy::TestArchive).unwrap();

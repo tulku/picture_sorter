@@ -272,6 +272,7 @@ impl Catalog {
         evidence: PairEvidence,
     ) -> AppResult<MembershipRevision> {
         evidence.validate()?;
+        member.validate()?;
         let tx = self.db.transaction()?;
         let id = canonical(&tx, id)?;
         let archive: String = tx
@@ -383,5 +384,32 @@ impl Catalog {
         ids.into_iter()
             .map(|id| self.group(decode(format!("\"{id}\""))?))
             .collect()
+    }
+}
+impl Catalog {
+    pub fn is_ancestor(&self, ancestor: VersionId, descendant: VersionId) -> AppResult<bool> {
+        Ok(self.db.query_row("WITH RECURSIVE ancestors(id) AS (VALUES(?) UNION SELECT p.parent FROM version_parents p JOIN ancestors a ON p.version=a.id) SELECT EXISTS(SELECT 1 FROM ancestors WHERE id=?)",params![descendant.to_string(),ancestor.to_string()],|r|r.get(0))?)
+    }
+    pub fn common_version(
+        &self,
+        left: VersionId,
+        right: VersionId,
+    ) -> AppResult<Option<VersionId>> {
+        let mut query=self.db.prepare("WITH RECURSIVE lhs(id) AS (VALUES(?) UNION SELECT p.parent FROM version_parents p JOIN lhs ON p.version=lhs.id),rhs(id) AS (VALUES(?) UNION SELECT p.parent FROM version_parents p JOIN rhs ON p.version=rhs.id),common(id) AS (SELECT id FROM lhs INTERSECT SELECT id FROM rhs) SELECT c.id FROM common c WHERE NOT EXISTS(SELECT 1 FROM version_parents p JOIN common child ON child.id=p.version WHERE p.parent=c.id) LIMIT 2")?;
+        let ids = query
+            .query_map(params![left.to_string(), right.to_string()], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if ids.len() > 1 {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "multiple common version ancestors require resolution",
+            ));
+        }
+        ids.into_iter()
+            .next()
+            .map(|id| decode(format!("\"{id}\"")))
+            .transpose()
     }
 }

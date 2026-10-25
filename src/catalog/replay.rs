@@ -32,7 +32,27 @@ impl Catalog {
         if let Err(e) = &result {
             self.block_record(&commit.commit_id.to_string(), &e.to_string())?;
         }
+        if result.is_ok() {
+            self.drain_pending(128)?;
+        }
         result
+    }
+    pub fn drain_pending(&mut self, limit: usize) -> AppResult<usize> {
+        if limit == 0 || limit > 128 {
+            return Err(AppError::invalid("replay batch must be 1..128"));
+        }
+        let mut applied = 0;
+        while applied < limit {
+            let bytes:Option<Vec<u8>>=self.db.query_row("SELECT c.envelope FROM commits c WHERE c.applied=0 AND NOT EXISTS(SELECT 1 FROM blocked_records b WHERE b.id=c.id) AND NOT EXISTS(SELECT 1 FROM dependencies d LEFT JOIN commits dep ON dep.id=d.dependency WHERE d.commit_id=c.id AND (dep.id IS NULL OR dep.applied=0)) LIMIT 1",[],|r|r.get(0)).optional()?;
+            let Some(bytes) = bytes else { break };
+            let commit: CommitEnvelope = serde_json::from_slice(&bytes)?;
+            if let Err(error) = self.apply_validated(&commit) {
+                self.block_record(&commit.commit_id.to_string(), &error.to_string())?;
+                return Err(error);
+            }
+            applied += 1;
+        }
+        Ok(applied)
     }
     fn apply_validated(&mut self, commit: &CommitEnvelope) -> AppResult<ApplyOutcome> {
         let encoded = commit.encode()?;
@@ -89,17 +109,6 @@ impl Catalog {
             [commit.commit_id.to_string()],
         )?;
         tx.commit()?;
-        loop {
-            let mut query=self.db.prepare("SELECT c.envelope FROM commits c WHERE c.applied=0 AND NOT EXISTS(SELECT 1 FROM dependencies d LEFT JOIN commits dep ON dep.id=d.dependency WHERE d.commit_id=c.id AND (dep.id IS NULL OR dep.applied=0)) LIMIT 1")?;
-            let bytes: Option<Vec<u8>> = query.query_row([], |r| r.get(0)).optional()?;
-            drop(query);
-            if let Some(bytes) = bytes {
-                let next = CommitEnvelope::decode(&bytes, commit.archive_id)?;
-                self.apply_validated(&next)?;
-            } else {
-                break;
-            }
-        }
         Ok(ApplyOutcome::Applied)
     }
     pub fn publication_readiness(&self) -> AppResult<PublicationReadiness> {
@@ -186,6 +195,7 @@ fn apply_record(db: &Connection, archive: &str, record: ArchiveRecord) -> AppRes
             evidence,
         } => {
             evidence.validate()?;
+            member.validate()?;
             let group = super::identity::canonical(db, group)?;
             let old: Option<(String, String)> = db
                 .query_row(
@@ -241,6 +251,7 @@ fn apply_record(db: &Connection, archive: &str, record: ArchiveRecord) -> AppRes
             path,
             owner,
         } => {
+            validate_sidecar_path(&path)?;
             let group = group
                 .map(|g| super::identity::canonical(db, g))
                 .transpose()?;

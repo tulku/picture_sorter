@@ -105,15 +105,14 @@ pub fn classify_sequences(
     }
     decisions
 }
+type SequencePartition = (String, String, String, SequenceKind);
+type SequenceFrame<'a> = (&'a CaptureRecord, u64, chrono::NaiveDateTime);
 fn classify_representatives(
     records: &[CaptureRecord],
     existing: &[SequenceRecord],
     policy: &SequencePolicy,
 ) -> Vec<SequenceDecision> {
-    let mut buckets: BTreeMap<
-        (String, String, String, SequenceKind),
-        Vec<(&CaptureRecord, u64, chrono::NaiveDateTime)>,
-    > = BTreeMap::new();
+    let mut buckets: BTreeMap<SequencePartition, Vec<SequenceFrame<'_>>> = BTreeMap::new();
     for record in records {
         let Some((kind, shot)) = mode(record) else {
             continue;

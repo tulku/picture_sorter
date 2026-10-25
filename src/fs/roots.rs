@@ -4,11 +4,11 @@ use crate::{
 };
 use std::{
     ffi::CString,
-    fs::{File, OpenOptions},
+    fs::File,
     io::{Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, RawFd},
-        unix::fs::{MetadataExt, OpenOptionsExt},
+        unix::fs::MetadataExt,
     },
     path::{Path, PathBuf},
 };
@@ -24,6 +24,8 @@ pub struct RootHandle {
     path: PathBuf,
     device: u64,
     inode: u64,
+    policy: RootPolicy,
+    mount_id: u64,
 }
 #[repr(C)]
 struct OpenHow {
@@ -36,24 +38,27 @@ impl RootHandle {
         if !path.is_absolute() {
             return Err(AppError::invalid("absolute root required"));
         }
-        let dir = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
-        let m = dir.metadata()?;
-        if let RootPolicy::Archive { expected_device } = policy {
-            if m.dev() != expected_device {
-                return Err(AppError::new(
-                    ErrorCode::Unavailable,
-                    "archive filesystem identity changed",
-                ));
-            }
+        if matches!(policy, RootPolicy::Local | RootPolicy::TestArchive) {
+            reject_network_root(path)?;
         }
+        let dir = open_root_directory(path)?;
+        let m = dir.metadata()?;
+        if let RootPolicy::Archive { expected_device } = policy
+            && m.dev() != expected_device
+        {
+            return Err(AppError::new(
+                ErrorCode::Unavailable,
+                "archive filesystem identity changed",
+            ));
+        }
+        let mount_id = descriptor_mount_id(dir.as_raw_fd())?;
         let root = Self {
             dir,
             path: path.to_owned(),
             device: m.dev(),
             inode: m.ino(),
+            mount_id,
+            policy,
         };
         if matches!(policy, RootPolicy::Local | RootPolicy::TestArchive) && root.is_network()? {
             return Err(AppError::invalid(
@@ -61,6 +66,15 @@ impl RootHandle {
             ));
         }
         Ok(root)
+    }
+    pub fn require_local(&self) -> AppResult<()> {
+        self.validate_identity()?;
+        if !matches!(self.policy, RootPolicy::Local) {
+            return Err(AppError::invalid(
+                "operation requires a local working/state root, never an archive root",
+            ));
+        }
+        Ok(())
     }
     pub fn fd(&self) -> RawFd {
         self.dir.as_raw_fd()
@@ -72,12 +86,12 @@ impl RootHandle {
         &self.path
     }
     pub fn validate_identity(&self) -> AppResult<()> {
-        let current = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&self.path)?;
+        let current = open_root_directory(&self.path)?;
         let m = current.metadata()?;
-        if m.dev() != self.device || m.ino() != self.inode {
+        if m.dev() != self.device
+            || m.ino() != self.inode
+            || descriptor_mount_id(current.as_raw_fd())? != self.mount_id
+        {
             return Err(AppError::new(
                 ErrorCode::Unavailable,
                 "managed root replaced; refusing fallback",
@@ -266,4 +280,96 @@ impl RootHandle {
         b.sync_all()?;
         self.validate_identity()
     }
+}
+
+fn descriptor_mount_id(fd: RawFd) -> AppResult<u64> {
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))?;
+    info.lines()
+        .find_map(|line| {
+            line.strip_prefix("mnt_id:")
+                .and_then(|value| value.trim().parse().ok())
+        })
+        .ok_or_else(|| {
+            AppError::new(
+                ErrorCode::Unsupported,
+                "kernel does not expose held-root mount identity",
+            )
+        })
+}
+
+fn open_root_directory(path: &Path) -> AppResult<File> {
+    use std::os::unix::ffi::OsStrExt;
+    let name =
+        CString::new(path.as_os_str().as_bytes()).map_err(|_| AppError::invalid("NUL in root"))?;
+    let how = OpenHow {
+        flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: 0x04 | 0x02,
+    };
+    // Root resolution itself must not follow a replaced ancestor symlink into another filesystem.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            name.as_ptr(),
+            &how,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // A successful openat2 returns a new owned directory descriptor.
+    Ok(unsafe { File::from_raw_fd(fd as RawFd) })
+}
+fn reject_network_root(path: &Path) -> AppResult<()> {
+    use std::os::unix::ffi::OsStringExt;
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let mut best: Option<(usize, &str)> = None;
+    for line in mounts.lines() {
+        let Some((fields, filesystem)) = line.split_once(" - ") else {
+            continue;
+        };
+        let Some(mount) = fields.split_whitespace().nth(4) else {
+            continue;
+        };
+        let kind = filesystem.split_whitespace().next().unwrap_or("");
+        let input = mount.as_bytes();
+        let mut decoded = Vec::new();
+        let mut i = 0;
+        while i < input.len() {
+            if input[i] == b'\\'
+                && i + 3 < input.len()
+                && input[i + 1..i + 4]
+                    .iter()
+                    .all(|n| (b'0'..=b'7').contains(n))
+            {
+                let n =
+                    (input[i + 1] - b'0') * 64 + (input[i + 2] - b'0') * 8 + (input[i + 3] - b'0');
+                decoded.push(n);
+                i += 4;
+            } else {
+                decoded.push(input[i]);
+                i += 1;
+            }
+        }
+        let mount = PathBuf::from(std::ffi::OsString::from_vec(decoded));
+        if path.starts_with(&mount)
+            && best.is_none_or(|(length, _)| mount.as_os_str().len() > length)
+        {
+            best = Some((mount.as_os_str().len(), kind));
+        }
+    }
+    if best.is_some_and(|(_, kind)| {
+        matches!(
+            kind,
+            "cifs" | "smb3" | "nfs" | "nfs4" | "9p" | "ceph" | "afs"
+        ) || kind.starts_with("fuse.sshfs")
+            || kind.starts_with("fuse.rclone")
+    }) {
+        return Err(AppError::invalid(
+            "working/state/test roots must be local; network roots are worker-only",
+        ));
+    }
+    Ok(())
 }

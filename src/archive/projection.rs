@@ -64,6 +64,7 @@ impl ArchiveStore {
     }
     pub fn apply_projection(&self, proof: &CommittedProjection) -> AppResult<ProjectionOutcome> {
         let plan = &proof.plan;
+        validate_sidecar_path(&plan.path)?;
         self.validate()?;
         if plan.owner == "jpeg-xmp-external" || plan.path.as_str().starts_with(".photo-sorter/") {
             return Err(AppError::new(

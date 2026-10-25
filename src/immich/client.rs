@@ -43,6 +43,8 @@ pub struct ServerInfo {
     pub licensed: bool,
 }
 pub struct ImmichClient {
+    rating_mode: super::RatingWriteMode,
+    rating_registry: crate::qualification::CapabilityRegistry,
     origin: Url,
     http: Client,
 }
@@ -95,7 +97,12 @@ impl ImmichClient {
             .default_headers(headers)
             .build()
             .map_err(|_| AppError::invalid("cannot configure TLS HTTP client"))?;
-        Ok(Self { origin, http })
+        Ok(Self {
+            origin,
+            http,
+            rating_mode: super::RatingWriteMode::Disabled,
+            rating_registry: Default::default(),
+        })
     }
     fn get<T: DeserializeOwned>(&self, path: &str) -> AppResult<T> {
         let url = self
@@ -191,4 +198,89 @@ pub fn parse_photo_url(value: &str, server: &Url) -> AppResult<uuid::Uuid> {
         return Err(AppError::invalid("expected /photos/<asset UUID>"));
     }
     uuid::Uuid::parse_str(segments[1]).map_err(|_| AppError::invalid("invalid asset UUID"))
+}
+
+impl ImmichClient {
+    pub fn with_rating_policy(
+        mut self,
+        mode: super::RatingWriteMode,
+        registry: crate::qualification::CapabilityRegistry,
+    ) -> Self {
+        self.rating_mode = mode;
+        self.rating_registry = registry;
+        self
+    }
+    pub fn outbound_enabled(&self) -> bool {
+        self.rating_mode != super::RatingWriteMode::Disabled
+    }
+    pub fn set_rating(&self, request: super::RatingWrite) -> AppResult<super::WriteOutcome> {
+        use super::{RatingWriteMode, WriteOutcome};
+        if self.rating_mode != RatingWriteMode::BestEffort {
+            return Err(AppError::new(
+                ErrorCode::Unsupported,
+                "this profile requires explicit best_effort mode; conditional updates are not supported",
+            ));
+        }
+        let server = self.server_info()?;
+        if server.version != TESTED_VERSION {
+            return Err(AppError::new(
+                ErrorCode::Unsupported,
+                "server upgrade invalidated rating write profile",
+            ));
+        }
+        let decision =
+            self.rating_registry
+                .allows(crate::qualification::OperationKind::RatingWrite {
+                    origin: &self.origin,
+                    asset: request.asset,
+                    version: &server.version,
+                });
+        if !decision.allowed {
+            return Err(AppError::new(ErrorCode::Unsupported, decision.reason));
+        }
+        let current = self.asset(request.asset)?;
+        let observed = super::ratings::remote_rating(&current)?;
+        if current.checksum != request.jpeg_checksum {
+            return Err(AppError::new(ErrorCode::Conflict, "JPEG identity changed"));
+        }
+        if observed == RatingObservation::Stars(request.desired) {
+            return Ok(WriteOutcome::Confirmed);
+        }
+        if observed != request.expected {
+            return Ok(WriteOutcome::Conflict { observed });
+        }
+        let desired = u8::from(request.desired);
+        let body = serde_json::json!({"rating":if desired==0{None}else{Some(desired)}});
+        let url = self
+            .origin
+            .join(&format!("/api/assets/{}", request.asset))
+            .map_err(|_| AppError::invalid("invalid API path"))?;
+        let response = self.http.put(url).json(&body).send();
+        match response {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) if matches!(response.status().as_u16(), 401 | 403 | 404) => {
+                return Err(AppError::new(
+                    match response.status().as_u16() {
+                        401 => ErrorCode::Authentication,
+                        403 => ErrorCode::Permission,
+                        _ => ErrorCode::NotFound,
+                    },
+                    "Immich denied rating write",
+                ));
+            }
+            _ => return Ok(WriteOutcome::Uncertain),
+        };
+        let after = match self.asset(request.asset) {
+            Ok(after) => after,
+            Err(_) => return Ok(WriteOutcome::Uncertain),
+        };
+        let observed = super::ratings::remote_rating(&after)?;
+        if after.checksum == request.jpeg_checksum
+            && observed == RatingObservation::Stars(request.desired)
+        {
+            Ok(WriteOutcome::Confirmed)
+        } else {
+            Ok(WriteOutcome::Conflict { observed })
+        }
+    }
 }

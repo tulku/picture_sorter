@@ -145,6 +145,7 @@ impl ArchiveStore {
         }
         commit.encode()?;
         for staged in &plan.staged {
+            staged.member.validate()?;
             if !staged.staged.as_str().starts_with(".photo-sorter/staging/") {
                 return Err(AppError::invalid("original must come from hidden staging"));
             }
@@ -195,6 +196,7 @@ impl ArchiveStore {
         for record in commit.records()? {
             match record {
                 ArchiveRecord::MemberAttached { group, member, .. } => {
+                    member.validate()?;
                     let mut original = self.root.open_relative(
                         &member.path,
                         libc::O_RDONLY | libc::O_NONBLOCK,
@@ -221,6 +223,9 @@ impl ArchiveStore {
                     if digest_file(&mut history)? != (digest, size) {
                         return Err(AppError::integrity("commit references unavailable history"));
                     }
+                }
+                ArchiveRecord::SidecarCreated { path: sidecar, .. } => {
+                    validate_sidecar_path(&sidecar)?
                 }
                 _ => {}
             }

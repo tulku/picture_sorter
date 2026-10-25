@@ -16,7 +16,7 @@ pub struct Catalog {
 }
 impl Catalog {
     pub fn open(state: &RootHandle) -> AppResult<Self> {
-        state.validate_identity()?;
+        state.require_local()?;
         let file = state.open_relative(
             &ArchivePath::parse("catalog.sqlite")?,
             libc::O_RDWR | libc::O_CREAT,
@@ -56,6 +56,8 @@ impl Catalog {
             tx.execute_batch(schema::SCHEMA)?;
             tx.execute_batch(schema::IMPORT_SCHEMA)?;
             tx.execute_batch(schema::EDIT_SCHEMA)?;
+            tx.execute_batch(schema::RATING_SCHEMA)?;
+            tx.execute_batch(schema::RATING_AUTHORITY_SCHEMA)?;
             tx.commit()?;
         }
         db.pragma_update(None, "journal_mode", "WAL")?;

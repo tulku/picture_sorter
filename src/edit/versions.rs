@@ -194,15 +194,17 @@ impl<'a> VersionStore<'a> {
                 params![version.to_string(), parent.to_string()],
             )?;
         }
-        let previous: Option<String> = tx
-            .query_row(
-                "SELECT version FROM local_heads WHERE sidecar=?",
-                [intent.sidecar.to_string()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if previous.as_ref() != Some(&version.to_string()) {
-            tx.execute("INSERT INTO local_heads(sidecar,version) VALUES(?,?) ON CONFLICT(sidecar) DO UPDATE SET version=excluded.version,dirty=1",params![intent.sidecar.to_string(),version.to_string()])?;
+        if intent.origin == VersionOrigin::Observed {
+            let previous: Option<String> = tx
+                .query_row(
+                    "SELECT version FROM local_heads WHERE sidecar=?",
+                    [intent.sidecar.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if previous.as_ref() != Some(&version.to_string()) {
+                tx.execute("INSERT INTO local_heads(sidecar,version) VALUES(?,?) ON CONFLICT(sidecar) DO UPDATE SET version=excluded.version,dirty=1",params![intent.sidecar.to_string(),version.to_string()])?;
+            }
         }
         tx.execute(
             "UPDATE sidecars SET protected=1 WHERE id=?",
@@ -220,6 +222,7 @@ impl Catalog {
         path: ArchivePath,
         owner: &str,
     ) -> AppResult<()> {
+        validate_sidecar_path(&path)?;
         let group = group.map(|g| self.canonical_group(g)).transpose()?;
         let old: Option<(Option<String>, String, String)> = self
             .db

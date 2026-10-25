@@ -7,10 +7,10 @@ struct Cli {
 }
 fn main() {
     let cli = Cli::parse();
-    if cli.nas_worker {
-        if let Err(error) = photo_sorter::transfer::run_worker() {
-            eprintln!("{error}");
-            std::process::exit(5);
-        }
+    if cli.nas_worker
+        && let Err(error) = photo_sorter::transfer::run_worker()
+    {
+        eprintln!("{error}");
+        std::process::exit(5);
     }
 }

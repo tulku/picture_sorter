@@ -67,7 +67,9 @@ impl Config {
     }
     pub fn load(path: &Path) -> AppResult<Self> {
         let text = std::fs::read_to_string(path)?;
-        let c: Self = toml::from_str(&text).map_err(|e| AppError::invalid(e.to_string()))?;
+        let c: Self = toml::from_str(&text).map_err(|_| {
+            AppError::invalid("invalid profile TOML or unsupported configuration field")
+        })?;
         c.validate()?;
         Ok(c)
     }
@@ -112,17 +114,5 @@ pub fn normalized(path: &Path) -> AppResult<PathBuf> {
     }) {
         return Err(AppError::invalid("root contains traversal"));
     }
-    match path.canonicalize() {
-        Ok(p) => Ok(p),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let parent = path
-                .parent()
-                .ok_or_else(|| AppError::invalid("root has no parent"))?;
-            Ok(normalized(parent)?.join(
-                path.file_name()
-                    .ok_or_else(|| AppError::invalid("root has no name"))?,
-            ))
-        }
-        Err(e) => Err(e.into()),
-    }
+    Ok(path.to_owned())
 }

@@ -155,6 +155,42 @@ impl ArchiveStore {
                 "commit filename disagrees with envelope",
             ));
         }
+        for record in commit.records()? {
+            match record {
+                ArchiveRecord::VersionAdded {
+                    version:
+                        Version {
+                            body: VersionBody::Content { digest, size },
+                            ..
+                        },
+                    ..
+                } => {
+                    let mut file = self
+                        .root
+                        .open_relative(&history_path(&digest)?, libc::O_RDONLY, 0)
+                        .map_err(|_| {
+                            AppError::integrity("journal references missing history payload")
+                        })?;
+                    if crate::transfer::digest_file(&mut file)? != (digest, size) {
+                        return Err(AppError::integrity(
+                            "journal references corrupt history payload",
+                        ));
+                    }
+                }
+                ArchiveRecord::MemberAttached { member, .. } => {
+                    member.validate()?;
+                    let mut file = self
+                        .root
+                        .open_relative(&member.path, libc::O_RDONLY, 0)
+                        .map_err(|_| AppError::integrity("journal references missing original"))?;
+                    if crate::transfer::digest_file(&mut file)? != (member.digest, member.size) {
+                        return Err(AppError::integrity("journal references corrupt original"));
+                    }
+                }
+                ArchiveRecord::SidecarCreated { path, .. } => validate_sidecar_path(&path)?,
+                _ => {}
+            }
+        }
         Ok(commit)
     }
 }

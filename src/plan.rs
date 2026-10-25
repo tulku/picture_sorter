@@ -68,12 +68,11 @@ pub fn decide(input: PlanInput) -> PlanDecision {
         return PlanDecision::ConflictExists;
     }
 
-    if input.incremental {
-        if let Some(cutoff) = input.cutoff {
-            if input.date < cutoff {
-                return PlanDecision::SkipOlderThanCutoff;
-            }
-        }
+    if input.incremental
+        && let Some(cutoff) = input.cutoff
+        && input.date < cutoff
+    {
+        return PlanDecision::SkipOlderThanCutoff;
     }
 
     PlanDecision::Copy

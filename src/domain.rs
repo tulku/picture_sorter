@@ -248,3 +248,44 @@ impl FaultInjector for NoFaults {
         Ok(())
     }
 }
+impl MediaRole {
+    pub fn for_filename(path: &str) -> Option<Self> {
+        match path.rsplit('.').next()?.to_ascii_lowercase().as_str() {
+            "cr2" | "nef" | "arw" | "dng" | "raw" | "orf" | "ori" => Some(Self::Raw),
+            "jpg" | "jpeg" => Some(Self::Jpeg),
+            "tif" | "tiff" | "png" => Some(Self::OtherStill),
+            "mov" | "mp4" | "avi" | "mts" | "m4v" | "mpg" | "mpeg" => Some(Self::Video),
+            _ => None,
+        }
+    }
+}
+impl OriginalMember {
+    pub fn validate(&self) -> AppResult<()> {
+        if MediaRole::for_filename(self.path.as_str()) != Some(self.role) {
+            return Err(AppError::integrity(
+                "original media role does not match supported original filename",
+            ));
+        }
+        Ok(())
+    }
+}
+pub fn validate_sidecar_path(path: &ArchivePath) -> AppResult<()> {
+    if MediaRole::for_filename(path.as_str()).is_some() {
+        return Err(AppError::integrity(
+            "mutable sidecar cannot claim an original media path",
+        ));
+    }
+    if !matches!(
+        path.as_str()
+            .rsplit('.')
+            .next()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("rrdata" | "rrexif" | "xmp" | "orig" | "pp3" | "dop" | "on1")
+    ) {
+        return Err(AppError::integrity(
+            "unrecognized companion path cannot be a mutable projection",
+        ));
+    }
+    Ok(())
+}

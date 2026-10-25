@@ -86,3 +86,10 @@ fn catalog_wal_stays_beneath_held_root() {
     assert!(!r.state.join("catalog.sqlite").exists());
     assert!(preserved.join("catalog.sqlite").exists());
 }
+#[test]
+fn live_sqlite_refuses_archive_root() {
+    let r = support::TestRig::new();
+    let archive = RootHandle::open(&r.archive, RootPolicy::TestArchive).unwrap();
+    assert!(Catalog::open(&archive).is_err());
+    assert!(!r.archive.join("catalog.sqlite").exists());
+}

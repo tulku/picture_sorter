@@ -72,6 +72,10 @@ fn eligible(catalog: &Catalog, group: &Group, now: Timestamp, hold: u64) -> AppR
     if !resident {
         return Ok(false);
     }
+    let rating_pending:bool=catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM rating_intents WHERE group_id=? AND state IN('prepared','sent'))",[group.id.to_string()],|r|r.get(0))?;
+    if rating_pending {
+        return Ok(false);
+    }
     let p = catalog.protection(group.id)?;
     if p.pinned || p.pending || p.conflict || group.members.is_empty() {
         return Ok(false);
@@ -98,6 +102,7 @@ impl Evictor<'_> {
         intent: EvictionIntent,
         faults: &dyn FaultInjector,
     ) -> AppResult<EvictionReport> {
+        self.local.require_local()?;
         let group = self.catalog.group(intent.group)?;
         if group.membership_revision != intent.revision
             || group.members != intent.members

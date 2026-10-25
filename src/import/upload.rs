@@ -8,6 +8,18 @@ use crate::{
 };
 use rusqlite::{OptionalExtension, params};
 
+type UploadItemRow = (
+    String,
+    String,
+    String,
+    String,
+    u64,
+    String,
+    Option<String>,
+    String,
+    bool,
+    bool,
+);
 #[derive(Default)]
 pub struct UploadDriver {
     active: Option<Active>,
@@ -58,7 +70,7 @@ impl ImportCoordinator {
         Ok(())
     }
     fn next_upload(&self, job: JobId) -> AppResult<Option<ImportItem>> {
-        let row:Option<(String,String,String,String,u64,String,Option<String>,String,bool,bool)>=self.catalog.db.query_row("SELECT id,source_root,source_path,digest,size,role,group_id,destination,local_ready,archived FROM import_items WHERE parent=? AND archived=0 AND state<>'conflict' ORDER BY rowid LIMIT 1",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))).optional()?;
+        let row:Option<UploadItemRow>=self.catalog.db.query_row("SELECT id,source_root,source_path,digest,size,role,group_id,destination,local_ready,archived FROM import_items WHERE parent=? AND archived=0 AND state<>'conflict' ORDER BY rowid LIMIT 1",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))).optional()?;
         row.map(
             |(id, root, path, digest, size, role, group, destination, local_ready, _archived)| {
                 Ok(ImportItem {
@@ -147,6 +159,18 @@ impl UploadDriver {
                 ));
             }
             WorkerState::Failed(error) => {
+                if matches!(active.phase, Phase::Read)
+                    && matches!(error.code, ErrorCode::Integrity | ErrorCode::Unsupported)
+                    && let Some(entry) = active
+                        .batch
+                        .as_ref()
+                        .and_then(|b| b.entries.get(active.index))
+                {
+                    engine
+                        .catalog
+                        .block_record(&entry.id.to_string(), &error.to_string())?;
+                }
+
                 let generation = engine.catalog.job(active.job)?.generation;
                 engine.catalog.transition(
                     active.job,

@@ -14,6 +14,7 @@ pub struct SnapshotGc<'a> {
 }
 impl SnapshotGc<'_> {
     pub fn collect(&self, catalog: &mut Catalog) -> AppResult<GcReport> {
+        self.state.require_local()?;
         let mut result = GcReport::default();
         let mut q=catalog.db.prepare("SELECT digest,path,size FROM snapshots s WHERE archived=1 AND refs=0 AND NOT EXISTS(SELECT 1 FROM jobs WHERE json_extract(state,'$') NOT IN('Complete','Cancelled')) AND NOT EXISTS(SELECT 1 FROM conflicts WHERE resolved=0) AND NOT EXISTS(SELECT 1 FROM projections WHERE pending=1) AND NOT EXISTS(SELECT 1 FROM local_heads l JOIN versions v ON v.id=l.version WHERE json_extract(v.body,'$.Content.digest')=s.digest) LIMIT 128")?;
         let rows = q

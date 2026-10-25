@@ -45,3 +45,20 @@ fn legacy_help_still_available() {
         );
     }
 }
+#[test]
+fn profile_validation_defers_archive_filesystem_access_to_worker() {
+    let r = TestRig::new();
+    let a = r.source.join("archive-a");
+    let b = r.source.join("archive-b");
+    std::os::unix::fs::symlink(&b, &a).unwrap();
+    std::os::unix::fs::symlink(&a, &b).unwrap();
+    let config = Config::new(r.local.clone(), r.state.clone(), a.clone());
+    assert!(config.validate().is_ok());
+    assert!(
+        photo_sorter::fs::RootHandle::open(
+            &a,
+            photo_sorter::fs::RootPolicy::Archive { expected_device: 0 }
+        )
+        .is_err()
+    );
+}

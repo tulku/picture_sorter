@@ -56,10 +56,10 @@ impl ApplicationSessions {
             .is_some_and(|s| s.load(Ordering::SeqCst))
     }
     pub fn revoke(&self, id: ApplicationSessionId) {
-        if let Ok(sessions) = self.sessions.lock() {
-            if let Some(state) = sessions.get(&id).and_then(Weak::upgrade) {
-                state.store(false, Ordering::SeqCst);
-            }
+        if let Ok(sessions) = self.sessions.lock()
+            && let Some(state) = sessions.get(&id).and_then(Weak::upgrade)
+        {
+            state.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -101,10 +101,10 @@ impl RefreshCoordinator<'_> {
             ".photo-sorter/snapshots/{}",
             &digest.as_str()[7..]
         ))?;
-        if let Err(error) = self.state.write_new(&target, bytes) {
-            if self.state.read(&target, size)? != bytes {
-                return Err(error);
-            }
+        if let Err(error) = self.state.write_new(&target, bytes)
+            && self.state.read(&target, size)? != bytes
+        {
+            return Err(error);
         }
         self.catalog.db.execute("INSERT INTO snapshots(digest,path,size,archived) VALUES(?,?,?,1) ON CONFLICT(digest) DO UPDATE SET archived=1",params![digest.as_str(),target.as_str(),size])?;
         Ok(())
@@ -114,6 +114,8 @@ impl RefreshCoordinator<'_> {
         request: RefreshRequest,
         faults: &dyn FaultInjector,
     ) -> AppResult<RefreshReport> {
+        self.local.require_local()?;
+        self.state.require_local()?;
         let mut report = RefreshReport::default();
         if !self.sessions.authorized(request.application_session) {
             report.waiting_application = true;

@@ -123,20 +123,20 @@ impl<'a> Snapshotter<'a> {
             SnapshotPayload::Reset => return Err(AppError::integrity("unexpected content reset")),
         };
         self.catalog.db.execute("INSERT INTO observations(path,digest,size,absent_since,readable) VALUES(?,?,?,NULL,1) ON CONFLICT(path) DO UPDATE SET digest=excluded.digest,size=excluded.size,absent_since=NULL,readable=1",params![owner.path.as_str(),match &body{VersionBody::Content{digest,..}=>digest.as_str(),_=>""},before.len()])?;
-        if let Some(previous) = previous {
-            if self.catalog.version(previous)?.body == body {
-                return Ok(if invalid {
-                    SnapshotObservation::OpaqueInvalid {
-                        version: previous,
-                        reason: "preserved opaque or malformed editor JSON".into(),
-                    }
-                } else {
-                    SnapshotObservation::StableContent {
-                        version: previous,
-                        changed: false,
-                    }
-                });
-            }
+        if let Some(previous) = previous
+            && self.catalog.version(previous)?.body == body
+        {
+            return Ok(if invalid {
+                SnapshotObservation::OpaqueInvalid {
+                    version: previous,
+                    reason: "preserved opaque or malformed editor JSON".into(),
+                }
+            } else {
+                SnapshotObservation::StableContent {
+                    version: previous,
+                    changed: false,
+                }
+            });
         }
         let parents = previous.map(|v| vec![v]).unwrap_or_default();
         let version = VersionStore::new(self.catalog, self.state).record(SnapshotIntent {

@@ -34,6 +34,16 @@ pub struct ImportReport {
     pub hash_bytes: u64,
 }
 pub type JobProgress = ImportReport;
+type PendingImportRow = (
+    String,
+    String,
+    String,
+    String,
+    u64,
+    String,
+    Option<String>,
+    String,
+);
 pub struct ImportCoordinator {
     pub config: Config,
     pub catalog: Catalog,
@@ -310,7 +320,7 @@ impl ImportCoordinator {
     }
     pub fn advance(&mut self, job: JobId) -> AppResult<JobProgress> {
         self.initialize_tables()?;
-        let row:Option<(String,String,String,String,u64,String,Option<String>,String)>=self.catalog.db.query_row("SELECT id,source_root,source_path,digest,size,role,group_id,destination FROM import_items WHERE parent=? AND local_ready=0 AND archived=0 AND state<>'conflict' ORDER BY rowid LIMIT 1",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional()?;
+        let row:Option<PendingImportRow>=self.catalog.db.query_row("SELECT id,source_root,source_path,digest,size,role,group_id,destination FROM import_items WHERE parent=? AND local_ready=0 AND archived=0 AND state<>'conflict' ORDER BY rowid LIMIT 1",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional()?;
         let Some((id, source_root, source_path, digest, size, role, group, destination)) = row
         else {
             return self.report(job);

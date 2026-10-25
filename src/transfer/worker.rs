@@ -241,10 +241,10 @@ impl WorkerSupervisor {
         Ok(())
     }
     pub fn poll(&mut self, ticket: WorkerTicket) -> AppResult<WorkerState> {
-        if let Some((id, state)) = &self.completed {
-            if *id == ticket {
-                return Ok(state.clone());
-            }
+        if let Some((id, state)) = &self.completed
+            && *id == ticket
+        {
+            return Ok(state.clone());
         }
         if self.child.try_wait()?.is_some() {
             return Ok(WorkerState::Reaped);
@@ -392,7 +392,8 @@ impl ArchiveRuntime {
                     archive,
                     writer,
                 )?;
-                let result = TransferEngine::stage(&spec)?;
+                let source = RootHandle::open(&spec.source.root, RootPolicy::Local)?;
+                let result = TransferEngine::stage_confined(&spec, &source, &store.root)?;
                 store.validate()?;
                 Ok(NasReply::Staged(result))
             }

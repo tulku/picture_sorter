@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+type LatestMediaResult = Result<Option<(DateTime<Utc>, PathBuf)>, Box<dyn std::error::Error>>;
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -121,24 +123,22 @@ fn parse_exif_datetime(date_str: &str) -> Option<DateTime<Utc>> {
 
 fn get_exif_date(exif: &Value) -> Option<DateTime<Utc>> {
     for key in ["DateTimeOriginal", "CreateDate"] {
-        if let Some(date_str) = exif.get(key).and_then(|v| v.as_str()) {
-            if let Some(date) = parse_exif_datetime(date_str) {
-                return Some(date);
-            }
+        if let Some(date_str) = exif.get(key).and_then(|v| v.as_str())
+            && let Some(date) = parse_exif_datetime(date_str)
+        {
+            return Some(date);
         }
     }
     None
 }
 
 fn get_sequence_info(exif: &Value, re: &Regex) -> u32 {
-    if let Some(special_mode) = exif.get("SpecialMode").and_then(|v| v.as_str()) {
-        if let Some(captures) = re.captures(special_mode) {
-            if let Some(seq_str) = captures.get(1) {
-                if let Ok(seq) = seq_str.as_str().parse::<u32>() {
-                    return seq;
-                }
-            }
-        }
+    if let Some(special_mode) = exif.get("SpecialMode").and_then(|v| v.as_str())
+        && let Some(captures) = re.captures(special_mode)
+        && let Some(seq_str) = captures.get(1)
+        && let Ok(seq) = seq_str.as_str().parse::<u32>()
+    {
+        return seq;
     }
     0
 }
@@ -149,14 +149,12 @@ fn get_hdr_info(exif: &Value, hdr_re: &Regex) -> Option<u32> {
             || drive_mode.contains("AE Auto Bracketing")
             || drive_mode.contains("AE Bracketing")
             || drive_mode.contains("Exposure Bracketing");
-        if is_bracket {
-            if let Some(captures) = hdr_re.captures(drive_mode) {
-                if let Some(shot_str) = captures.get(1) {
-                    if let Ok(shot_num) = shot_str.as_str().parse::<u32>() {
-                        return Some(shot_num);
-                    }
-                }
-            }
+        if is_bracket
+            && let Some(captures) = hdr_re.captures(drive_mode)
+            && let Some(shot_str) = captures.get(1)
+            && let Ok(shot_num) = shot_str.as_str().parse::<u32>()
+        {
+            return Some(shot_num);
         }
     }
     None
@@ -170,13 +168,13 @@ fn numbered_dirs(dir: &Path) -> io::Result<Vec<(u32, PathBuf)>> {
         if !path.is_dir() {
             continue;
         }
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if let Ok(n) = name.parse::<u32>() {
-                dirs.push((n, path));
-            }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && let Ok(n) = name.parse::<u32>()
+        {
+            dirs.push((n, path));
         }
     }
-    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    dirs.sort_by_key(|a| std::cmp::Reverse(a.0));
     Ok(dirs)
 }
 
@@ -191,10 +189,10 @@ fn day_has_photos(dir: &Path) -> bool {
                 if walk(&path) {
                     return true;
                 }
-            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if matches!(classify_name(name), FileRole::Media(_)) {
-                    return true;
-                }
+            } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && matches!(classify_name(name), FileRole::Media(_))
+            {
+                return true;
             }
         }
         false
@@ -218,9 +216,7 @@ fn newest_day_dir(base_dir: &Path) -> io::Result<Option<PathBuf>> {
     Ok(None)
 }
 
-fn max_date_in_dir(
-    dir: &Path,
-) -> Result<Option<(DateTime<Utc>, PathBuf)>, Box<dyn std::error::Error>> {
+fn max_date_in_dir(dir: &Path) -> LatestMediaResult {
     let output = Command::new("exiftool")
         .args([
             "-j",
@@ -275,26 +271,24 @@ fn max_date_in_dir(
         let Some(date) = get_exif_date(&item) else {
             continue;
         };
-        if best.as_ref().map_or(true, |(d, _)| date > *d) {
+        if best.as_ref().is_none_or(|(d, _)| date > *d) {
             best = Some((date, path));
         }
     }
     Ok(best)
 }
 
-fn find_most_recent_file_in_destination(
-    output_dir: &Path,
-) -> Result<Option<(DateTime<Utc>, PathBuf)>, Box<dyn std::error::Error>> {
+fn find_most_recent_file_in_destination(output_dir: &Path) -> LatestMediaResult {
     let mut best: Option<(DateTime<Utc>, PathBuf)> = None;
     for tree in ["RAW", "JPEG", "VIDEO"] {
         let Some(day_dir) = newest_day_dir(&output_dir.join(tree))? else {
             continue;
         };
         println!("Scanning newest {} day: {}", tree, day_dir.display());
-        if let Some((date, path)) = max_date_in_dir(&day_dir)? {
-            if best.as_ref().map_or(true, |(d, _)| date > *d) {
-                best = Some((date, path));
-            }
+        if let Some((date, path)) = max_date_in_dir(&day_dir)?
+            && best.as_ref().is_none_or(|(d, _)| date > *d)
+        {
+            best = Some((date, path));
         }
     }
     if let Some((date, path)) = &best {
@@ -334,16 +328,16 @@ fn collect_all_files_recursive(directory: &Path) -> Vec<PathBuf> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if !matches!(classify_name(name), FileRole::Ignore) {
-                        files.push(path);
-                    }
+                if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && !matches!(classify_name(name), FileRole::Ignore)
+                {
+                    files.push(path);
                 }
             } else if path.is_dir() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with('.') {
-                        continue;
-                    }
+                if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && name.starts_with('.')
+                {
+                    continue;
                 }
                 collect_recursive(&path, files);
             }
@@ -366,10 +360,10 @@ fn group_files_by_base(directory: &Path) -> HashMap<String, Vec<PathBuf>> {
     );
 
     for file_path in all_files {
-        if let Some(filename) = file_path.file_name().and_then(|n| n.to_str()) {
-            if let Some(base) = group_stem(filename) {
-                groups.entry(base.to_string()).or_default().push(file_path);
-            }
+        if let Some(filename) = file_path.file_name().and_then(|n| n.to_str())
+            && let Some(base) = group_stem(filename)
+        {
+            groups.entry(base.to_string()).or_default().push(file_path);
         }
         pb.inc(1);
     }
@@ -681,11 +675,12 @@ fn note_newest(
     dest: &Path,
     output_dir: &Path,
 ) {
-    if newest.as_ref().map_or(true, |(d, _)| date > *d) {
+    if newest.as_ref().is_none_or(|(d, _)| date > *d) {
         *newest = Some((date, relative_to_output(output_dir, dest)));
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_and_plan_copy(
     output_dir: &Path,
     groups: &HashMap<String, Vec<PathBuf>>,

@@ -187,3 +187,52 @@ fn invalid_later_record_rolls_back_entire_commit() {
         PublicationReadiness::Blocked(_)
     ));
 }
+#[test]
+fn sidecar_record_cannot_claim_an_original_media_path() {
+    let r = support::TestRig::new();
+    let root = RootHandle::open(&r.state, RootPolicy::Local).unwrap();
+    let mut c = Catalog::open(&root).unwrap();
+    let record = commit(
+        ArchiveId::new(),
+        vec![ArchiveRecord::SidecarCreated {
+            id: SidecarId::new(),
+            group: None,
+            path: ArchivePath::parse("RAW/only-original.ORF").unwrap(),
+            owner: "rapidraw-base".into(),
+        }],
+    );
+    assert!(c.apply_commit(&record).is_err());
+    assert!(matches!(
+        c.publication_readiness().unwrap(),
+        PublicationReadiness::Blocked(_)
+    ));
+}
+#[test]
+fn pending_replay_is_bounded_and_can_resume() {
+    let r = support::TestRig::new();
+    let root = RootHandle::open(&r.state, RootPolicy::Local).unwrap();
+    let mut c = Catalog::open(&root).unwrap();
+    let archive = ArchiveId::new();
+    let writer = WriterId::new();
+    let mut commits = Vec::new();
+    for n in 1..=200 {
+        let dependencies = commits
+            .last()
+            .map(|c: &CommitEnvelope| vec![c.commit_id])
+            .unwrap_or_default();
+        commits.push(CommitEnvelope::new(archive, writer, n, dependencies, vec![]).unwrap());
+    }
+    for commit in commits.iter().skip(1).rev() {
+        assert_eq!(c.apply_commit(commit).unwrap(), ApplyOutcome::Deferred);
+    }
+    c.apply_commit(&commits[0]).unwrap();
+    assert!(matches!(
+        c.publication_readiness().unwrap(),
+        PublicationReadiness::Blocked(_)
+    ));
+    assert_eq!(c.drain_pending(128).unwrap(), 71);
+    assert!(matches!(
+        c.publication_readiness().unwrap(),
+        PublicationReadiness::Ready
+    ));
+}
