@@ -8,6 +8,10 @@ pub enum JobKind {
         parent: JobId,
         item: JobId,
     },
+    MetadataFetch {
+        group: GroupId,
+        versions: Vec<VersionId>,
+    },
     ArchiveInit,
     ChangeMode {
         request: crate::archive::ModeChangeRequest,

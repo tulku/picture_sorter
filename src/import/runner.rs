@@ -280,7 +280,7 @@ impl ImportCoordinator {
                 captures.push(capture);
             }
         }
-        let sequences = classify_sequences(&captures, &[], &SequencePolicy::default());
+        let sequences = self.catalog.classify_import_sequences(&captures)?;
         for (entry, recognition) in entries.iter().zip(recognized) {
             let exists:bool=self.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM import_items WHERE parent=? AND source_path=? AND digest=?)",params![job.to_string(),entry.path.as_str(),recognition.digest.as_str()],|r|r.get(0))?;
             if exists {

@@ -93,3 +93,19 @@ fn live_sqlite_refuses_archive_root() {
     assert!(Catalog::open(&archive).is_err());
     assert!(!r.archive.join("catalog.sqlite").exists());
 }
+#[test]
+fn ingestion_milestone_does_not_create_a_second_attempt_for_running_generation() {
+    let r = support::TestRig::new();
+    let root = RootHandle::open(&r.state, RootPolicy::Local).unwrap();
+    let mut catalog = Catalog::open(&root).unwrap();
+    let job = catalog
+        .enqueue(DurableRequest {
+            operation_id: OperationId::new(),
+            kind: JobKind::Clean,
+        })
+        .unwrap();
+    catalog.transition(job, 0, JobTransition::Start).unwrap();
+    catalog.transition(job, 1, JobTransition::Ingested).unwrap();
+    assert!(catalog.job(job).unwrap().local_ready);
+    assert_eq!(catalog.job(job).unwrap().generation, 1);
+}

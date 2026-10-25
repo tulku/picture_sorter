@@ -208,3 +208,173 @@ fn finish(
                 .into(),
     });
 }
+impl crate::catalog::Catalog {
+    pub fn classify_import_sequences(
+        &mut self,
+        records: &[CaptureRecord],
+    ) -> crate::error::AppResult<Vec<SequenceDecision>> {
+        use crate::error::AppError;
+        use rusqlite::params;
+        if records.len() > 128 {
+            return Err(AppError::invalid("sequence input batch exceeds 128"));
+        }
+        let mut window = std::collections::BTreeMap::new();
+        for record in records {
+            record_capture_evidence(&self.db, record)?;
+            window.insert(
+                (record.member.digest.clone(), record.member.path.clone()),
+                record.clone(),
+            );
+        }
+        for record in records {
+            let Some(time) = time(record) else {
+                continue;
+            };
+            let second = time.and_utc().timestamp();
+            let mut query=self.db.prepare("SELECT payload FROM capture_facts WHERE context=? AND camera=? AND second BETWEEN ? AND ? ORDER BY abs(second-?),digest,path LIMIT 256")?;
+            for row in query.query_map(
+                params![
+                    record.context,
+                    record.metadata.camera,
+                    second - 5,
+                    second + 5,
+                    second
+                ],
+                |r| r.get::<_, String>(0),
+            )? {
+                let capture: CaptureRecord = serde_json::from_str(&row?)?;
+                window
+                    .entry((capture.member.digest.clone(), capture.member.path.clone()))
+                    .or_insert(capture);
+                if window.len() >= 512 {
+                    break;
+                }
+            }
+            if window.len() >= 512 {
+                break;
+            }
+        }
+        let mut existing = Vec::new();
+        for capture in window.values() {
+            let mut query = self
+                .db
+                .prepare("SELECT DISTINCT kind,anchor FROM sequence_members WHERE digest=?")?;
+            for row in query.query_map([capture.member.digest.as_str()], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })? {
+                let (kind, anchor) = row?;
+                existing.push(SequenceRecord {
+                    kind: serde_json::from_str(&kind)?,
+                    anchor,
+                    members: vec![capture.member.digest.clone()],
+                });
+            }
+        }
+        let mut merged = std::collections::BTreeMap::new();
+        for entry in existing {
+            merged
+                .entry((entry.kind, entry.anchor))
+                .or_insert_with(Vec::new)
+                .extend(entry.members);
+        }
+        let existing = merged
+            .into_iter()
+            .map(|((kind, anchor), members)| SequenceRecord {
+                kind,
+                anchor,
+                members,
+            })
+            .collect::<Vec<_>>();
+        let window = window.into_values().collect::<Vec<_>>();
+        let decisions = classify_sequences(&window, &existing, &SequencePolicy::default());
+        for decision in &decisions {
+            record_sequence_evidence(
+                &self.db,
+                &SequenceRecord {
+                    kind: decision.kind,
+                    anchor: decision.anchor.clone(),
+                    members: decision.members.clone(),
+                },
+            )?;
+        }
+        Ok(decisions)
+    }
+    pub fn sequence_records_for(
+        &self,
+        digest: &Digest,
+    ) -> crate::error::AppResult<Vec<crate::archive::ArchiveRecord>> {
+        let mut result = Vec::new();
+        let mut query = self
+            .db
+            .prepare("SELECT payload FROM capture_facts WHERE digest=? ORDER BY path LIMIT 128")?;
+        for row in query.query_map([digest.as_str()], |r| r.get::<_, String>(0))? {
+            result.push(crate::archive::ArchiveRecord::CaptureRecorded {
+                capture: serde_json::from_str(&row?)?,
+            });
+        }
+        let mut query=self.db.prepare("SELECT kind,anchor FROM sequence_members WHERE digest=? ORDER BY kind,anchor LIMIT 128")?;
+        for row in query.query_map([digest.as_str()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })? {
+            let (kind, anchor) = row?;
+            let mut members=self.db.prepare("SELECT digest FROM sequence_members WHERE kind=? AND anchor=? AND digest<>? ORDER BY digest LIMIT 511")?;
+            let mut members = members
+                .query_map(rusqlite::params![kind, anchor, digest.as_str()], |r| {
+                    r.get::<_, String>(0)
+                })?
+                .map(|r| Digest::parse(&r?))
+                .collect::<crate::error::AppResult<Vec<_>>>()?;
+            members.push(digest.clone());
+            result.push(crate::archive::ArchiveRecord::SequenceRecorded {
+                sequence: SequenceRecord {
+                    kind: serde_json::from_str(&kind)?,
+                    anchor,
+                    members,
+                },
+            });
+        }
+        Ok(result)
+    }
+}
+pub(crate) fn record_capture_evidence(
+    db: &rusqlite::Connection,
+    capture: &CaptureRecord,
+) -> crate::error::AppResult<()> {
+    let mut capture = capture.clone();
+    capture.source_mtime = None;
+    capture.metadata.raw = serde_json::json!({"DriveMode":capture.metadata.raw.get("DriveMode")});
+    let payload = serde_json::to_string(&capture)?;
+    if payload.len() > 16 * 1024 {
+        return Err(crate::error::AppError::invalid(
+            "normalized capture facts exceed bound",
+        ));
+    }
+    let second = time(&capture).map(|t| t.and_utc().timestamp());
+    db.execute("INSERT INTO capture_facts(digest,path,context,camera,second,payload) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING",rusqlite::params![capture.member.digest.as_str(),capture.member.path.as_str(),capture.context,capture.metadata.camera,second,payload])?;
+    Ok(())
+}
+pub(crate) fn record_sequence_evidence(
+    db: &rusqlite::Connection,
+    sequence: &SequenceRecord,
+) -> crate::error::AppResult<()> {
+    if sequence.members.len() > 512
+        || sequence.anchor.len() > 255
+        || sequence.anchor.contains('/')
+        || sequence.anchor.is_empty()
+    {
+        return Err(crate::error::AppError::invalid(
+            "invalid sequence evidence bound/anchor",
+        ));
+    }
+    for digest in &sequence.members {
+        db.execute(
+            "INSERT INTO sequence_members(digest,kind,anchor) VALUES(?,?,?) ON CONFLICT DO NOTHING",
+            rusqlite::params![
+                digest.as_str(),
+                serde_json::to_string(&sequence.kind)?,
+                sequence.anchor
+            ],
+        )?;
+    }
+    Ok(())
+}

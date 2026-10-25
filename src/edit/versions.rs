@@ -127,7 +127,11 @@ impl<'a> VersionStore<'a> {
             }
             serde_json::from_str(&format!("\"{version}\""))?
         } else {
-            let version = VersionId::new();
+            let version = if intent.origin == VersionOrigin::Derived {
+                VersionId(intent.operation.0)
+            } else {
+                VersionId::new()
+            };
             self.catalog.db.execute("INSERT INTO snapshot_intents(operation,version,sidecar,parents,body,origin) VALUES(?,?,?,?,?,?)",params![intent.operation.to_string(),version.to_string(),intent.sidecar.to_string(),serde_json::to_string(&parents)?,serde_json::to_string(&body)?,serde_json::to_string(&intent.origin)?])?;
             version
         };

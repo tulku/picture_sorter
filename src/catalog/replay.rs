@@ -189,6 +189,12 @@ fn apply_record(
     record: ArchiveRecord,
 ) -> AppResult<()> {
     match record {
+        ArchiveRecord::CaptureRecorded { capture } => {
+            crate::import::record_capture_evidence(db, &capture)?
+        }
+        ArchiveRecord::SequenceRecorded { sequence } => {
+            crate::import::record_sequence_evidence(db, &sequence)?
+        }
         ArchiveRecord::AmbiguityRecorded {
             id,
             kind,
@@ -231,6 +237,7 @@ fn apply_record(
             super::conflicts::apply_resolution(db, request)?
         }
         ArchiveRecord::MetadataCached { result } => {
+            let result = result.bounded()?;
             if result.extractor != crate::import::EXTRACTOR_VERSION {
                 return Err(AppError::integrity(
                     "unsupported normalized metadata contract",
@@ -509,6 +516,7 @@ fn apply_record(
                 return Err(AppError::integrity("resolution references unknown version"));
             }
             if db.execute("UPDATE conflicts SET resolved=1,revision=revision+1 WHERE id=? AND revision=? AND resolved=0",params![id.to_string(),expected_revision])?!=1{return Err(AppError::integrity("resolution precondition mismatch"));}
+            db.execute("UPDATE residency SET conflict=EXISTS(SELECT 1 FROM conflicts WHERE group_id=residency.group_id AND resolved=0) WHERE group_id IN(SELECT group_id FROM conflicts WHERE id=?)",[id.to_string()])?;
         }
         ArchiveRecord::MappingRecorded {
             remote_checksum,

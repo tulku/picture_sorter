@@ -666,3 +666,109 @@ fn status_and_conflicts_have_bounded_resumable_pages() {
         128
     );
 }
+#[test]
+fn capacity_pressure_reclaims_old_archived_lru_before_direct_import() {
+    let fixture = ServiceFixture::with_config(|config, _| {
+        config.budget = 3 * 1024 * 1024;
+        config.activity_hold_seconds = 0;
+    });
+    let init = fixture.cli(&["archive", "init"]);
+    assert!(init.status.success());
+    std::fs::write(fixture.r.source.join("OLD.ORF"), vec![1; 1200 * 1024]).unwrap();
+    let out = fixture.cli(&[
+        "import",
+        fixture.r.source.to_str().unwrap(),
+        "--wait-for",
+        "archived",
+    ]);
+    assert!(
+        out.status.success(),
+        "{} status {}",
+        String::from_utf8_lossy(&out.stdout),
+        fixture.status()
+    );
+    let old = fixture.status()["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["group"]["members"].as_array().unwrap())
+        .find(|m| m["path"].as_str().unwrap().ends_with("OLD.ORF"))
+        .unwrap()["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    std::fs::remove_file(fixture.r.source.join("OLD.ORF")).unwrap();
+    std::fs::write(fixture.r.source.join("NEW.ORF"), vec![2; 1500 * 1024]).unwrap();
+    let out = fixture.cli(&["import", fixture.r.source.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{} status {}",
+        String::from_utf8_lossy(&out.stdout),
+        fixture.status()
+    );
+    let new = fixture.status()["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["group"]["members"].as_array().unwrap())
+        .find(|m| m["path"].as_str().unwrap().ends_with("NEW.ORF"))
+        .unwrap()["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        fixture.r.local.join(&new).exists(),
+        "new original should be admitted locally after reclaiming eligible archived LRU"
+    );
+    assert!(!fixture.r.local.join(&old).exists());
+    assert!(fixture.r.archive.join(old).exists());
+}
+#[test]
+fn unchanged_owned_source_companion_reuses_archived_history_without_new_commit() {
+    let service = ServiceFixture::new();
+    assert!(service.cli(&["archive", "init"]).status.success());
+    std::fs::write(service.r.source.join("A.ORF"), b"raw").unwrap();
+    std::fs::write(
+        service.r.source.join("A.ORF.rrdata"),
+        br#"{"version":1,"rating":3,"adjustments":null}"#,
+    )
+    .unwrap();
+    let first = service.cli(&[
+        "import",
+        service.r.source.to_str().unwrap(),
+        "--wait-for",
+        "archived",
+    ]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stdout)
+    );
+    let count = || {
+        std::fs::read_dir(service.r.archive.join(".photo-sorter/commits"))
+            .unwrap()
+            .map(|directory| {
+                std::fs::read_dir(directory.unwrap().path())
+                    .unwrap()
+                    .count()
+            })
+            .sum::<usize>()
+    };
+    let before = count();
+    let second = service.cli(&[
+        "import",
+        service.r.source.to_str().unwrap(),
+        "--wait-for",
+        "archived",
+    ]);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    assert_eq!(
+        count(),
+        before,
+        "an unchanged owned companion must reuse exact committed version evidence"
+    );
+}

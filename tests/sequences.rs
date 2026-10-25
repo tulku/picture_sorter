@@ -179,3 +179,33 @@ fn orf_is_primary_over_ori() {
         "DCIM/100OMSYS/a.ORF"
     );
 }
+#[test]
+fn real_import_sequence_context_survives_batches_restart_and_shared_replay() {
+    let r = support::TestRig::new();
+    let root = RootHandle::open(&r.state, RootPolicy::Local).unwrap();
+    let mut catalog = Catalog::open(&root).unwrap();
+    let frames = burst();
+    let first = catalog.classify_import_sequences(&frames[..2]).unwrap();
+    assert_eq!(first.len(), 1);
+    let anchor = first[0].anchor.clone();
+    drop(catalog);
+    let mut catalog = Catalog::open(&root).unwrap();
+    let next = catalog.classify_import_sequences(&frames[2..]).unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].anchor, anchor);
+    assert!(next[0].members.contains(&frames[3].member.digest));
+    let records = catalog
+        .sequence_records_for(&frames[2].member.digest)
+        .unwrap();
+    let archive = ArchiveId::new();
+    let commit =
+        photo_sorter::archive::CommitEnvelope::new(archive, WriterId::new(), 1, vec![], records)
+            .unwrap();
+    let other = r._temp.path().join("other-state");
+    std::fs::create_dir(&other).unwrap();
+    let root = RootHandle::open(&other, RootPolicy::Local).unwrap();
+    let mut rebuilt = Catalog::open(&root).unwrap();
+    rebuilt.apply_commit(&commit).unwrap();
+    let repeated = rebuilt.classify_import_sequences(&frames[1..]).unwrap();
+    assert_eq!(repeated[0].anchor, anchor);
+}

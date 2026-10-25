@@ -202,3 +202,20 @@ fn nonportable_source_name_does_not_stop_independent_import() {
         b"preserve"
     );
 }
+#[test]
+fn oversized_exif_is_cached_as_bounded_error_without_blocking_original_identity() {
+    let r = support::TestRig::new();
+    let root = RootHandle::open(&r.state, RootPolicy::Local).unwrap();
+    let mut catalog = Catalog::open(&root).unwrap();
+    let digest = Digest::of(b"original");
+    let result = MetadataResult::from_json(
+        digest.clone(),
+        serde_json::json!({"Make":"camera","DateTimeOriginal":"2026:10:25 12:00:00","Unexpected":"x".repeat(1024*1024)}),
+    );
+    catalog.cache_metadata(&result).unwrap();
+    let cached = catalog.metadata(&digest).unwrap().unwrap();
+    assert!(cached.error.is_some());
+    assert!(serde_json::to_vec(&cached).unwrap().len() < 8192);
+    assert_eq!(cached.digest, digest);
+    assert!(cached.camera.is_empty());
+}

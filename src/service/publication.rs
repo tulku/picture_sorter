@@ -537,12 +537,27 @@ fn prepare(engine: &mut ImportCoordinator, candidate: &Candidate) -> AppResult<V
                 operation: serde_json::from_str(&format!("\"{operation}\""))?,
             });
             let is_current = engine.catalog.local_head(version.sidecar)? == Some(version.id);
+            let derived: Option<String> = engine
+                .catalog
+                .db
+                .query_row(
+                    "SELECT expected FROM derived_heads WHERE version=?",
+                    [version.id.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let is_derived = derived.as_ref().is_some_and(|expected| {
+                serde_json::from_str::<Vec<VersionId>>(expected)
+                    .ok()
+                    .as_ref()
+                    == Some(&engine.catalog.heads(version.sidecar).unwrap_or_default())
+            });
             let is_pending: bool = engine.catalog.db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM rating_baselines WHERE pending_version=?)",
                 [version.id.to_string()],
                 |r| r.get(0),
             )?;
-            if is_current || is_pending {
+            if is_current || is_pending || is_derived {
                 let expected = engine.catalog.heads(version.sidecar)?;
                 let mut heads = vec![];
                 for head in &expected {
@@ -558,6 +573,29 @@ fn prepare(engine: &mut ImportCoordinator, candidate: &Candidate) -> AppResult<V
                     expected: expected.clone(),
                     heads: heads.clone(),
                 });
+                if is_derived && heads == vec![version.id] {
+                    let mut query=engine.catalog.db.prepare("SELECT id,revision,details FROM conflicts WHERE kind='sidecar' AND resolved=0 ORDER BY id LIMIT 128")?;
+                    for row in query.query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, u64>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })? {
+                        let (id, revision, details) = row?;
+                        if serde_json::from_str::<Vec<VersionId>>(&details)
+                            .ok()
+                            .as_ref()
+                            == Some(&expected)
+                        {
+                            records.push(ArchiveRecord::ConflictResolved {
+                                id: serde_json::from_value(id.into())?,
+                                expected_revision: revision,
+                                version: version.id,
+                            });
+                        }
+                    }
+                }
                 if heads.len() > 1 {
                     let digest = blake3::hash(
                         format!("sidecar-conflict:{}:{heads:?}", version.sidecar).as_bytes(),

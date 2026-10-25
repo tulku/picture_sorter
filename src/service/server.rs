@@ -265,6 +265,7 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         reader: super::archive_reader::ArchiveReader::default(),
         http_reason,
         rating_cursor: None,
+        merge_cursor: None,
         job_cursor: None,
         engine: ImportCoordinator::new(config.clone(), catalog),
         local,
@@ -427,6 +428,7 @@ struct Runtime {
     http: Option<super::http::AsyncImmich>,
     http_reason: Option<String>,
     rating_cursor: Option<Option<uuid::Uuid>>,
+    merge_cursor: Option<SidecarId>,
     job_cursor: Option<JobId>,
     local: RootHandle,
     state: RootHandle,
@@ -928,6 +930,21 @@ impl Runtime {
                 )?,
             }
         }
+        let editor_allowed = self.engine.config.local_test_backend
+            || self
+                .editor_identity
+                .as_ref()
+                .is_some_and(|identity| identity.decision(&self.engine.config).allowed);
+        if editor_allowed
+            && let Err(error) = super::metadata_merge::advance(
+                &mut self.engine.catalog,
+                &self.state,
+                &self.engine.config.rapidraw_version,
+                &mut self.merge_cursor,
+            )
+        {
+            self.http_reason = Some(error.to_string());
+        }
         let now = clock.now();
         let mut jobs = self.engine.catalog.jobs_page(self.job_cursor, 128, true)?;
         self.job_cursor = jobs.last().map(|job| job.id);
@@ -1113,6 +1130,45 @@ impl Runtime {
             && self.bootstrap.active_job().is_none_or(|id| id == job)
             && self.fetch.nas_active_job().is_none_or(|id| id == job)
     }
+    fn pressure_reclaim(&mut self, parent: JobId) -> AppResult<bool> {
+        let pending:bool=self.engine.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE json_extract(request,'$.kind.type')='evict' AND json_extract(state,'$') NOT IN('Complete','Cancelled','Failed','Conflict'))",[],|r|r.get(0))?;
+        let reclaim = if pending {
+            true
+        } else if let Some(intent) = EvictionPlanner::candidates_with_hold(
+            &self.engine.catalog,
+            SystemClock::default().now(),
+            self.engine.config.activity_hold_seconds,
+        )?
+        .into_iter()
+        .next()
+        {
+            self.engine.catalog.enqueue(DurableRequest {
+                operation_id: intent.operation,
+                kind: JobKind::Evict {
+                    group: intent.group,
+                    revision: intent.revision,
+                    members: intent.members,
+                    activity: intent.eligibility_activity,
+                },
+            })?;
+            true
+        } else {
+            false
+        };
+        if reclaim {
+            let record = self.engine.catalog.job(parent)?;
+            if record.state != JobState::Running {
+                self.engine
+                    .catalog
+                    .transition(parent, record.generation, JobTransition::Start)?;
+            }
+            self.engine
+                .catalog
+                .db
+                .execute("DELETE FROM job_retry WHERE job=?", [parent.to_string()])?;
+        }
+        Ok(reclaim)
+    }
     fn pin_shared_fresh(&mut self, job: JobId) -> AppResult<bool> {
         let required: Option<u64> = self
             .engine
@@ -1153,6 +1209,13 @@ impl Runtime {
                     self.local_transfer.advance(&mut self.engine, job)?;
                 }
                 let report = self.engine.report(job)?;
+                if report.waiting > 0
+                    && self.local_transfer.active_parent().is_none()
+                    && self.engine.catalog.job(job)?.state == JobState::WaitingCapacity
+                    && self.pressure_reclaim(job)?
+                {
+                    return Ok(());
+                }
                 if report.conflicting > 0 {
                     self.wait(
                         job,
@@ -1193,6 +1256,20 @@ impl Runtime {
                 )
                 .advance(job)?;
                 self.result(job, report)?;
+            }
+            JobKind::MetadataFetch { .. } => {
+                let nas_allowed = self.nas_job_allowed(job);
+                self.fetch.advance(
+                    &mut self.engine.catalog,
+                    &config,
+                    &mut self.worker,
+                    &mut self.maintenance,
+                    job,
+                    nas_allowed,
+                )?;
+                if self.fetch.verified(job) {
+                    self.complete(job)?;
+                }
             }
             JobKind::Pin { .. } => {
                 let fresh = self.pin_shared_fresh(job)?;
@@ -1341,9 +1418,10 @@ impl Runtime {
                 }
             }
             JobKind::Clean => {
-                let intents = EvictionPlanner::candidates(
+                let intents = EvictionPlanner::candidates_with_hold(
                     &self.engine.catalog,
                     SystemClock::default().now(),
+                    config.activity_hold_seconds,
                 )?;
                 let mut removed = 0;
                 for intent in intents {

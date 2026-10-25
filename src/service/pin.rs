@@ -67,6 +67,12 @@ impl PinDriver {
             return Ok(());
         }
         if active.deferred.is_some() {
+            if let Some(attempt) = active.attempt {
+                catalog.update_reservation(attempt.reservation, 0)?;
+            }
+            catalog
+                .db
+                .execute("DELETE FROM pin_attempts WHERE job=?", [job.to_string()])?;
             return Ok(());
         }
         let worker = if matches!(active.phase, Phase::Fetch) {
@@ -233,7 +239,13 @@ impl PinDriver {
                 reservation: serde_json::from_str(&format!("\"{reservation}\""))?,
             };
             let target: Target = serde_json::from_str(&target)?;
-            reconcile_reservation(catalog, &attempt)?;
+            if catalog.job(job)?.generation != attempt.spec.generation {
+                return Err(AppError::new(
+                    ErrorCode::Conflict,
+                    "obsolete pin attempt generation; owned partial retained",
+                ));
+            }
+            readmit_attempt(catalog, config, &attempt)?;
             let ticket = nas.submit(NasCommand::FetchArchive {
                 archive: bound_archive(config)?,
                 writer: config.writer_id,
@@ -251,7 +263,11 @@ impl PinDriver {
         }
         let current = catalog.group(group)?;
         let mut target = None;
-        for member in current.members {
+        let metadata_only = matches!(
+            catalog.job(job)?.request.kind,
+            JobKind::MetadataFetch { .. }
+        );
+        for member in current.members.into_iter().filter(|_| !metadata_only) {
             if !checked(catalog, job, &member, current.membership_revision)? {
                 target = Some(Target {
                     group,
@@ -263,13 +279,9 @@ impl PinDriver {
             }
         }
         if target.is_none() {
-            let mut query=catalog.db.prepare("SELECT v.body FROM sidecars s JOIN heads h ON h.sidecar=s.id JOIN versions v ON v.id=h.version WHERE s.group_id=? ORDER BY s.id LIMIT 128")?;
-            let bodies = query
-                .query_map([group.to_string()], |r| r.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(query);
+            let bodies = catalog.pin_metadata_bodies(job, group, current.membership_revision)?;
             for body in bodies {
-                if let VersionBody::Content { digest, size } = serde_json::from_str(&body)? {
+                if let VersionBody::Content { digest, size } = body {
                     let member = OriginalMember {
                         path: crate::edit::snapshot_path(&digest)?,
                         digest,
@@ -326,7 +338,9 @@ fn target_root<'a>(config: &'a Config, target: &Target) -> &'a std::path::Path {
 }
 fn pin_group(catalog: &Catalog, job: JobId) -> AppResult<GroupId> {
     match catalog.job(job)?.request.kind {
-        JobKind::Pin { group } => catalog.canonical_group(group),
+        JobKind::Pin { group } | JobKind::MetadataFetch { group, .. } => {
+            catalog.canonical_group(group)
+        }
         JobKind::PinUrl { .. } => {
             let group: String = catalog.db.query_row(
                 "SELECT group_id FROM pin_targets WHERE job=?",
@@ -431,7 +445,7 @@ fn prepare_attempt(
     )?;
     Ok(Some(Attempt { spec, reservation }))
 }
-fn reconcile_reservation(catalog: &mut Catalog, attempt: &Attempt) -> AppResult<()> {
+fn partial_size(attempt: &Attempt) -> AppResult<u64> {
     let root = RootHandle::open(&attempt.spec.destination_root, RootPolicy::Local)?;
     let partial = match root.open_relative(
         &attempt.spec.staged_path,
@@ -448,10 +462,169 @@ fn reconcile_reservation(catalog: &mut Catalog, attempt: &Attempt) -> AppResult<
         Err(e) if e.errno == Some(libc::ENOENT) => 0,
         Err(e) => return Err(e),
     };
-    let remaining = attempt
-        .spec
-        .expected_size
-        .checked_sub(partial)
-        .ok_or_else(|| AppError::integrity("pin partial exceeds object size"))?;
-    catalog.update_reservation(attempt.reservation, remaining)
+    if partial > attempt.spec.expected_size {
+        return Err(AppError::integrity("pin partial exceeds object size"));
+    }
+    Ok(partial)
+}
+fn reconcile_reservation(catalog: &mut Catalog, attempt: &Attempt) -> AppResult<()> {
+    catalog.update_reservation(
+        attempt.reservation,
+        attempt.spec.expected_size - partial_size(attempt)?,
+    )
+}
+fn readmit_attempt(catalog: &mut Catalog, config: &Config, attempt: &Attempt) -> AppResult<()> {
+    let local = RootHandle::open(&config.working_root, RootPolicy::Local)?;
+    let state = RootHandle::open(&config.state_root, RootPolicy::Local)?;
+    let root = RootHandle::open(&attempt.spec.destination_root, RootPolicy::Local)?;
+    let own: u64 = catalog.db.query_row(
+        "SELECT remaining FROM reservations WHERE id=?",
+        [attempt.reservation.to_string()],
+        |r| r.get(0),
+    )?;
+    let reserved = catalog
+        .remaining_reservations(FilesystemId(root.device()))?
+        .checked_sub(own)
+        .ok_or_else(|| AppError::integrity("pin reservation filesystem mismatch"))?;
+    let occupied = occupied_bytes(&local)?
+        .checked_add(state_occupied_bytes(&state)?)
+        .ok_or_else(|| AppError::invalid("occupancy overflow"))?;
+    let decision = admit(&AdmissionInput {
+        budget: config.budget,
+        occupied,
+        reserved,
+        available: available_bytes(&root)?,
+        reserve: config.reserve,
+        required: attempt.spec.expected_size,
+        existing: 0,
+        partial: partial_size(attempt)?,
+        overhead: 0,
+        nas_available: false,
+        allow_direct: false,
+    });
+    if let AdmissionDecision::Local { additional_bytes } = decision {
+        catalog.update_reservation(attempt.reservation, additional_bytes)
+    } else {
+        catalog.update_reservation(attempt.reservation, 0)?;
+        Err(AppError::new(
+            ErrorCode::Capacity,
+            "pin retry waits for current capacity; partial bytes and pin retained",
+        ))
+    }
+}
+impl Catalog {
+    pub(crate) fn pin_metadata_bodies(
+        &self,
+        job: JobId,
+        group: GroupId,
+        revision: MembershipRevision,
+    ) -> AppResult<Vec<VersionBody>> {
+        let (metadata_only, versions) = match self.job(job)?.request.kind {
+            JobKind::MetadataFetch {
+                group: requested,
+                versions,
+            } => {
+                if requested != group || versions.len() > 3 || versions.is_empty() {
+                    return Err(AppError::invalid(
+                        "metadata merge fetch requires one to three exact versions of its group",
+                    ));
+                }
+                for id in &versions {
+                    let sidecar = self.version(*id)?.sidecar;
+                    let owner: Option<String> = self.db.query_row(
+                        "SELECT group_id FROM sidecars WHERE id=?",
+                        [sidecar.to_string()],
+                        |r| r.get(0),
+                    )?;
+                    if owner.as_deref() != Some(&group.to_string()) {
+                        return Err(AppError::integrity(
+                            "metadata fetch crosses group ownership",
+                        ));
+                    }
+                }
+                (true, versions)
+            }
+            _ => (false, vec![]),
+        };
+        let mut query=self.db.prepare("SELECT DISTINCT v.body FROM sidecars s JOIN versions v ON v.sidecar=s.id WHERE s.group_id=? AND (v.id IN(SELECT value FROM json_each(?)) OR (?=0 AND EXISTS(SELECT 1 FROM heads h WHERE h.version=v.id AND h.sidecar=s.id))) AND json_extract(v.body,'$.Content.digest') IS NOT NULL AND NOT EXISTS(SELECT 1 FROM pin_checks p WHERE p.job=? AND p.digest=json_extract(v.body,'$.Content.digest') AND p.revision=?) ORDER BY v.id LIMIT 128")?;
+        query
+            .query_map(
+                params![
+                    group.to_string(),
+                    serde_json::to_string(&versions)?,
+                    metadata_only,
+                    job.to_string(),
+                    revision.0
+                ],
+                |r| r.get::<_, String>(0),
+            )?
+            .map(|r| Ok(serde_json::from_str(&r?)?))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn failed_pin_attempt_readmits_partial_against_current_capacity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let local = temporary.path().join("local");
+        let state = temporary.path().join("state");
+        let archive = temporary.path().join("archive");
+        for path in [&local, &state, &archive] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let mut config = Config::new(local.clone(), state.clone(), archive);
+        config.reserve = 0;
+        let state_root = RootHandle::open(&state, RootPolicy::Local).unwrap();
+        let mut catalog = Catalog::open(&state_root).unwrap();
+        let group = catalog.create_group(false).unwrap();
+        let job = catalog.request_pin(group, OperationId::new()).unwrap();
+        let target = Target {
+            group,
+            revision: catalog.group(group).unwrap().membership_revision,
+            member: OriginalMember {
+                path: ArchivePath::parse("RAW/frame.orf").unwrap(),
+                digest: Digest::of(&[1; 100]),
+                size: 100,
+                role: MediaRole::Raw,
+            },
+            metadata: false,
+        };
+        let attempt = prepare_attempt(&mut catalog, &config, job, &target)
+            .unwrap()
+            .unwrap();
+        catalog.update_reservation(attempt.reservation, 0).unwrap();
+        let local_root = RootHandle::open(&local, RootPolicy::Local).unwrap();
+        local_root
+            .mkdir_all(
+                &ArchivePath::parse(
+                    attempt
+                        .spec
+                        .staged_path
+                        .as_str()
+                        .rsplit_once('/')
+                        .unwrap()
+                        .0,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        local_root
+            .write_new(&attempt.spec.staged_path, &[1; 20])
+            .unwrap();
+        let occupied =
+            occupied_bytes(&local_root).unwrap() + state_occupied_bytes(&state_root).unwrap();
+        config.budget = occupied + 50;
+        assert!(readmit_attempt(&mut catalog, &config, &attempt).is_err());
+        config.budget = occupied + 80;
+        readmit_attempt(&mut catalog, &config, &attempt).unwrap();
+        assert_eq!(
+            catalog
+                .remaining_reservations(FilesystemId(local_root.device()))
+                .unwrap(),
+            80
+        );
+    }
 }

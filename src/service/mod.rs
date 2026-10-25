@@ -60,3 +60,5 @@ mod observation;
 mod publication;
 
 mod pin;
+
+mod metadata_merge;

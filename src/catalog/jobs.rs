@@ -89,6 +89,7 @@ impl Catalog {
         let mut archived = old.archive_committed;
         let mut reason = None;
         let mut cancel = old.cancel_requested;
+        let starting = matches!(&change, JobTransition::Start);
         match change {
             JobTransition::Start => {
                 generation = generation
@@ -134,7 +135,7 @@ impl Catalog {
         if changed != 1 {
             return Err(AppError::new(ErrorCode::Conflict, "obsolete generation"));
         }
-        if matches!(state, JobState::Running) {
+        if starting {
             tx.execute(
                 "INSERT INTO attempts(job,generation,state) VALUES(?,?,?)",
                 params![id.to_string(), generation, encode(&state)?],

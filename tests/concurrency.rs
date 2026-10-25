@@ -17,6 +17,13 @@ fn raw(status: &serde_json::Value) -> (String, String) {
 }
 #[test]
 fn two_clients_same_import_and_divergent_saved_edits() {
+    concurrent_scenario(false);
+}
+#[test]
+fn two_clients_merge_rating_and_adjustments_without_refetching_raw_or_overwriting_live_edits() {
+    concurrent_scenario(true);
+}
+fn concurrent_scenario(mergeable: bool) {
     let first = ServiceFixture::with_config(|config, r| {
         let root = RootHandle::open(&r.archive, RootPolicy::TestArchive).unwrap();
         for dir in ["commits", "versions", "staging", "locks", "sequences"] {
@@ -120,13 +127,22 @@ fn two_clients_same_import_and_divergent_saved_edits() {
         std::fs::read(second.r.local.join(format!("{path}.rrdata"))).unwrap(),
         base
     );
+    if mergeable {
+        std::fs::remove_file(first.r.local.join(&path)).unwrap();
+        std::fs::remove_file(second.r.local.join(&path)).unwrap();
+    }
     let a = br#"{"version":1,"rating":3,"adjustments":{"exposure":2},"tags":null,"mask":"first"}"#;
     let b = br#"{"version":1,"rating":3,"adjustments":{"exposure":3},"tags":null,"mask":"second"}"#;
+    let b: &[u8] = if mergeable {
+        br#"{"version":1,"rating":5,"adjustments":{"exposure":1},"tags":null}"#
+    } else {
+        b
+    };
     std::fs::write(first.r.local.join(format!("{path}.rrdata")), a).unwrap();
     std::fs::write(second.r.local.join(format!("{path}.rrdata")), b).unwrap();
     let deadline = Instant::now();
     loop {
-        let histories = [a.as_slice(), b.as_slice()].iter().all(|bytes| {
+        let histories = [a.as_slice(), b].iter().all(|bytes| {
             first
                 .r
                 .archive
@@ -141,6 +157,44 @@ fn two_clients_same_import_and_divergent_saved_edits() {
             "both saved histories were not archived"
         );
         std::thread::sleep(Duration::from_millis(20));
+    }
+    if mergeable {
+        let deadline = Instant::now();
+        loop {
+            let bytes =
+                std::fs::read(first.r.archive.join(format!("{path}.rrdata"))).unwrap_or_default();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            if value["rating"] == 5
+                && value["adjustments"]["exposure"] == 2
+                && value["mask"] == "first"
+            {
+                break;
+            }
+            assert!(
+                deadline.elapsed() < Duration::from_secs(20),
+                "metadata-only merge did not publish: {}",
+                first.status()
+            );
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(
+            std::fs::read(first.r.local.join(format!("{path}.rrdata"))).unwrap(),
+            a
+        );
+        assert_eq!(
+            std::fs::read(second.r.local.join(format!("{path}.rrdata"))).unwrap(),
+            b
+        );
+        assert!(!first.r.local.join(&path).exists());
+        assert!(!second.r.local.join(&path).exists());
+        assert!([first.status(), second.status()].iter().any(|status| {
+            status["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|job| job["request"]["kind"]["type"] == "metadata_fetch")
+        }));
+        return;
     }
     let deadline = Instant::now();
     while ![first.status(), second.status()].iter().any(|s| {
@@ -174,7 +228,7 @@ fn two_clients_same_import_and_divergent_saved_edits() {
         std::fs::read(second.r.local.join(format!("{path}.rrdata"))).unwrap(),
         b
     );
-    for bytes in [a.as_slice(), b.as_slice()] {
+    for bytes in [a.as_slice(), b] {
         assert_eq!(
             std::fs::read(
                 first

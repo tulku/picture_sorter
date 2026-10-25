@@ -16,3 +16,5 @@ mod bootstrap;
 pub use bootstrap::*;
 mod local;
 pub use local::LocalImportAttempt;
+
+pub(crate) use sequences::{record_capture_evidence, record_sequence_evidence};

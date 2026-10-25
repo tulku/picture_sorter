@@ -72,28 +72,51 @@ impl ImportCoordinator {
         }
         Ok(())
     }
-    fn next_upload(&self, job: JobId) -> AppResult<Option<ImportItem>> {
-        let row:Option<UploadItemRow>=self.catalog.db.query_row("SELECT id,source_root,source_path,digest,size,role,group_id,destination,local_ready,archived FROM import_items WHERE parent=? AND archived=0 AND state<>'conflict' AND (group_id IS NOT NULL OR EXISTS(SELECT 1 FROM import_scans WHERE job=parent AND complete=1)) ORDER BY group_id IS NULL,rowid LIMIT 1",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))).optional()?;
-        row.map(
-            |(id, root, path, digest, size, role, group, destination, local_ready, _archived)| {
-                Ok(ImportItem {
-                    id: serde_json::from_str(&format!("\"{id}\""))?,
-                    source: SourceLocation {
-                        root: root.into(),
-                        path: ArchivePath::parse(&path)?,
-                    },
-                    digest: Digest::parse(&digest)?,
-                    size,
-                    role: serde_json::from_str(&role)?,
-                    group: group
-                        .map(|g| serde_json::from_str(&format!("\"{g}\"")))
-                        .transpose()?,
-                    destination: ArchivePath::parse(&destination)?,
-                    local_ready,
-                })
-            },
-        )
-        .transpose()
+    fn next_upload(&mut self, job: JobId) -> AppResult<Option<ImportItem>> {
+        for _ in 0..128 {
+            let row:Option<UploadItemRow>=self.catalog.db.query_row("SELECT id,source_root,source_path,digest,size,role,group_id,destination,local_ready,archived FROM import_items WHERE parent=? AND archived=0 AND state<>'conflict' AND (group_id IS NOT NULL OR EXISTS(SELECT 1 FROM import_scans WHERE job=parent AND complete=1)) ORDER BY group_id IS NULL,rowid LIMIT 1",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))).optional()?;
+            let Some((id, root, path, digest, size, role, group, destination, local_ready, _)) =
+                row
+            else {
+                return Ok(None);
+            };
+            let item = ImportItem {
+                id: serde_json::from_value(id.into())?,
+                source: SourceLocation {
+                    root: root.into(),
+                    path: ArchivePath::parse(&path)?,
+                },
+                digest: Digest::parse(&digest)?,
+                size,
+                role: serde_json::from_str(&role)?,
+                group: group
+                    .map(|g| serde_json::from_value(g.into()))
+                    .transpose()?,
+                destination: ArchivePath::parse(&destination)?,
+                local_ready,
+            };
+            if matches!(item.role, SourceRole::Companion(_)) {
+                let owner = source_owner(self, &item, job)?;
+                let target = owner
+                    .as_ref()
+                    .map(|(_, path, _)| path)
+                    .unwrap_or(&item.destination);
+                let archived:bool=self.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM sidecars s JOIN heads h ON h.sidecar=s.id JOIN versions v ON v.id=h.version JOIN archived_versions a ON a.version=v.id WHERE s.path=? AND json_extract(v.body,'$.Content.digest')=? AND json_extract(v.body,'$.Content.size')=?)",params![target.as_str(),item.digest.as_str(),item.size],|r|r.get(0))?;
+                if archived {
+                    self.catalog.db.execute(
+                        "UPDATE import_items SET archived=1,state='archived' WHERE id=?",
+                        [item.id.to_string()],
+                    )?;
+                    self.catalog.db.execute(
+                        "UPDATE import_stats SET recognized=recognized+1 WHERE job=?",
+                        [job.to_string()],
+                    )?;
+                    continue;
+                }
+            }
+            return Ok(Some(item));
+        }
+        Ok(None)
     }
 }
 impl UploadDriver {
@@ -491,7 +514,7 @@ fn prepare_plan(engine: &mut ImportCoordinator, active: &Active) -> AppResult<Pu
             },
         ]
     } else {
-        let owner = source_owner(engine, &active.item)?;
+        let owner = source_owner(engine, &active.item, active.job)?;
         let (group, sidecar_path, owner_name) = owner.unwrap_or((
             None,
             active.item.destination.clone(),
@@ -565,6 +588,7 @@ fn prepare_plan(engine: &mut ImportCoordinator, active: &Active) -> AppResult<Pu
         }
         records
     };
+    records.extend(engine.catalog.sequence_records_for(&active.item.digest)?);
     if let Some(result) = engine.catalog.metadata(&active.item.digest)? {
         records.push(ArchiveRecord::MetadataCached { result });
     }
@@ -618,12 +642,17 @@ fn prepare_plan(engine: &mut ImportCoordinator, active: &Active) -> AppResult<Pu
 fn source_owner(
     engine: &ImportCoordinator,
     item: &ImportItem,
+    parent: JobId,
 ) -> AppResult<Option<(Option<GroupId>, ArchivePath, String)>> {
     use crate::edit::{OwnerDecision, SidecarKind, resolve_owner};
-    let mut query=engine.catalog.db.prepare("SELECT source_path,destination,digest,size,role,group_id FROM import_items WHERE source_root=? AND group_id IS NOT NULL AND archived=1 AND substr(?,1,length(source_path))=source_path ORDER BY length(source_path) DESC LIMIT 128")?;
+    let mut query=engine.catalog.db.prepare("SELECT source_path,destination,digest,size,role,group_id FROM import_items WHERE parent=? AND source_root=? AND group_id IS NOT NULL AND archived=1 AND substr(?,1,length(source_path))=source_path ORDER BY length(source_path) DESC LIMIT 128")?;
     let rows = query
         .query_map(
-            params![item.source.root.to_str(), item.source.path.as_str()],
+            params![
+                parent.to_string(),
+                item.source.root.to_str(),
+                item.source.path.as_str()
+            ],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,

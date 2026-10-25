@@ -23,6 +23,14 @@ pub struct MetadataResult {
     pub error: Option<String>,
 }
 impl MetadataResult {
+    pub(crate) fn bounded(&self) -> AppResult<Self> {
+        if serde_json::to_vec(self)?.len() <= 8192 {
+            return Ok(self.clone());
+        }
+        let mut bounded = Self::from_json(self.digest.clone(), serde_json::Value::Null);
+        bounded.error=Some("EXIF result exceeded the normalized 8 KiB bound; original retained and date fallback required".into());
+        Ok(bounded)
+    }
     pub fn from_json(digest: Digest, raw: serde_json::Value) -> Self {
         let capture = raw
             .get("DateTimeOriginal")
@@ -141,7 +149,8 @@ impl Catalog {
         Ok(())
     }
     pub fn cache_metadata(&mut self, result: &MetadataResult) -> AppResult<()> {
-        self.db.execute("INSERT INTO metadata_cache(digest,metadata,extractor) VALUES(?,?,?) ON CONFLICT(digest,extractor) DO UPDATE SET metadata=excluded.metadata",params![result.digest.as_str(),serde_json::to_string(result)?,result.extractor])?;
+        let result = result.bounded()?;
+        self.db.execute("INSERT INTO metadata_cache(digest,metadata,extractor) VALUES(?,?,?) ON CONFLICT(digest,extractor) DO UPDATE SET metadata=excluded.metadata",params![result.digest.as_str(),serde_json::to_string(&result)?,result.extractor])?;
         Ok(())
     }
     pub fn metadata(&self, digest: &Digest) -> AppResult<Option<MetadataResult>> {

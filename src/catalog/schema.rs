@@ -33,6 +33,9 @@ CREATE TABLE observations(path TEXT PRIMARY KEY,digest TEXT,size INTEGER,absent_
 PRAGMA user_version=1;
 "#;
 pub const IMPORT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS capture_facts(digest TEXT NOT NULL,path TEXT NOT NULL,context TEXT NOT NULL,camera TEXT NOT NULL,second INTEGER,payload TEXT NOT NULL,PRIMARY KEY(digest,path));
+CREATE INDEX IF NOT EXISTS capture_neighborhood ON capture_facts(context,camera,second);
+CREATE TABLE IF NOT EXISTS sequence_members(digest TEXT NOT NULL,kind TEXT NOT NULL,anchor TEXT NOT NULL,PRIMARY KEY(digest,kind,anchor));
 CREATE TABLE IF NOT EXISTS import_scans(job TEXT PRIMARY KEY REFERENCES jobs(id),complete INTEGER NOT NULL DEFAULT 0,skipped INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS import_items(id TEXT PRIMARY KEY,parent TEXT NOT NULL REFERENCES jobs(id),source_root TEXT NOT NULL,source_path TEXT NOT NULL,digest TEXT NOT NULL,size INTEGER NOT NULL,role TEXT NOT NULL,group_id TEXT,destination TEXT NOT NULL,state TEXT NOT NULL,local_ready INTEGER NOT NULL DEFAULT 0,archived INTEGER NOT NULL DEFAULT 0,warning INTEGER NOT NULL DEFAULT 0,UNIQUE(parent,source_path,digest));
 CREATE TABLE IF NOT EXISTS upload_plans(item TEXT PRIMARY KEY,plan TEXT NOT NULL);
@@ -41,6 +44,8 @@ CREATE TABLE IF NOT EXISTS import_stats(job TEXT PRIMARY KEY REFERENCES jobs(id)
 CREATE TABLE IF NOT EXISTS group_facts(context TEXT NOT NULL,stem TEXT NOT NULL,camera TEXT NOT NULL,capture TEXT NOT NULL,group_id TEXT NOT NULL REFERENCES groups(id),PRIMARY KEY(context,stem,camera,capture));
 "#;
 pub const EDIT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS derived_heads(version TEXT PRIMARY KEY,sidecar TEXT NOT NULL,expected TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS metadata_merge_attempts(sidecar TEXT NOT NULL,signature TEXT NOT NULL,reason TEXT NOT NULL,PRIMARY KEY(sidecar,signature));
 CREATE TABLE IF NOT EXISTS pin_sync_epochs(job TEXT PRIMARY KEY,required INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS pin_attempts(job TEXT PRIMARY KEY,spec TEXT NOT NULL,reservation TEXT NOT NULL,target TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pin_checks(job TEXT NOT NULL,path TEXT NOT NULL,digest TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(job,path,digest));
