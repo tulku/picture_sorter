@@ -5,8 +5,8 @@ Date: 2026-10-25.
 Repository: picture_sorter, origin git@github.com:tulku/picture_sorter.git.
 Implementation baseline inspected: de1cffa6a785a594c7aebf5de2e2e8716c30a448.
 Planning branch: meta/superpowers-plans (orphan; never merge into implementation branches).
-Planning worktree: /home/tulku/Sentrisense/repos/picture_sorter/superpowers-plans.
-Specification path: /home/tulku/Sentrisense/repos/picture_sorter/superpowers-plans/specs/2026-10-25-offline-photo-archive-design.md.
+Planning worktree: /home/tulku/Repos/picture_sorter/superpowers-plans.
+Specification path: /home/tulku/Repos/picture_sorter/superpowers-plans/specs/2026-10-25-offline-photo-archive-design.md.
 
 ## 1. Purpose and user workflow
 

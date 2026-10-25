@@ -1,11 +1,11 @@
 # Final independent whole-branch review package
 
-Implementation: /home/tulku/Sentrisense/repos/picture_sorter/offline-photo-archive
+Implementation: /home/tulku/Repos/picture_sorter/offline-photo-archive
 Branch: feat/offline-photo-archive
 Base: de1cffa6a785a594c7aebf5de2e2e8716c30a448
 Head: 134a14b7f581f396667d98bd41833492e6938860
 
-Read the spec at /home/tulku/Sentrisense/repos/picture_sorter/superpowers-plans/specs/2026-10-25-offline-photo-archive-design.md (especially sections 19,21,25), approved review record at /home/tulku/Sentrisense/repos/picture_sorter/superpowers-plans/specs/2026-10-25-offline-photo-archive-review.md and plan at /home/tulku/Sentrisense/repos/picture_sorter/superpowers-plans/plans/2026-10-25-offline-photo-archive-implementation.md. All 23 tasks are implemented; T23 final review gate remains. Consult all Ruling: lines in /home/tulku/Sentrisense/repos/picture_sorter/superpowers-plans/plans/2026-10-25-offline-photo-archive-execution.md; judge decisions independently. Read actual code/diff and tests; this package is not proof of correctness.
+Read the spec at /home/tulku/Repos/picture_sorter/superpowers-plans/specs/2026-10-25-offline-photo-archive-design.md (especially sections 19,21,25), approved review record at /home/tulku/Repos/picture_sorter/superpowers-plans/specs/2026-10-25-offline-photo-archive-review.md and plan at /home/tulku/Repos/picture_sorter/superpowers-plans/plans/2026-10-25-offline-photo-archive-implementation.md. All 23 tasks are implemented; T23 final review gate remains. Consult all Ruling: lines in /home/tulku/Repos/picture_sorter/superpowers-plans/plans/2026-10-25-offline-photo-archive-execution.md; judge decisions independently. Read actual code/diff and tests; this package is not proof of correctness.
 
 ## Review focus
 
