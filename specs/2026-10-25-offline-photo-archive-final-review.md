@@ -1,0 +1,18 @@
+# Independent whole-branch review
+
+Reviewer: fresh gpt-6-astra, high, read-only, no subagents. Range de1cffa6..134a14b. Verdict: not ready; one Critical and eleven Important findings, no Minors, Declined to judge: []. Full report delivered through final_independent_review agent; source passes covered all implementation subsystems and generated fixture probes.
+
+- C1 Critical: lexical root checks and independent root identities do not reject physical aliases/overlap; bind aliases can let eviction unlink archive originals. config.rs:105, transfer/worker.rs:359, storage/eviction.rs:229. Add actual held-root physical overlap rejection and isolated alias regression.
+- I1 Important: unexpected/unreadable journal enumeration does not persist a blocker, so clean can evict despite unknown shared state. service/archive_reader.rs:287 plus publishers. Real repro /tmp/photo-review-journal.log.
+- I2 Important: default local verify audits nonresident archived originals and permanently blocks ordinary publication after normal clean. service/server.rs:1599, catalog/verify.rs:38. Real repro /tmp/photo-review-verify.log. Audit expected resident placements and support corrected findings.
+- I3 Important: archive verify misses current projections, local verify omits immutable saved history/live projection scopes. service/archive_reader.rs:553 and server.rs:1600. Real repro /tmp/photo-review-projection.log. Include Content/Reset semantics and distinguish pending local application.
+- I4 Important: existing-destination admission reserves zero but actual local worker always stages another copy. import/local.rs:137, transfer/worker.rs:1155. Real repeat-offline repro /tmp/photo-review-repeat.log. Strongly reuse existing bytes and never allocate unreserved duplicates.
+- I5 Important: verification hashes and fresh occupancy scans run synchronously on the coordinator. server.rs:1599, observation.rs:235, import/local.rs:105. Move bounded bulk work to workers while retaining fresh admission proofs/reservations; verify actual responsiveness.
+- I6 Important: stage_only is discarded from durable Refresh kind and never reaches staging. server.rs:591/1489. Fetch remote immutable metadata without live application or editor assertion, supporting no-wait.
+- I7 Important: disconnects during synchronous refresh do not revoke later per-file permission until outer event loop returns. server.rs:398, edit/refresh.rs:124. Gate each bounded application on actual peer liveness; only already-started application may finish.
+- I8 Important: empty-group refresh takes only first128 groups and filters residency afterward; later resident groups never considered. server.rs:601. Persist bounded continuation and cover >128 groups.
+- I9 Important: ChooseHead plans projections only for rapidraw-base and preserved-source-companion; other supported owned sidecar choices can never publish/apply canonical result. catalog/conflicts.rs:183/547. Share eligibility policy and test virtual data, exif cache and RAW XMP.
+- I10 Important: one permanently blocked oldest prepared/sent rating intent starves all other groups. server.rs:1184, immich/ratings.rs:229. Fair scheduling with per-group uncertainty/order preservation.
+- I11 Important: unconditional25-second foreground cutoff returns before requested milestone and drops refresh permission despite healthy long progress. server.rs:416, service/client.rs:28. Continue healthy waits, retain explicit unavailable/disconnect semantics, test >25-second progress.
+
+Repro helpers: /tmp/photo-review-probes.py and /tmp/photo-review-extra-probes.py; generated roots /tmp/photo-final-review-*. No personal roots/apps/credentials used. Reviewer did not rerun full suite or deployed qualification.
