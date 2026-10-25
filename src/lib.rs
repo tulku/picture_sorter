@@ -8,3 +8,4 @@ pub mod fs;
 pub mod import;
 pub mod plan;
 pub mod sidecar;
+pub mod storage;
