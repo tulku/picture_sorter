@@ -44,6 +44,9 @@ pub fn serve(
 }
 #[derive(Clone)]
 pub struct RatingServerState {
+    pub restore_favorite_on_put: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub asset_fields: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
+    pub after_put_fields: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
     pub checksum: std::sync::Arc<std::sync::Mutex<String>>,
     pub favorite: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
     pub favorite_writes: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
@@ -72,6 +75,9 @@ impl RatingServer {
             url::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
         let asset = uuid::Uuid::new_v4();
         let state = RatingServerState {
+            restore_favorite_on_put: Arc::new(AtomicBool::new(false)),
+            asset_fields: Arc::new(Mutex::new(serde_json::json!({}))),
+            after_put_fields: Arc::new(Mutex::new(serde_json::json!({}))),
             checksum: Arc::new(Mutex::new("AAAAAAAAAAAAAAAAAAAAAAAAAAA=".into())),
             rating: Arc::new(Mutex::new(None)),
             favorite: Arc::new(Mutex::new(Some(false))),
@@ -140,12 +146,26 @@ impl RatingServer {
                             let favorite = favorite.as_bool().unwrap();
                             *worker_state.favorite.lock().unwrap() = Some(favorite);
                             worker_state.favorite_writes.lock().unwrap().push(favorite);
+                            if worker_state
+                                .restore_favorite_on_put
+                                .swap(false, Ordering::SeqCst)
+                            {
+                                *worker_state.favorite.lock().unwrap() = Some(true);
+                            }
                         } else {
                             assert!(value.get("rating").is_some());
                             let rating = value["rating"].as_i64().map(|n| n as i8);
                             *worker_state.rating.lock().unwrap() = rating;
                             worker_state.writes.lock().unwrap().push(rating);
                         }
+                        let after = worker_state.after_put_fields.lock().unwrap().clone();
+                        worker_state
+                            .asset_fields
+                            .lock()
+                            .unwrap()
+                            .as_object_mut()
+                            .unwrap()
+                            .extend(after.as_object().unwrap().clone());
                         if worker_state.drop_put.swap(false, Ordering::SeqCst) {
                             continue;
                         }
@@ -158,6 +178,15 @@ impl RatingServer {
                         serde_json::json!(*worker_state.checksum.lock().unwrap());
                     asset_value["exifInfo"]["rating"] =
                         serde_json::json!(*worker_state.rating.lock().unwrap());
+                    asset_value.as_object_mut().unwrap().extend(
+                        worker_state
+                            .asset_fields
+                            .lock()
+                            .unwrap()
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    );
                     if let Some(favorite) = *worker_state.favorite.lock().unwrap() {
                         asset_value["isFavorite"] = serde_json::json!(favorite);
                     } else {

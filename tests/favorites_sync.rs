@@ -2,6 +2,7 @@ mod support;
 use photo_sorter::{catalog::*, domain::*, edit::*, fs::*, immich::*, qualification::*};
 use std::os::unix::fs::PermissionsExt;
 struct Fixture {
+    semantic_archive: ArchiveId,
     r: support::TestRig,
     server: support::http::RatingServer,
     c: Catalog,
@@ -63,6 +64,7 @@ impl Fixture {
         )
         .unwrap();
         Self {
+            semantic_archive: ArchiveId::new(),
             r,
             server,
             c,
@@ -344,6 +346,7 @@ fn start_service(
     std::fs::create_dir_all(f.r.local.join("RAW")).unwrap();
     std::fs::write(f.r.local.join("RAW/a.ORF.rrdata"), bytes).unwrap();
     let Fixture {
+        semantic_archive: _,
         r,
         server,
         c,
@@ -687,4 +690,545 @@ fn added_jpeg_authority_ambiguity_blocks_an_existing_favorite_intent() {
     f.c.bind_asset(&f.server.origin, &second, f.group).unwrap();
     assert!(f.advance().waiting);
     assert_eq!(*f.server.state.favorite.lock().unwrap(), Some(false));
+}
+#[test]
+fn canceled_unsent_pick_never_becomes_incoming_metadata_in_either_poll_order() {
+    for poll_first in [false, true] {
+        let mut f = Fixture::new();
+        f.save(serde_json::Value::Null);
+        f.poll();
+        f.save(serde_json::json!("pick"));
+        f.poll();
+        let (_, old) = f.c.next_favorite_intent(0).unwrap().unwrap();
+        f.save(serde_json::Value::Null);
+        if poll_first {
+            f.poll();
+        }
+        assert!(
+            !FavoriteSynchronizer {
+                catalog: &mut f.c,
+                client: &f.client
+            }
+            .advance(old)
+            .unwrap()
+            .confirmed
+        );
+        assert_eq!(f.poll().conflicts, 0);
+        f.poll();
+        assert!(f.c.next_favorite_intent(0).unwrap().is_none());
+        assert!(f.c.favorite_pending_version(f.group).unwrap().is_none());
+        assert_eq!(*f.server.state.favorite.lock().unwrap(), Some(false));
+    }
+}
+#[test]
+fn newer_save_retaining_pick_replaces_the_unsent_source_in_either_poll_order() {
+    for poll_first in [false, true] {
+        let mut f = Fixture::new();
+        f.save(serde_json::Value::Null);
+        f.poll();
+        f.save(serde_json::json!("pick"));
+        f.poll();
+        let (_, old) = f.c.next_favorite_intent(0).unwrap().unwrap();
+        let root = RootHandle::open(&f.r.state, RootPolicy::Local).unwrap();
+        let parent = f.c.local_head(f.sidecar).unwrap().unwrap();
+        VersionStore::new(&mut f.c,&root).record(SnapshotIntent{sidecar:f.sidecar,parents:vec![parent],operation:OperationId::new(),origin:VersionOrigin::Observed,payload:SnapshotPayload::Content(br#"{"version":1,"rating":5,"flag":"pick","adjustments":{"masks":[1,2],"exposure":2},"future":42}"#.to_vec())}).unwrap();
+        if poll_first {
+            f.poll();
+        }
+        assert!(
+            !FavoriteSynchronizer {
+                catalog: &mut f.c,
+                client: &f.client
+            }
+            .advance(old)
+            .unwrap()
+            .confirmed
+        );
+        assert_eq!(f.poll().conflicts, 0);
+        assert!(f.advance().confirmed);
+        assert_eq!(*f.server.state.favorite.lock().unwrap(), Some(true));
+        assert!(f.server.state.writes.lock().unwrap().is_empty());
+    }
+}
+#[test]
+fn clearing_pick_while_its_sent_outcome_is_uncertain_keeps_receipt_and_publishes_clear() {
+    let mut f = Fixture::new();
+    f.save(serde_json::Value::Null);
+    f.poll();
+    f.save(serde_json::json!("pick"));
+    f.poll();
+    f.server
+        .state
+        .drop_put
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(f.advance().waiting);
+    f.save(serde_json::Value::Null);
+    assert_eq!(f.poll().conflicts, 0);
+    let root = RootHandle::open(&f.r.state, RootPolicy::Local).unwrap();
+    drop(f.c);
+    f.c = Catalog::open(&root).unwrap();
+    assert!(f.advance().confirmed);
+    assert_eq!(f.poll().conflicts, 0);
+    assert!(f.advance().confirmed);
+    assert_eq!(*f.server.state.favorite.lock().unwrap(), Some(false));
+}
+#[test]
+fn reject_readback_races_reconcile_again_without_favorite_conflict() {
+    for uncertain_restart in [false, true] {
+        let mut f = Fixture::new();
+        f.save(serde_json::json!("reject"));
+        *f.server.state.favorite.lock().unwrap() = Some(true);
+        f.poll();
+        let (_, original) = f.c.next_favorite_intent(0).unwrap().unwrap();
+        f.server
+            .state
+            .restore_favorite_on_put
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        f.server
+            .state
+            .drop_put
+            .store(uncertain_restart, std::sync::atomic::Ordering::SeqCst);
+        let report = f.advance();
+        assert!(!report.conflict);
+        if uncertain_restart {
+            let root = RootHandle::open(&f.r.state, RootPolicy::Local).unwrap();
+            drop(f.c);
+            f.c = Catalog::open(&root).unwrap();
+            assert!(!f.advance().conflict);
+        }
+        assert_eq!(f.poll().conflicts, 0);
+        assert!(f.advance().confirmed);
+        assert_eq!(*f.server.state.favorite.lock().unwrap(), Some(false));
+        assert!(
+            f.c.conflicts(false)
+                .unwrap()
+                .iter()
+                .all(|c| c.kind != "favorite")
+        );
+        let db = rusqlite::Connection::open(f.r.state.join("catalog.sqlite")).unwrap();
+        let retained: u64 = db
+            .query_row(
+                "SELECT count(*) FROM favorite_intents WHERE id=?",
+                [original.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, 1);
+    }
+}
+#[test]
+fn reject_cannot_reconcile_past_a_changed_jpeg_identity_after_put() {
+    let mut f = Fixture::new();
+    f.save(serde_json::json!("reject"));
+    *f.server.state.favorite.lock().unwrap() = Some(true);
+    f.poll();
+    f.server
+        .state
+        .restore_favorite_on_put
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    *f.server.state.after_put_fields.lock().unwrap() =
+        serde_json::json!({"originalPath":"/external/moved.JPG"});
+    assert!(f.advance().conflict);
+    let count = f.server.state.favorite_writes.lock().unwrap().len();
+    f.poll();
+    assert!(f.c.next_favorite_intent(0).unwrap().is_none());
+    assert_eq!(f.server.state.favorite_writes.lock().unwrap().len(), count);
+    assert!(
+        f.c.conflicts(false)
+            .unwrap()
+            .iter()
+            .any(|c| c.kind == "mapping_identity")
+    );
+    assert!(
+        f.c.conflicts(false)
+            .unwrap()
+            .iter()
+            .all(|c| c.kind != "favorite")
+    );
+}
+
+fn resolve_choice(
+    f: &mut Fixture,
+    kind: &str,
+    details: serde_json::Value,
+    resolution: ConflictResolution,
+) {
+    use photo_sorter::archive::*;
+    let id = f.c.record_rating_conflict(f.group, kind, details).unwrap();
+    let request = ResolutionRequest {
+        operation: OperationId::new(),
+        conflict: id,
+        expected_revision: f.c.conflict(id).unwrap().revision,
+        expected_heads: vec![],
+        expected_memberships: vec![(f.group, f.c.group(f.group).unwrap().membership_revision)],
+        resolution,
+    };
+    let records = f.c.resolution_records(&request).unwrap();
+    f.c.apply_commit(
+        &CommitEnvelope::new(f.semantic_archive, WriterId::new(), 1, vec![], records).unwrap(),
+    )
+    .unwrap();
+}
+fn switch_jpeg(f: &mut Fixture) -> uuid::Uuid {
+    let mut second = f.client.asset(f.server.asset).unwrap();
+    second.id = uuid::Uuid::new_v4();
+    let id = second.id;
+    f.c.bind_asset(&f.server.origin, &second, f.group).unwrap();
+    let origin = f.server.origin.origin().ascii_serialization();
+    resolve_choice(
+        f,
+        "rating_authority",
+        serde_json::json!({"server":origin}),
+        ConflictResolution::SelectRatingAuthority { asset: id },
+    );
+    *f.server.state.asset_fields.lock().unwrap() = serde_json::json!({"id":id});
+    id
+}
+#[test]
+fn explicit_jpeg_authority_retires_old_baseline_and_prepared_work() {
+    for prepared in [false, true] {
+        let mut f = Fixture::new();
+        f.save(serde_json::Value::Null);
+        f.poll();
+        if prepared {
+            f.save(serde_json::json!("pick"));
+            f.poll();
+            f.save(serde_json::Value::Null);
+        }
+        let id = switch_jpeg(&mut f);
+        assert_eq!(f.poll().conflicts, 0);
+        assert_eq!(f.poll().conflicts, 0);
+        assert!(f.c.next_favorite_intent(0).unwrap().is_none());
+        let db = rusqlite::Connection::open(f.r.state.join("catalog.sqlite")).unwrap();
+        let body: String = db
+            .query_row(
+                "SELECT body FROM favorite_baselines WHERE group_id=?",
+                [f.group.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["asset"],
+            id.to_string()
+        );
+    }
+}
+#[test]
+fn selected_jpeg_cancels_old_pending_pick_with_a_preserving_metadata_version() {
+    let mut f = Fixture::new();
+    f.save(serde_json::Value::Null);
+    f.poll();
+    *f.server.state.favorite.lock().unwrap() = Some(true);
+    f.poll();
+    let old = f.c.favorite_pending_version(f.group).unwrap().unwrap();
+    *f.server.state.favorite.lock().unwrap() = Some(false);
+    switch_jpeg(&mut f);
+    assert_eq!(f.poll().conflicts, 0);
+    let new = f.c.favorite_pending_version(f.group).unwrap().unwrap();
+    assert_ne!(old, new);
+    assert!(f.c.is_ancestor(old, new).unwrap());
+    assert!(f.pending()["flag"].is_null());
+    assert_eq!(
+        f.pending()["adjustments"]["masks"],
+        serde_json::json!([1, 2])
+    );
+}
+#[test]
+fn selected_jpeg_baseline_can_advance_while_retaining_old_asset_uncertainty() {
+    let mut f = Fixture::new();
+    f.save(serde_json::Value::Null);
+    f.poll();
+    f.save(serde_json::json!("pick"));
+    f.poll();
+    let (_, old) = f.c.next_favorite_intent(0).unwrap().unwrap();
+    f.server
+        .state
+        .drop_put
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(f.advance().waiting);
+    f.save(serde_json::Value::Null);
+    *f.server.state.favorite.lock().unwrap() = Some(false);
+    let selected = switch_jpeg(&mut f);
+    assert_eq!(f.poll().conflicts, 0);
+    let db = rusqlite::Connection::open(f.r.state.join("catalog.sqlite")).unwrap();
+    let state: String = db
+        .query_row(
+            "SELECT state FROM favorite_intents WHERE id=?",
+            [old.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "sent");
+    let key = f.r.state.join("key");
+    let report = qualify_immich(ImmichProbeRequest {
+        origin: f.server.origin.clone(),
+        key_file: key.clone(),
+        asset: selected,
+        isolated_asset_confirmed: true,
+        fixture: true,
+        favorites: true,
+    })
+    .unwrap();
+    f.client = ImmichClient::new(f.server.origin.clone(), &key)
+        .unwrap()
+        .with_rating_policy(
+            RatingWriteMode::BestEffort,
+            CapabilityRegistry::new(vec![report]),
+        );
+    f.save(serde_json::json!("pick"));
+    f.poll();
+    let id:String=db.query_row("SELECT id FROM favorite_intents WHERE state='prepared' AND json_extract(body,'$.asset')=?",[selected.to_string()],|r|r.get(0)).unwrap();
+    let id = serde_json::from_value(id.into()).unwrap();
+    assert!(
+        FavoriteSynchronizer {
+            catalog: &mut f.c,
+            client: &f.client
+        }
+        .advance(id)
+        .unwrap()
+        .confirmed
+    );
+    let state: String = db
+        .query_row(
+            "SELECT state FROM favorite_intents WHERE id=?",
+            [old.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "sent");
+}
+fn primary_b(f: &mut Fixture, flag: serde_json::Value, associate: bool) -> SidecarId {
+    let group = if associate {
+        f.c.create_group(false).unwrap()
+    } else {
+        f.group
+    };
+    f.c.attach_member(
+        group,
+        OriginalMember {
+            path: ArchivePath::parse("RAW/b.ORF").unwrap(),
+            digest: Digest::of(b"fixture"),
+            size: 7,
+            role: MediaRole::Raw,
+        },
+        PairEvidence::UserSelected {
+            reason: "fixture alternate raw".into(),
+        },
+    )
+    .unwrap();
+    let sidecar = SidecarId::new();
+    f.c.register_sidecar(
+        sidecar,
+        Some(group),
+        ArchivePath::parse("RAW/b.ORF.rrdata").unwrap(),
+        "rapidraw-base",
+    )
+    .unwrap();
+    let root = RootHandle::open(&f.r.state, RootPolicy::Local).unwrap();
+    VersionStore::new(&mut f.c,&root).record(SnapshotIntent{sidecar,parents:vec![],operation:OperationId::new(),origin:VersionOrigin::Observed,payload:SnapshotPayload::Content(serde_json::to_vec(&serde_json::json!({"version":1,"rating":3,"flag":flag,"adjustments":{"masks":[7]},"future":99})).unwrap())}).unwrap();
+    if associate {
+        f.group =
+            f.c.merge_groups(
+                &[f.group, group],
+                PairEvidence::UserSelected {
+                    reason: "fixture raw association".into(),
+                },
+            )
+            .unwrap();
+        let ids =
+            f.c.conflicts(false)
+                .unwrap()
+                .into_iter()
+                .filter(|c| c.kind == "primary_raw")
+                .map(|c| c.id)
+                .collect::<Vec<_>>();
+        for id in ids {
+            let request = ResolutionRequest {
+                operation: OperationId::new(),
+                conflict: id,
+                expected_revision: f.c.conflict(id).unwrap().revision,
+                expected_heads: vec![],
+                expected_memberships: vec![(
+                    f.group,
+                    f.c.group(f.group).unwrap().membership_revision,
+                )],
+                resolution: ConflictResolution::SelectPrimaryRaw {
+                    member: ArchivePath::parse("RAW/b.ORF").unwrap(),
+                },
+            };
+            let records = f.c.resolution_records(&request).unwrap();
+            f.c.apply_commit(
+                &photo_sorter::archive::CommitEnvelope::new(
+                    f.semantic_archive,
+                    WriterId::new(),
+                    1,
+                    vec![],
+                    records,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+    }
+    resolve_choice(
+        f,
+        "primary_raw",
+        serde_json::json!({"reason":"fixture primary choice"}),
+        ConflictResolution::SelectPrimaryRaw {
+            member: ArchivePath::parse("RAW/b.ORF").unwrap(),
+        },
+    );
+    f.sidecar = sidecar;
+    sidecar
+}
+#[test]
+fn primary_raw_choice_supersedes_old_queued_pick_and_uses_new_raw_flag() {
+    for associate in [false, true] {
+        for reject in [false, true] {
+            let mut f = Fixture::new();
+            f.save(serde_json::Value::Null);
+            f.poll();
+            f.save(serde_json::json!("pick"));
+            f.poll();
+            let (_, old) = f.c.next_favorite_intent(0).unwrap().unwrap();
+            primary_b(
+                &mut f,
+                if reject {
+                    serde_json::json!("reject")
+                } else {
+                    serde_json::Value::Null
+                },
+                associate,
+            );
+            assert!(
+                !FavoriteSynchronizer {
+                    catalog: &mut f.c,
+                    client: &f.client
+                }
+                .advance(old)
+                .unwrap()
+                .confirmed
+            );
+            assert_eq!(*f.server.state.favorite.lock().unwrap(), Some(false));
+            if reject {
+                *f.server.state.favorite.lock().unwrap() = Some(true);
+            }
+            assert_eq!(f.poll().conflicts, 0);
+            if reject {
+                assert!(f.advance().confirmed);
+            } else {
+                assert!(f.c.next_favorite_intent(0).unwrap().is_none());
+            }
+            assert_eq!(*f.server.state.favorite.lock().unwrap(), Some(false));
+        }
+    }
+}
+#[test]
+fn primary_raw_change_preserves_old_pending_history_without_cross_sidecar_derivation() {
+    let mut f = Fixture::new();
+    f.save(serde_json::Value::Null);
+    f.poll();
+    *f.server.state.favorite.lock().unwrap() = Some(true);
+    f.poll();
+    let old = f.c.favorite_pending_version(f.group).unwrap().unwrap();
+    primary_b(&mut f, serde_json::json!("reject"), false);
+    assert_eq!(f.poll().conflicts, 0);
+    assert!(f.advance().confirmed);
+    assert!(f.c.favorite_pending_version(f.group).unwrap().is_none());
+    assert!(f.c.version(old).is_ok());
+}
+#[test]
+fn primary_raw_change_waits_for_sent_pick_receipt_then_publishes_new_neutral() {
+    let mut f = Fixture::new();
+    f.save(serde_json::Value::Null);
+    f.poll();
+    f.save(serde_json::json!("pick"));
+    f.poll();
+    f.server
+        .state
+        .drop_put
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(f.advance().waiting);
+    primary_b(&mut f, serde_json::Value::Null, false);
+    assert_eq!(f.poll().conflicts, 0);
+    assert!(f.advance().confirmed);
+    assert_eq!(f.poll().conflicts, 0);
+    assert!(f.advance().confirmed);
+    assert_eq!(*f.server.state.favorite.lock().unwrap(), Some(false));
+}
+#[test]
+fn prepared_favorite_rechecks_live_path_library_and_type_in_the_http_worker() {
+    for changed in [
+        serde_json::json!({"originalPath":"/external/moved.JPG"}),
+        serde_json::json!({"libraryId":uuid::Uuid::new_v4()}),
+        serde_json::json!({"type":"VIDEO"}),
+    ] {
+        let mut f = Fixture::new();
+        f.save(serde_json::Value::Null);
+        f.poll();
+        f.save(serde_json::json!("pick"));
+        f.poll();
+        let count = f.server.state.favorite_writes.lock().unwrap().len();
+        *f.server.state.asset_fields.lock().unwrap() = changed;
+        let report = f.advance();
+        assert!(report.waiting || report.conflict);
+        assert_eq!(f.server.state.favorite_writes.lock().unwrap().len(), count);
+        assert_eq!(*f.server.state.favorite.lock().unwrap(), Some(false));
+        assert_eq!(f.poll().conflicts, 1);
+    }
+}
+#[test]
+fn retired_pending_metadata_is_referenced_by_baseline_history_for_gc() {
+    let mut f = Fixture::new();
+    f.save(serde_json::Value::Null);
+    f.poll();
+    *f.server.state.favorite.lock().unwrap() = Some(true);
+    f.poll();
+    let old = f.c.favorite_pending_version(f.group).unwrap().unwrap();
+    primary_b(&mut f, serde_json::json!("reject"), false);
+    f.poll();
+    let VersionBody::Content { digest, .. } = f.c.version(old).unwrap().body else {
+        panic!()
+    };
+    let db = rusqlite::Connection::open(f.r.state.join("catalog.sqlite")).unwrap();
+    db.execute(
+        "INSERT OR IGNORE INTO archived_versions(version) VALUES(?)",
+        [old.to_string()],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE snapshots SET archived=1 WHERE digest=?",
+        [digest.as_str()],
+    )
+    .unwrap();
+    let candidates = photo_sorter::storage::SnapshotGc::candidates(&mut f.c).unwrap();
+    assert!(!candidates.iter().any(|c| c.0 == digest.as_str()));
+    let retained: u64 = db
+        .query_row(
+            "SELECT count(*) FROM favorite_baseline_history WHERE pending_version=?",
+            [old.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, 1);
+}
+#[test]
+fn reject_with_unobserved_remote_does_not_invent_a_false_common_baseline() {
+    let mut f = Fixture::new();
+    f.save(serde_json::json!("reject"));
+    *f.server.state.favorite.lock().unwrap() = None;
+    f.poll();
+    let db = rusqlite::Connection::open(f.r.state.join("catalog.sqlite")).unwrap();
+    let body: String = db
+        .query_row(
+            "SELECT body FROM favorite_baselines WHERE group_id=?",
+            [f.group.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["common"].is_null());
+    f.save(serde_json::Value::Null);
+    *f.server.state.favorite.lock().unwrap() = Some(true);
+    assert_eq!(f.poll().conflicts, 1);
+    assert!(f.c.favorite_pending_version(f.group).unwrap().is_none());
 }

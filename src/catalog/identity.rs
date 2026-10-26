@@ -185,6 +185,7 @@ pub(crate) fn merge(
             "rating_observations",
             "rating_intents",
             "favorite_intents",
+            "favorite_baseline_history",
             "favorite_observations",
             "import_items",
             "group_facts",

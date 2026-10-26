@@ -160,6 +160,8 @@ fn qualify_favorites(request: ImmichProbeRequest) -> AppResult<CapabilityReport>
                 expected,
                 desired,
                 jpeg_checksum: initial.checksum.clone(),
+                external_path: initial.original_path.clone(),
+                library_id: initial.library_id,
             })?;
             if !matches!(outcome, FavoriteOutcome::Confirmed) {
                 results.push(ProbeResult {
@@ -185,6 +187,8 @@ fn qualify_favorites(request: ImmichProbeRequest) -> AppResult<CapabilityReport>
             expected,
             desired: original,
             jpeg_checksum: initial.checksum,
+            external_path: initial.original_path,
+            library_id: initial.library_id,
         })?;
         results.push(ProbeResult {name:"restore_original".into(),outcome:if matches!(restored,FavoriteOutcome::Confirmed) {ProbeOutcome::Pass}else {ProbeOutcome::Fail},detail:"Restoration uses the last confirmed probe value as its precondition; non-CAS race remains".into()});
         Ok(results)

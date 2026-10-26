@@ -385,12 +385,12 @@ impl ImmichClient {
     ) -> AppResult<super::FavoriteOutcome> {
         use super::FavoriteOutcome;
         let current = self.asset(request.asset)?;
+        if !request.matches_asset(&current) {
+            return Err(AppError::new(ErrorCode::Conflict, "JPEG identity changed"));
+        }
         let observed = current
             .is_favorite
             .ok_or_else(|| AppError::new(ErrorCode::Unsupported, "favorite is unobserved"))?;
-        if current.checksum != request.jpeg_checksum {
-            return Err(AppError::new(ErrorCode::Conflict, "JPEG identity changed"));
-        }
         if observed == request.desired {
             return Ok(FavoriteOutcome::Confirmed);
         }
@@ -425,6 +425,9 @@ impl ImmichClient {
             Ok(after) => after,
             Err(_) => return Ok(FavoriteOutcome::Uncertain),
         };
+        if !request.matches_asset(&after) {
+            return Ok(FavoriteOutcome::IdentityChanged);
+        }
         let Some(observed) = after.is_favorite else {
             return Ok(FavoriteOutcome::Uncertain);
         };

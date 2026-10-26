@@ -20,6 +20,8 @@ struct Baseline {
     common: Option<bool>,
     applied: Option<bool>,
     pending: Option<bool>,
+    #[serde(default)]
+    outbound: Option<OperationId>,
     source_version: Option<VersionId>,
     pending_version: Option<VersionId>,
 }
@@ -46,7 +48,7 @@ struct Local {
 }
 impl Catalog {
     pub fn next_favorite_intent(&self, after: i64) -> AppResult<Option<(i64, OperationId)>> {
-        let row: Option<(i64,String)> = self.db.query_row("SELECT r.rowid,r.id FROM favorite_intents r WHERE r.state IN('prepared','sent') AND NOT EXISTS(SELECT 1 FROM favorite_intents p WHERE p.group_id=r.group_id AND p.rowid<r.rowid AND p.state IN('prepared','sent')) ORDER BY r.rowid<=?,r.rowid LIMIT 1",[after],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let row: Option<(i64,String)> = self.db.query_row("SELECT r.rowid,r.id FROM favorite_intents r WHERE r.state IN('prepared','sent') AND NOT EXISTS(SELECT 1 FROM favorite_intents p WHERE p.group_id=r.group_id AND json_extract(p.body,'$.server')=json_extract(r.body,'$.server') AND json_extract(p.body,'$.asset')=json_extract(r.body,'$.asset') AND p.rowid<r.rowid AND p.state IN('prepared','sent')) ORDER BY r.rowid<=?,r.rowid LIMIT 1",[after],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         row.map(|(row, id)| Ok((row, serde_json::from_value(id.into())?)))
             .transpose()
     }
@@ -116,6 +118,138 @@ fn observation(value: Option<bool>) -> RatingObservation {
         .unwrap_or(RatingObservation::Unobserved)
 }
 impl FavoriteSynchronizer<'_> {
+    fn primary_is_current(&self, intent: &Intent) -> AppResult<bool> {
+        let group = self.catalog.group(intent.group)?;
+        let Some(primary) = super::ratings::primary_raw(&group) else {
+            return Ok(false);
+        };
+        if !group
+            .members
+            .iter()
+            .any(|m| m.role == MediaRole::Raw && m.path == primary)
+        {
+            return Ok(false);
+        }
+        let row: Option<(Option<String>, String, String)> = self
+            .catalog
+            .db
+            .query_row(
+                "SELECT group_id,path,owner FROM sidecars WHERE id=?",
+                [intent.sidecar.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((Some(group), path, owner)) = row else {
+            return Ok(false);
+        };
+        Ok(self
+            .catalog
+            .canonical_group(serde_json::from_value(group.into())?)?
+            == intent.group
+            && path == format!("{}.rrdata", primary.as_str())
+            && owner == "rapidraw-base")
+    }
+    fn retire_baseline(
+        &mut self,
+        group: GroupId,
+        previous: &Baseline,
+        next: &Baseline,
+    ) -> AppResult<()> {
+        let body = serde_json::to_string(previous)?;
+        let id = Digest::of(serde_json::to_vec(&(group, &body))?.as_slice());
+        let tx = self.catalog.db.transaction()?;
+        tx.execute("INSERT INTO favorite_baseline_history(id,group_id,body,source_version,pending_version) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING",params![id.as_str(),group.to_string(),body,previous.source_version.map(|v|v.to_string()),previous.pending_version.map(|v|v.to_string())])?;
+        tx.execute(
+            "UPDATE favorite_intents SET state='superseded' WHERE group_id=? AND state='prepared'",
+            [group.to_string()],
+        )?;
+        tx.execute("UPDATE favorite_baselines SET body=?,source_version=?,pending_version=? WHERE group_id=?",params![serde_json::to_string(next)?,next.source_version.map(|v|v.to_string()),next.pending_version.map(|v|v.to_string()),group.to_string()])?;
+        tx.commit()?;
+        Ok(())
+    }
+    fn supersede(&mut self, id: OperationId) -> AppResult<()> {
+        let (group, body): (String, String) = self.catalog.db.query_row(
+            "SELECT group_id,body FROM favorite_intents WHERE id=?",
+            [id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let intent: Intent = serde_json::from_str(&body)?;
+        let previous: Option<String> = self
+            .catalog
+            .db
+            .query_row(
+                "SELECT body FROM favorite_baselines WHERE group_id=?",
+                [&group],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let tx = self.catalog.db.transaction()?;
+        let changed = tx.execute(
+            "UPDATE favorite_intents SET state='superseded' WHERE id=? AND state='prepared'",
+            [id.to_string()],
+        )?;
+        if changed > 0
+            && let Some(previous) = previous
+        {
+            let mut baseline: Baseline = serde_json::from_str(&previous)?;
+            if baseline.outbound == Some(id)
+                || (baseline.outbound.is_none()
+                    && baseline.pending == Some(intent.desired)
+                    && baseline.source_version == Some(intent.source))
+            {
+                baseline.outbound = None;
+                baseline.pending = None;
+                tx.execute(
+                    "UPDATE favorite_baselines SET body=? WHERE group_id=?",
+                    params![serde_json::to_string(&baseline)?, group],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    fn reconcile_outbound(
+        &mut self,
+        group: GroupId,
+        baseline: &mut Baseline,
+        local: &Local,
+        remote: Option<bool>,
+    ) -> AppResult<bool> {
+        if baseline.outbound.is_none() && baseline.pending.is_some() {
+            let id:Option<String>=self.catalog.db.query_row("SELECT id FROM favorite_intents WHERE group_id=? AND json_extract(body,'$.server')=? AND json_extract(body,'$.asset')=? AND json_extract(body,'$.sidecar')=? AND state IN('prepared','sent') ORDER BY rowid DESC LIMIT 1",params![group.to_string(),baseline.server,baseline.asset.to_string(),local.sidecar.map(|v|v.to_string())],|r|r.get(0)).optional()?;
+            baseline.outbound = id.map(|id| serde_json::from_value(id.into())).transpose()?;
+        }
+        let Some(id) = baseline.outbound else {
+            return Ok(false);
+        };
+        let (body, state): (String, String) = self.catalog.db.query_row(
+            "SELECT body,state FROM favorite_intents WHERE id=?",
+            [id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let intent: Intent = serde_json::from_str(&body)?;
+        if state == "sent" {
+            return Ok(true);
+        }
+        if state == "prepared"
+            && local.version == Some(intent.source)
+            && local.sidecar == Some(intent.sidecar)
+            && remote != Some(intent.desired)
+        {
+            return Ok(!intent.reject);
+        }
+        if state == "prepared" {
+            self.supersede(id)?;
+        }
+        if state == "confirmed" {
+            baseline.common = Some(intent.desired);
+            baseline.applied = Some(intent.desired);
+        }
+        baseline.pending = None;
+        baseline.outbound = None;
+        Ok(false)
+    }
+
     pub fn poll(&mut self, scope: RatingScope) -> AppResult<RatingPollReport> {
         use crate::ratings::*;
         if scope.limit == 0 || scope.limit > 128 {
@@ -216,14 +350,53 @@ impl FavoriteSynchronizer<'_> {
                 .map(|s| serde_json::from_str(&s))
                 .transpose()?
                 .unwrap_or_default();
-            if !baseline.server.is_empty() && (baseline.server != server || baseline.asset != asset)
-            {
+            let jpeg_changed = !baseline.server.is_empty()
+                && (baseline.server != server || baseline.asset != asset);
+            if jpeg_changed && authority.as_ref() != Some(&(server.clone(), asset.to_string())) {
                 self.conflict(
                     group,
                     serde_json::json!({"reason":"favorite authority changed; baseline retained"}),
                 )?;
                 report.conflicts += 1;
                 continue;
+            }
+            let previous_sidecar = baseline
+                .source_version
+                .or(baseline.pending_version)
+                .map(|v| self.catalog.version(v).map(|v| v.sidecar))
+                .transpose()?;
+            let raw_changed = previous_sidecar.is_some() && previous_sidecar != local.sidecar;
+            if jpeg_changed || raw_changed {
+                let mut next = Baseline {
+                    server: server.clone(),
+                    asset,
+                    pending_version: if raw_changed {
+                        None
+                    } else {
+                        baseline.pending_version
+                    },
+                    ..Default::default()
+                };
+                if !jpeg_changed && let Some(id) = baseline.outbound {
+                    let sent: bool = self.catalog.db.query_row(
+                        "SELECT state='sent' FROM favorite_intents WHERE id=?",
+                        [id.to_string()],
+                        |r| r.get(0),
+                    )?;
+                    if sent {
+                        next.outbound = Some(id);
+                    }
+                }
+                if next.pending_version.is_some()
+                    && local.flag.and_then(PickFlag::favorite) == remote.is_favorite
+                    && remote.is_favorite.is_some()
+                {
+                    next.common = remote.is_favorite;
+                    next.applied = remote.is_favorite;
+                    next.pending = remote.is_favorite;
+                }
+                self.retire_baseline(group, &baseline, &next)?;
+                baseline = next;
             }
             let remote = remote.is_favorite;
             if local.flag == Some(PickFlag::Unsupported) {
@@ -232,6 +405,11 @@ impl FavoriteSynchronizer<'_> {
                     serde_json::json!({"reason":"unsupported native flag"}),
                 )?;
                 report.conflicts += 1;
+                continue;
+            }
+            if self.reconcile_outbound(group, &mut baseline, &local, remote)? {
+                report.pending += 1;
+                report.observed += 1;
                 continue;
             }
             let value = local.flag.and_then(PickFlag::favorite);
@@ -254,6 +432,11 @@ impl FavoriteSynchronizer<'_> {
                 } else {
                     RatingDecision::Converge(Rating::try_from(0)?)
                 }
+            } else if let (Some(value), Some(remote)) = (value, remote)
+                && value == remote
+                && baseline.pending.is_none()
+            {
+                RatingDecision::Converge(Rating::try_from(u8::from(value))?)
             } else {
                 reconcile_rating(&RatingInputs {
                     last_common: observation(baseline.common),
@@ -281,6 +464,7 @@ impl FavoriteSynchronizer<'_> {
                             reject,
                             expected,
                             u8::from(wanted) != 0,
+                            &mut baseline,
                         )?;
                         baseline.pending = Some(u8::from(wanted) != 0);
                         report.pending += 1;
@@ -322,7 +506,21 @@ impl FavoriteSynchronizer<'_> {
                     report.pending += 1;
                 }
                 RatingDecision::Converge(wanted) => {
-                    baseline.common = Some(u8::from(wanted) != 0);
+                    let wanted = u8::from(wanted) != 0;
+                    if !reject && let Some(version) = baseline.pending_version {
+                        let document = super::ratings::load_rating_document(
+                            &root,
+                            &self.catalog.version(version)?,
+                            &adapter,
+                        )?;
+                        if document.flag.favorite() != Some(wanted) {
+                            baseline.pending_version =
+                                self.derive(&root, &adapter, group, &local, &baseline, wanted)?;
+                        }
+                    }
+                    if remote.is_some() {
+                        baseline.common = Some(wanted);
+                    }
                     baseline.applied = value;
                     baseline.pending = None;
                 }
@@ -368,6 +566,7 @@ impl FavoriteSynchronizer<'_> {
         reject: bool,
         expected: bool,
         desired: bool,
+        baseline: &mut Baseline,
     ) -> AppResult<()> {
         let server = self.client.origin().origin().ascii_serialization();
         let (path,digest,checksum,external,library):(String,String,String,String,Option<String>)=self.catalog.db.query_row("SELECT path,digest,remote_checksum,external_path,library FROM mappings WHERE server=? AND asset=? AND stale=0",params![server,asset.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
@@ -387,19 +586,25 @@ impl FavoriteSynchronizer<'_> {
             desired,
         };
         let body = serde_json::to_string(&intent)?;
-        let exists:bool=self.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM favorite_intents WHERE group_id=? AND state IN('prepared','sent') AND body=?)",params![group.to_string(),body],|r|r.get(0))?;
-        if exists {
-            return Ok(());
-        }
+        let old:Option<String>=self.catalog.db.query_row("SELECT id FROM favorite_intents WHERE group_id=? AND state IN('prepared','sent') AND body=? ORDER BY rowid DESC LIMIT 1",params![group.to_string(),body],|r|r.get(0)).optional()?;
+        let id = old
+            .map(|id| serde_json::from_value(id.into()))
+            .transpose()?
+            .unwrap_or_else(OperationId::new);
+        baseline.outbound = Some(id);
+        baseline.pending = Some(desired);
+        baseline.server = intent.server.clone();
+        baseline.asset = asset;
         let tx = self.catalog.db.transaction()?;
         tx.execute(
-            "UPDATE favorite_intents SET state='superseded' WHERE group_id=? AND state='prepared'",
-            [group.to_string()],
+            "UPDATE favorite_intents SET state='superseded' WHERE group_id=? AND state='prepared' AND id<>?",
+            params![group.to_string(),id.to_string()],
         )?;
         tx.execute(
-            "INSERT INTO favorite_intents(id,group_id,body,state) VALUES(?,?,?,'prepared')",
-            params![OperationId::new().to_string(), group.to_string(), body],
+            "INSERT INTO favorite_intents(id,group_id,body,state) VALUES(?,?,?,'prepared') ON CONFLICT(id) DO NOTHING",
+            params![id.to_string(), group.to_string(), body],
         )?;
+        tx.execute("INSERT INTO favorite_baselines(group_id,body,source_version,pending_version) VALUES(?,?,?,?) ON CONFLICT(group_id) DO UPDATE SET body=excluded.body,source_version=excluded.source_version,pending_version=excluded.pending_version",params![group.to_string(),serde_json::to_string(&baseline)?,baseline.source_version.map(|v|v.to_string()),baseline.pending_version.map(|v|v.to_string())])?;
         tx.execute(
             "UPDATE residency SET protected=1 WHERE group_id=?",
             [group.to_string()],
@@ -562,16 +767,15 @@ impl FavoriteSynchronizer<'_> {
         {
             return Ok(waiting("favorite JPEG binding changed"));
         }
-        let prior:bool=self.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM favorite_intents WHERE group_id=? AND rowid<(SELECT rowid FROM favorite_intents WHERE id=?) AND state IN('prepared','sent'))",params![intent.group.to_string(),id.to_string()],|r|r.get(0))?;
+        let prior:bool=self.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM favorite_intents WHERE group_id=? AND json_extract(body,'$.server')=? AND json_extract(body,'$.asset')=? AND rowid<(SELECT rowid FROM favorite_intents WHERE id=?) AND state IN('prepared','sent'))",params![intent.group.to_string(),intent.server,intent.asset.to_string(),id.to_string()],|r|r.get(0))?;
         if prior {
             return Ok(waiting("earlier favorite intent must settle"));
         }
         if state == "prepared" {
-            if self.catalog.local_head(intent.sidecar)? != Some(intent.source) {
-                self.catalog.db.execute(
-                    "UPDATE favorite_intents SET state='superseded' WHERE id=?",
-                    [id.to_string()],
-                )?;
+            if !self.primary_is_current(&intent)?
+                || self.catalog.local_head(intent.sidecar)? != Some(intent.source)
+            {
+                self.supersede(id)?;
                 return Ok(waiting("favorite source superseded"));
             }
             let mut q = self
@@ -630,6 +834,13 @@ impl FavoriteSynchronizer<'_> {
                 expected: intent.expected,
                 desired: intent.desired,
                 jpeg_checksum: intent.checksum.clone(),
+                external_path: intent.external.clone(),
+                library_id: intent
+                    .library
+                    .as_deref()
+                    .map(uuid::Uuid::parse_str)
+                    .transpose()
+                    .map_err(|_| AppError::integrity("invalid favorite library identity"))?,
             });
             return match outcome {
                 Ok(FavoriteOutcome::Uncertain) => {
@@ -662,6 +873,8 @@ impl FavoriteSynchronizer<'_> {
         if asset.checksum != intent.checksum
             || asset.original_path != intent.external
             || asset.library_id.map(|v| v.to_string()) != intent.library
+            || asset.kind != "IMAGE"
+            || asset.original_mime_type.as_deref() != Some("image/jpeg")
         {
             return Ok(waiting("readback JPEG identity changed"));
         }
@@ -684,6 +897,50 @@ impl FavoriteSynchronizer<'_> {
         intent: &Intent,
         outcome: FavoriteOutcome,
     ) -> AppResult<RatingSyncReport> {
+        if matches!(outcome, FavoriteOutcome::IdentityChanged) {
+            self.catalog.db.execute(
+                "UPDATE favorite_intents SET state='identity_changed' WHERE id=?",
+                [id.to_string()],
+            )?;
+            self.catalog.record_rating_conflict(intent.group,"mapping_identity",serde_json::json!({"intent":id,"asset":intent.asset,"reason":"live JPEG identity changed during favorite write"}))?;
+            return Ok(RatingSyncReport {
+                conflict: true,
+                ..Default::default()
+            });
+        }
+        let selected: Option<(String, String)> = self
+            .catalog
+            .db
+            .query_row(
+                "SELECT server,asset FROM rating_authorities WHERE group_id=?",
+                [intent.group.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let authority_changed = selected
+            .is_some_and(|a| a != (intent.server.clone(), intent.asset.to_string()))
+            || !self.primary_is_current(intent)?;
+        if let FavoriteOutcome::Conflict { observed } = outcome
+            && ((intent.reject && !intent.desired) || authority_changed)
+        {
+            let tx = self.catalog.db.transaction()?;
+            tx.execute(
+                "INSERT INTO favorite_receipts(id,intent,body) VALUES(?,?,?)",
+                params![
+                    OperationId::new().to_string(),
+                    id.to_string(),
+                    serde_json::to_string(
+                        &serde_json::json!({"binding":intent,"observed":observed})
+                    )?
+                ],
+            )?;
+            tx.execute(
+                "UPDATE favorite_intents SET state='readback_different' WHERE id=?",
+                [id.to_string()],
+            )?;
+            tx.commit()?;
+            return Ok(RatingSyncReport{waiting:true,reason:Some("Reject readback retained; fresh flag and binding observation required for a new intent".into()),..Default::default()});
+        }
         let confirmed = matches!(outcome, FavoriteOutcome::Confirmed);
         if matches!(outcome, FavoriteOutcome::Uncertain) {
             return Ok(RatingSyncReport {
@@ -699,7 +956,7 @@ impl FavoriteSynchronizer<'_> {
             ],
         )?;
         if !confirmed {
-            self.conflict(intent.group,serde_json::json!({"intent":id,"expected":intent.expected,"desired":intent.desired,"reason":"favorite changed concurrently"}))?;
+            self.conflict(intent.group,serde_json::json!({"intent":id,"expected":intent.expected,"desired":intent.desired,"local":if intent.desired { PickFlag::Pick } else { PickFlag::Neutral },"remote":match outcome { FavoriteOutcome::Conflict { observed }=>Some(observed), _=>None },"reason":"favorite changed concurrently"}))?;
         }
         Ok(RatingSyncReport {
             confirmed,
