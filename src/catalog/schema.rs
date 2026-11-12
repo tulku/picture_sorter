@@ -1,4 +1,4 @@
-pub const VERSION: i64 = 1;
+pub const VERSION: i64 = 2;
 pub const SCHEMA: &str = r#"
 CREATE TABLE archives(id TEXT PRIMARY KEY, writer TEXT NOT NULL, sequence INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE blobs(digest TEXT PRIMARY KEY, size INTEGER NOT NULL CHECK(size>=0), metadata TEXT, extractor TEXT);
@@ -32,7 +32,7 @@ CREATE TABLE conflicts(id TEXT PRIMARY KEY,kind TEXT NOT NULL,group_id TEXT,revi
 CREATE TABLE capabilities(id TEXT PRIMARY KEY,report TEXT NOT NULL);
 CREATE TABLE blocked_records(id TEXT PRIMARY KEY,reason TEXT NOT NULL);
 CREATE TABLE observations(path TEXT PRIMARY KEY,digest TEXT,size INTEGER,absent_since INTEGER,readable INTEGER NOT NULL DEFAULT 1,tool_digest TEXT);
-PRAGMA user_version=1;
+PRAGMA user_version=2;
 "#;
 pub const IMPORT_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS capture_facts(digest TEXT NOT NULL,path TEXT NOT NULL,context TEXT NOT NULL,camera TEXT NOT NULL,second INTEGER,payload TEXT NOT NULL,PRIMARY KEY(digest,path));
@@ -96,4 +96,6 @@ CREATE TABLE retained_companions(sidecar TEXT PRIMARY KEY REFERENCES sidecars(id
 CREATE TABLE archived_versions(version TEXT PRIMARY KEY REFERENCES versions(id));
 "#;
 
-pub const JPEG_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS jpeg_fingerprints(digest TEXT NOT NULL REFERENCES blobs(digest), algorithm TEXT NOT NULL, fingerprint TEXT, PRIMARY KEY(digest,algorithm));";
+pub const JPEG_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS jpeg_fingerprints(digest TEXT NOT NULL REFERENCES blobs(digest), algorithm TEXT NOT NULL, fingerprint TEXT, PRIMARY KEY(digest,algorithm));
+CREATE TABLE IF NOT EXISTS jpeg_checks(item TEXT PRIMARY KEY REFERENCES import_items(id),payload TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS jpeg_duplicates(item TEXT PRIMARY KEY REFERENCES import_items(id),archive TEXT NOT NULL,canonical_group TEXT NOT NULL,canonical_path TEXT NOT NULL,canonical_digest TEXT NOT NULL REFERENCES blobs(digest),canonical_size INTEGER NOT NULL,image TEXT NOT NULL);";

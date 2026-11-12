@@ -2,7 +2,7 @@
 
 `photo_sorter` imports camera originals into a bounded local working tree, preserves observed saved edits, and publishes verified originals and immutable metadata history to an archive. A local SQLite catalog and one coordinator keep local work available while the archive is unavailable. Originals are immutable; editing data is retained separately with causal versions and explicit conflict handling.
 
-The default local budget is 70 GiB with 5 GiB filesystem reserve. A completed local import can still await archive publication. Check the reported milestone and retained job before deciding what to do with a card. Repeat imports verify byte identity and reuse metadata; no timestamp cutoff determines whether a photo was imported. Supported originals include CR2/NEF/ARW/DNG/RAW/ORF/ORI, JPG/JPEG/TIF/TIFF/PNG, and MOV/MP4/AVI/MTS/M4V/MPG/MPEG. Only genuine JPEGs qualify for initial Immich URL mapping.
+The default local budget is 70 GiB with 5 GiB filesystem reserve. A completed local import can still await archive publication. Check the reported milestone and retained job before deciding what to do with a card. Repeat imports verify byte identity, recognise JPEG metadata-only variants by image content, and reuse metadata; no timestamp cutoff determines whether a photo was imported. Supported originals include CR2/NEF/ARW/DNG/RAW/ORF/ORI, JPG/JPEG/TIF/TIFF/PNG, and MOV/MP4/AVI/MTS/M4V/MPG/MPEG. Only genuine JPEGs qualify for initial Immich URL mapping.
 
 Build on Linux with Rust 2024, rsync and ExifTool:
 

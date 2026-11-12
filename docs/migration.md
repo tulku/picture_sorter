@@ -11,3 +11,7 @@ The automated build does not migrate personal photos, alter Syncthing/Immich set
 7. Review backup/rebuild and abandoned-lock procedures. Install the generated user service and point the quoted runner at the reviewed explicit profile/card path yourself. Confirm old Syncthing/importer exclusions remain effective. Observe status and budget through a complete offline/reconnect cycle before routine use.
 
 Keep rollback copies of old configuration, archive, local edits and catalog state. Rolling back software does not authorize concurrent writers, deleting causal history or downgrading a newer catalog. Stop/reap all writers and inspect archive mode/history before switching owners. Deployment probes are real operations on explicitly disposable scratch/assets and must be authorized separately from this isolated implementation run.
+
+## JPEG recognition catalogue upgrade
+
+The JPEG image-duplicate release upgrades the local catalogue from version 1 to version 2 when opened. Existing photo identities, jobs and history are preserved. Take a catalogue backup before upgrading and finish any active bootstrap before replacing its service. Older binaries refuse version 2, because they cannot interpret image-duplicate accounting safely. Archive marker/journal schemas stay unchanged; no archive photo is rewritten by this upgrade.

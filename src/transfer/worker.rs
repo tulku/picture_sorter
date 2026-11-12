@@ -19,6 +19,14 @@ use std::{
 const MAX_LINE: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasCommand {
+    InspectJpegArchive {
+        root: PathBuf,
+        archive: crate::domain::ArchiveId,
+        writer: crate::domain::WriterId,
+        path: crate::domain::ArchivePath,
+        expected_digest: crate::domain::Digest,
+        expected_size: u64,
+    },
     MeasureLocalSpace {
         local: PathBuf,
         state: PathBuf,
@@ -209,6 +217,7 @@ pub enum NasCommand {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasReply {
+    JpegInspection(crate::import::JpegInspection),
     Refreshed(crate::edit::RefreshReport),
     LocalSpace(crate::fs::ManagedSpaceMeasurement),
     Capability(crate::qualification::CapabilityReport),
@@ -834,6 +843,42 @@ impl ArchiveRuntime {
             self.last_exchange_decision = Some(store.exchange_decision());
         }
         match command {
+            NasCommand::InspectJpegArchive {
+                root,
+                archive,
+                writer,
+                path,
+                expected_digest,
+                expected_size,
+            } => {
+                let store = self.open_store(&root, archive, writer)?;
+                let mut file =
+                    store
+                        .root
+                        .open_relative(&path, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+                if !file.metadata()?.is_file() {
+                    return Err(AppError::integrity(
+                        "JPEG archive candidate is not a regular file",
+                    ));
+                }
+                let before = crate::import::jpeg_file_stamp(&file.metadata()?);
+                let inspection = crate::import::inspect_jpeg(&mut file)?;
+                let current =
+                    store
+                        .root
+                        .open_relative(&path, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+                if crate::import::jpeg_file_stamp(&file.metadata()?) != before
+                    || crate::import::jpeg_file_stamp(&current.metadata()?) != before
+                    || inspection.digest != expected_digest
+                    || inspection.size != expected_size
+                {
+                    return Err(AppError::integrity(
+                        "JPEG archive candidate changed since catalogue verification",
+                    ));
+                }
+                store.validate()?;
+                Ok(NasReply::JpegInspection(inspection))
+            }
             NasCommand::CaptureHistory {
                 root,
                 archive,

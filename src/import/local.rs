@@ -37,7 +37,7 @@ impl ImportCoordinator {
         {
             return Ok(None);
         }
-        let row:Option<PendingLocalRow>=self.catalog.db.query_row("SELECT id,source_root,source_path,digest,size,role,group_id,destination FROM import_items WHERE parent=? AND local_ready=0 AND archived=0 AND state<>'conflict' ORDER BY rowid LIMIT 1",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional()?;
+        let row:Option<PendingLocalRow>=self.catalog.db.query_row("SELECT id,source_root,source_path,digest,size,role,group_id,destination FROM import_items WHERE parent=? AND local_ready=0 AND archived=0 AND state NOT IN('conflict','jpeg_pending','image_duplicate') ORDER BY rowid LIMIT 1",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional()?;
         let Some((id, source_root, source_path, digest, size, role, group, destination)) = row
         else {
             return Ok(None);

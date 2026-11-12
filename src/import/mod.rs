@@ -21,3 +21,8 @@ pub(crate) use sequences::{record_capture_evidence, record_sequence_evidence};
 
 mod jpeg;
 pub use jpeg::*;
+
+mod jpeg_duplicates;
+pub(crate) use jpeg_duplicates::*;
+
+mod jpeg_xmp;

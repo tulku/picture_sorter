@@ -67,6 +67,7 @@ struct Rendering {
     orientation: u16,
     colour_space: Option<u16>,
     gamma: Option<(u32, u32)>,
+    extra: Vec<(u32, u16, u32, Vec<u8>)>,
 }
 impl Default for Rendering {
     fn default() -> Self {
@@ -74,6 +75,7 @@ impl Default for Rendering {
             orientation: 1,
             colour_space: None,
             gamma: None,
+            extra: Vec::new(),
         }
     }
 }
@@ -86,6 +88,8 @@ fn fingerprint(reader: &mut impl Read) -> io::Result<Option<blake3::Hasher>> {
     let mut hash = blake3::Hasher::new_derive_key("photo-sorter JPEG image content v1");
     hash.update(&soi);
     let mut rendering = None;
+    let mut xmp = std::collections::BTreeSet::new();
+    let mut xmp_bytes = 0usize;
     let (mut frame, mut quantization, mut huffman) = (false, false, false);
     loop {
         let mut header = [0; 4];
@@ -114,9 +118,18 @@ fn fingerprint(reader: &mut impl Read) -> io::Result<Option<blake3::Hasher>> {
                 rendering = Some(value);
                 continue;
             }
-            0xe1 if payload.starts_with(b"http://ns.adobe.com/xap/1.0/\0")
-                || payload.starts_with(b"http://ns.adobe.com/xmp/extension/\0") =>
-            {
+            0xe1 if payload.starts_with(b"http://ns.adobe.com/xmp/extension/\0") => {
+                return Ok(None);
+            }
+            0xe1 if payload.starts_with(b"http://ns.adobe.com/xap/1.0/\0") => {
+                let Some(properties) = super::jpeg_xmp::properties(&payload[29..]) else {
+                    return Ok(None);
+                };
+                xmp_bytes = xmp_bytes.saturating_add(payload.len());
+                if xmp_bytes > 1024 * 1024 {
+                    return Ok(None);
+                }
+                xmp.extend(properties);
                 continue;
             }
             0xfe => continue,
@@ -204,6 +217,11 @@ fn fingerprint(reader: &mut impl Read) -> io::Result<Option<blake3::Hasher>> {
             } else {
                 hash.update(&[0]);
             }
+            hash.update(&serde_json::to_vec(&rendering.extra).map_err(io::Error::other)?);
+            xmp.retain(|property| {
+                !property.is_redundant_rendering(rendering.orientation, rendering.colour_space)
+            });
+            hash.update(&serde_json::to_vec(&xmp).map_err(io::Error::other)?);
             return Ok(Some(hash));
         }
     }
@@ -253,6 +271,34 @@ impl Tiff<'_> {
         }
         Some(result)
     }
+    fn normalized_field(&self, entry: usize) -> Option<(u16, u32, Vec<u8>)> {
+        let kind = self.u16(entry + 2)?;
+        let count = self.u32(entry + 4)?;
+        let (size, unit) = match kind {
+            1 | 2 | 6 | 7 => (1, 1),
+            3 | 8 => (2, 2),
+            4 | 9 | 11 => (4, 4),
+            5 | 10 => (8, 4),
+            12 => (8, 8),
+            _ => return None,
+        };
+        let length = (count as usize).checked_mul(size)?;
+        let start = if length <= 4 {
+            entry + 8
+        } else {
+            self.u32(entry + 8)? as usize
+        };
+        let bytes = self.bytes.get(start..start.checked_add(length)?)?;
+        let mut result = Vec::with_capacity(length);
+        for chunk in bytes.chunks_exact(unit) {
+            if self.little || unit == 1 {
+                result.extend_from_slice(chunk);
+            } else {
+                result.extend(chunk.iter().rev());
+            }
+        }
+        Some((kind, count, result))
+    }
     fn short(&self, entry: usize) -> Option<u16> {
         if self.u16(entry + 2)? != 3 || self.u32(entry + 4)? != 1 {
             return None;
@@ -272,6 +318,14 @@ fn exif_rendering(bytes: &[u8]) -> Option<Rendering> {
     }
     let first = tiff.directory(tiff.u32(4)? as usize)?;
     let mut result = Rendering::default();
+    for tag in [
+        0x0106, 0x012d, 0x013e, 0x013f, 0x0211, 0x0212, 0x0213, 0x0214, 0x8773,
+    ] {
+        if let Some(entry) = first.get(&tag) {
+            let (kind, count, value) = tiff.normalized_field(*entry)?;
+            result.extra.push((tag as u32, kind, count, value));
+        }
+    }
     if let Some(entry) = first.get(&0x112) {
         result.orientation = tiff.short(*entry)?;
         if !(1..=8).contains(&result.orientation) {
@@ -283,6 +337,20 @@ fn exif_rendering(bytes: &[u8]) -> Option<Rendering> {
             return None;
         }
         let exif = tiff.directory(tiff.u32(entry + 8)? as usize)?;
+        if let Some(entry) = exif.get(&0xa005) {
+            if tiff.u16(entry + 2)? != 4 || tiff.u32(entry + 4)? != 1 {
+                return None;
+            }
+            let interoperability = tiff.directory(tiff.u32(entry + 8)? as usize)?;
+            for tag in [1, 2] {
+                if let Some(entry) = interoperability.get(&tag) {
+                    let (kind, count, value) = tiff.normalized_field(*entry)?;
+                    result
+                        .extra
+                        .push((0x20000 + tag as u32, kind, count, value));
+                }
+            }
+        }
         if let Some(entry) = exif.get(&0xa001) {
             result.colour_space = Some(tiff.short(*entry)?);
         }

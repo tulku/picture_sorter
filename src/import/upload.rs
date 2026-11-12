@@ -37,6 +37,7 @@ struct Active {
 }
 #[derive(Clone, Copy)]
 enum Phase {
+    JpegInspect,
     Stage,
     History,
     Begin,
@@ -74,7 +75,7 @@ impl ImportCoordinator {
     }
     fn next_upload(&mut self, job: JobId) -> AppResult<Option<ImportItem>> {
         for _ in 0..128 {
-            let row:Option<UploadItemRow>=self.catalog.db.query_row("SELECT id,source_root,source_path,digest,size,role,group_id,destination,local_ready,archived FROM import_items WHERE parent=? AND archived=0 AND state<>'conflict' AND (group_id IS NOT NULL OR EXISTS(SELECT 1 FROM import_scans WHERE job=parent AND complete=1)) ORDER BY group_id IS NULL,rowid LIMIT 1",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))).optional()?;
+            let row:Option<UploadItemRow>=self.catalog.db.query_row("SELECT id,source_root,source_path,digest,size,role,group_id,destination,local_ready,archived FROM import_items WHERE parent=? AND archived=0 AND state NOT IN('conflict','image_duplicate') AND (group_id IS NOT NULL OR EXISTS(SELECT 1 FROM import_scans WHERE job=parent AND complete=1)) ORDER BY group_id IS NULL,rowid LIMIT 1",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))).optional()?;
             let Some((id, root, path, digest, size, role, group, destination, local_ready, _)) =
                 row
             else {
@@ -195,6 +196,38 @@ impl UploadDriver {
             let Some(item) = engine.next_upload(job)? else {
                 return engine.report(job);
             };
+            if let Some(check) = engine.pending_jpeg_check(item.id)? {
+                if let Some(image) = engine.catalog.jpeg_fingerprint(&check.candidate.digest)? {
+                    engine.finish_jpeg_check(
+                        &item,
+                        &JpegInspection {
+                            digest: check.candidate.digest,
+                            size: check.candidate.size,
+                            image,
+                        },
+                    )?;
+                    return engine.report(job);
+                }
+                let ticket = worker.submit(NasCommand::InspectJpegArchive {
+                    root: engine.config.archive_root.clone(),
+                    archive,
+                    writer: engine.config.writer_id,
+                    path: check.candidate.path,
+                    expected_digest: check.candidate.digest,
+                    expected_size: check.candidate.size,
+                })?;
+                self.active = Some(Active {
+                    job,
+                    item,
+                    ticket,
+                    phase: Phase::JpegInspect,
+                    session: None,
+                    batch: None,
+                    index: 0,
+                    plan: None,
+                });
+                return engine.report(job);
+            }
             let source = if item.local_ready {
                 SourceLocation {
                     root: engine.config.working_root.clone(),
@@ -281,10 +314,16 @@ impl UploadDriver {
                         Phase::Read | Phase::List | Phase::Ack | Phase::Abort
                     )
                 {
-                    engine.catalog.db.execute(
+                    let tx = engine.catalog.db.transaction()?;
+                    tx.execute(
                         "UPDATE import_items SET state='conflict' WHERE id=?",
                         [active.item.id.to_string()],
                     )?;
+                    tx.execute(
+                        "DELETE FROM jpeg_checks WHERE item=?",
+                        [active.item.id.to_string()],
+                    )?;
+                    tx.commit()?;
                     if let SourceRole::Original(role) = active.item.role {
                         engine.catalog.record_ambiguity(
                             "original_collision",
@@ -324,6 +363,10 @@ impl UploadDriver {
                         }
                     }
                     (Phase::Abort, NasReply::Done) => return engine.report(job),
+                    (Phase::JpegInspect, NasReply::JpegInspection(inspection)) => {
+                        engine.finish_jpeg_check(&active.item, &inspection)?;
+                        return engine.report(job);
+                    }
                     (Phase::Stage, NasReply::Staged(_)) => {
                         if matches!(active.item.role, SourceRole::Companion(_)) {
                             active.phase = Phase::History;
@@ -413,7 +456,7 @@ impl UploadDriver {
                             engine.catalog.refresh_protection(group)?;
                         }
                         let report = engine.report(active.job)?;
-                        if report.archive_committed == report.selected
+                        if report.pending_archive == 0
                             && report.conflicting == 0
                             && engine.scan_complete(active.job)?
                         {
@@ -651,7 +694,7 @@ fn source_owner(
     parent: JobId,
 ) -> AppResult<Option<(Option<GroupId>, ArchivePath, String)>> {
     use crate::edit::{OwnerDecision, SidecarKind, resolve_owner};
-    let mut query=engine.catalog.db.prepare("SELECT source_path,destination,digest,size,role,group_id FROM import_items WHERE parent=? AND source_root=? AND group_id IS NOT NULL AND archived=1 AND substr(?,1,length(source_path))=source_path ORDER BY length(source_path) DESC LIMIT 128")?;
+    let mut query=engine.catalog.db.prepare("SELECT i.source_path,coalesce(d.canonical_path,i.destination),coalesce(d.canonical_digest,i.digest),coalesce(d.canonical_size,i.size),i.role,coalesce(d.canonical_group,i.group_id) FROM import_items i LEFT JOIN jpeg_duplicates d ON d.item=i.id WHERE i.parent=? AND i.source_root=? AND coalesce(d.canonical_group,i.group_id) IS NOT NULL AND (i.archived=1 OR (i.state='image_duplicate' AND d.item IS NOT NULL)) AND substr(?,1,length(i.source_path))=i.source_path ORDER BY length(i.source_path) DESC LIMIT 128")?;
     let rows = query
         .query_map(
             params![

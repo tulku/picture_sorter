@@ -111,7 +111,7 @@ impl StatusSnapshot {
         Ok(Self {
             session_metrics: crate::metrics::snapshot(),
             pagination,
-            schema_version: 1,
+            schema_version: crate::catalog::schema::VERSION as u32,
             protocol_version: 1,
             profile_id: engine.config.profile_id,
             writer_id: engine.config.writer_id,

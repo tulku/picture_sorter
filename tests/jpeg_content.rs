@@ -31,9 +31,8 @@ fn gps_xmp_and_comments_do_not_change_image_identity() {
         RED,
         &[
             exif(1),
-            segment(
-                0xe1,
-                b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta GPSLatitude='51.2'/ >",
+            block_xmp(
+                "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:exif='http://ns.adobe.com/exif/1.0/' exif:GPSLatitude='51,12N'/></rdf:RDF></x:xmpmeta>",
             ),
             segment(0xfe, b"geotagged"),
         ],
@@ -190,4 +189,145 @@ fn explicit_uncalibrated_colour_space_is_not_unspecified() {
         .image
         .unwrap();
     assert_ne!(unspecified, uncalibrated);
+}
+
+#[test]
+fn jpeg_accounting_upgrade_preserves_existing_catalogue() {
+    use photo_sorter::{
+        catalog::Catalog,
+        fs::{RootHandle, RootPolicy},
+    };
+    let state = tempfile::tempdir().unwrap();
+    let root = RootHandle::open(state.path(), RootPolicy::Local).unwrap();
+    let mut catalog = Catalog::open(&root).unwrap();
+    let group = catalog.create_group(false).unwrap();
+    drop(catalog);
+    let db = rusqlite::Connection::open(state.path().join("catalog.sqlite")).unwrap();
+    db.execute_batch("DROP TABLE jpeg_duplicates; DROP TABLE jpeg_checks; DROP TABLE jpeg_fingerprints; PRAGMA user_version=1;").unwrap();
+    drop(db);
+    let catalog = Catalog::open(&root).unwrap();
+    assert_eq!(catalog.group(group).unwrap().id, group);
+    drop(catalog);
+    let db = rusqlite::Connection::open(state.path().join("catalog.sqlite")).unwrap();
+    let version: u64 = db
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        version, 2,
+        "old readers must reject new duplicate-accounting states"
+    );
+    let duplicates: u64 = db
+        .query_row("SELECT count(*) FROM jpeg_duplicates", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(duplicates, 0);
+}
+
+#[test]
+fn xmp_only_rendering_changes_are_not_ignored() {
+    let xmp = |rotation: u8| {
+        block_xmp(&format!(
+            "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:tiff='http://ns.adobe.com/tiff/1.0/' tiff:Orientation='{rotation}'/></rdf:RDF></x:xmpmeta>"
+        ))
+    };
+    let first = inspect_jpeg(Cursor::new(insert(RED, &[xmp(1)])))
+        .unwrap()
+        .image
+        .unwrap();
+    let rotated = inspect_jpeg(Cursor::new(insert(RED, &[xmp(6)])))
+        .unwrap()
+        .image
+        .unwrap();
+    assert_ne!(
+        first, rotated,
+        "XMP rotation affects displayed image identity"
+    );
+}
+fn block_xmp(xml: &str) -> Vec<u8> {
+    let mut payload = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
+    payload.extend_from_slice(xml.as_bytes());
+    segment(0xe1, &payload)
+}
+
+#[test]
+fn exif_white_point_changes_remain_distinct() {
+    let image = |numerator: u32| {
+        let mut payload =
+            b"Exif\0\0II\x2a\0\x08\0\0\0\x01\0\x3e\x01\x05\0\x02\0\0\0\x1a\0\0\0\0\0\0\0".to_vec();
+        for value in [numerator, 10000, 3290, 10000] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        inspect_jpeg(Cursor::new(insert(RED, &[segment(0xe1, &payload)])))
+            .unwrap()
+            .image
+            .unwrap()
+    };
+    assert_ne!(image(3127), image(3457));
+}
+#[test]
+fn xmp_namespace_prefixes_and_geotags_do_not_change_matching_rotation() {
+    let first = block_xmp(
+        "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:tiff='http://ns.adobe.com/tiff/1.0/' tiff:Orientation='1'/></rdf:RDF></x:xmpmeta>",
+    );
+    let second = block_xmp(
+        "<x:xmpmeta xmlns:x='adobe:ns:meta/'><r:RDF xmlns:r='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><r:Description xmlns:t='http://ns.adobe.com/tiff/1.0/' xmlns:e='http://ns.adobe.com/exif/1.0/' e:GPSLatitude='51,12N'><t:Orientation>1</t:Orientation></r:Description></r:RDF></x:xmpmeta>",
+    );
+    assert_eq!(
+        inspect_jpeg(Cursor::new(insert(RED, &[first])))
+            .unwrap()
+            .image
+            .unwrap(),
+        inspect_jpeg(Cursor::new(insert(RED, &[second])))
+            .unwrap()
+            .image
+            .unwrap()
+    );
+}
+#[test]
+fn unknown_xmp_rendering_is_preserved_and_unsafe_xml_is_unsupported() {
+    let packet = |exposure: u8| {
+        block_xmp(&format!(
+            "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:crs='http://ns.adobe.com/camera-raw-settings/1.0/' crs:Exposure2012='{exposure}'/></rdf:RDF></x:xmpmeta>"
+        ))
+    };
+    assert_ne!(
+        inspect_jpeg(Cursor::new(insert(RED, &[packet(0)])))
+            .unwrap()
+            .image
+            .unwrap(),
+        inspect_jpeg(Cursor::new(insert(RED, &[packet(1)])))
+            .unwrap()
+            .image
+            .unwrap()
+    );
+    for xml in ["<!DOCTYPE x [<!ENTITY foo '6'>]><x/>", "<broken>"] {
+        assert!(
+            inspect_jpeg(Cursor::new(insert(RED, &[block_xmp(xml)])))
+                .unwrap()
+                .image
+                .is_none()
+        );
+    }
+    let extended = segment(0xe1, b"http://ns.adobe.com/xmp/extension/\0fragment");
+    assert!(
+        inspect_jpeg(Cursor::new(insert(RED, &[extended])))
+            .unwrap()
+            .image
+            .is_none()
+    );
+}
+
+#[test]
+fn camera_xmp_trailing_zero_padding_does_not_disable_recognition() {
+    let xml = "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:tiff='http://ns.adobe.com/tiff/1.0/' tiff:Orientation='1'/></rdf:RDF></x:xmpmeta>";
+    let clean = inspect_jpeg(Cursor::new(insert(RED, &[block_xmp(xml)])))
+        .unwrap()
+        .image
+        .unwrap();
+    let padded = inspect_jpeg(Cursor::new(insert(
+        RED,
+        &[block_xmp(&(xml.to_owned() + "\0"))],
+    )))
+    .unwrap()
+    .image;
+    assert_eq!(padded, Some(clean));
 }

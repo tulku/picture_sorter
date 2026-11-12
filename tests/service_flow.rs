@@ -681,7 +681,7 @@ fn status_and_conflicts_have_bounded_resumable_pages() {
 #[test]
 fn capacity_pressure_reclaims_old_archived_lru_before_direct_import() {
     let fixture = ServiceFixture::with_config(|config, _| {
-        config.budget = 3 * 1024 * 1024;
+        config.budget = 4 * 1024 * 1024;
         config.activity_hold_seconds = 0;
     });
     let init = fixture.cli(&["archive", "init"]);

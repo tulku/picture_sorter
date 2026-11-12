@@ -1743,10 +1743,18 @@ impl Runtime {
                     )?;
                 }
                 if self.engine.scan_complete(job)?
-                    && report.archive_committed == report.selected
+                    && report.pending_archive == 0
                     && report.waiting == 0
                     && report.conflicting == 0
                 {
+                    let record = self.engine.catalog.job(job)?;
+                    if !record.archive_committed {
+                        self.engine.catalog.transition(
+                            job,
+                            record.generation,
+                            JobTransition::Archived,
+                        )?;
+                    }
                     self.complete(job)?;
                 } else if self.upload.active_job() == Some(job)
                     || (due

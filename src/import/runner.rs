@@ -25,6 +25,8 @@ pub struct ImportReport {
     pub recognized: u64,
     pub local_ready: u64,
     pub archive_committed: u64,
+    #[serde(default)]
+    pub image_duplicates: u64,
     pub pending_archive: u64,
     pub waiting: u64,
     pub conflicting: u64,
@@ -322,6 +324,7 @@ impl ImportCoordinator {
             let child = JobId::new();
             let mut warning = false;
             let mut conflict = false;
+            let mut jpeg_check = None;
             let (group, destination) = match &entry.role {
                 SourceRole::Original(role) => {
                     let capture = captures
@@ -360,7 +363,7 @@ impl ImportCoordinator {
                         &[PlannedGroup {
                             id,
                             records: vec![capture.clone()],
-                            sequence: anchor,
+                            sequence: anchor.clone(),
                         }],
                         &self.catalog,
                         &self.config.import_timezone,
@@ -386,7 +389,29 @@ impl ImportCoordinator {
                     } else {
                         id
                     };
-                    if !conflict {
+                    if *role == MediaRole::Jpeg && !ambiguous.contains_key(&entry.path) {
+                        let original = plan_placements(
+                            &[PlannedGroup {
+                                id: GroupId::new(),
+                                records: vec![capture.clone()],
+                                sequence: anchor.clone(),
+                            }],
+                            &self.catalog,
+                            &self.config.import_timezone,
+                        )?
+                        .remove(0)
+                        .member
+                        .path;
+                        match self.prepare_jpeg_check(entry, &member, &original, id, &facts)? {
+                            JpegSelection::Compare(check) => {
+                                jpeg_check = Some(check);
+                                conflict = false;
+                            }
+                            JpegSelection::Ambiguous => conflict = true,
+                            JpegSelection::None => {}
+                        }
+                    }
+                    if jpeg_check.is_none() && !conflict {
                         self.catalog.attach_member(
                             id,
                             OriginalMember {
@@ -401,7 +426,7 @@ impl ImportCoordinator {
                         if !facts.camera.is_empty() && !facts.capture.is_empty() {
                             self.catalog.db.execute("INSERT INTO group_facts(context,stem,camera,capture,group_id) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING",params![facts.context,facts.stem,facts.camera,facts.capture,id.to_string()])?;
                         }
-                    } else {
+                    } else if jpeg_check.is_none() {
                         self.catalog.db.execute("INSERT INTO conflicts(id,kind,group_id,details) VALUES(?,'original_collision',?,?)",params![ConflictId::new().to_string(),id.to_string(),serde_json::to_string(&member)?])?;
                     }
                     (Some(id), member.path)
@@ -430,20 +455,31 @@ impl ImportCoordinator {
                 )
                 .optional()?;
             let local = false;
-            let mut archived = placement.is_some_and(|p| p.1);
+            let mut archived = jpeg_check.is_none() && placement.is_some_and(|p| p.1);
             if matches!(entry.role, SourceRole::Companion(_)) {
                 archived=self.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM sidecars s JOIN heads h ON h.sidecar=s.id JOIN versions v ON v.id=h.version JOIN archived_versions a ON a.version=v.id WHERE s.path=? AND json_extract(v.body,'$.Content.digest')=? AND json_extract(v.body,'$.Content.size')=?)",params![destination.as_str(),recognition.digest.as_str(),entry.size],|r|r.get(0))?;
             }
-            let recognized_existing = placement.is_some_and(|p| p.0 || p.1) || archived;
-            let state = if conflict {
+            let recognized_existing =
+                jpeg_check.is_none() && (placement.is_some_and(|p| p.0 || p.1) || archived);
+            let state = if jpeg_check.is_some() {
+                "jpeg_pending"
+            } else if conflict {
                 "conflict"
             } else if local || archived {
                 "accounted"
             } else {
                 "pending"
             };
-            self.catalog.db.execute("INSERT INTO import_items(id,parent,source_root,source_path,digest,size,role,group_id,destination,state,local_ready,archived,warning) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",params![child.to_string(),job.to_string(),entry.root.path().to_str().ok_or_else(||AppError::invalid("UTF-8 source root required"))?,entry.path.as_str(),recognition.digest.as_str(),entry.size,serde_json::to_string(&entry.role)?,group.map(|g|g.to_string()),destination.as_str(),state,local,archived,warning])?;
-            self.catalog.db.execute("UPDATE import_stats SET selected=selected+1,recognized=recognized+?,hash_bytes=hash_bytes WHERE job=?",params![u64::from(recognized_existing),job.to_string()])?;
+            let tx = self.catalog.db.transaction()?;
+            tx.execute("INSERT INTO import_items(id,parent,source_root,source_path,digest,size,role,group_id,destination,state,local_ready,archived,warning) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",params![child.to_string(),job.to_string(),entry.root.path().to_str().ok_or_else(||AppError::invalid("UTF-8 source root required"))?,entry.path.as_str(),recognition.digest.as_str(),entry.size,serde_json::to_string(&entry.role)?,group.map(|g|g.to_string()),destination.as_str(),state,local,archived,warning])?;
+            if let Some(check) = jpeg_check {
+                tx.execute(
+                    "INSERT INTO jpeg_checks(item,payload) VALUES(?,?)",
+                    params![child.to_string(), serde_json::to_string(&check)?],
+                )?;
+            }
+            tx.execute("UPDATE import_stats SET selected=selected+1,recognized=recognized+?,hash_bytes=hash_bytes WHERE job=?",params![u64::from(recognized_existing),job.to_string()])?;
+            tx.commit()?;
         }
         for neighbors in ambiguous.values() {
             let mut groups = std::collections::BTreeSet::new();
@@ -486,8 +522,13 @@ impl ImportCoordinator {
     }
     pub fn report(&self, job: JobId) -> AppResult<ImportReport> {
         let (selected,recognized,exif_invocations,transfer_bytes,hash_bytes)=self.catalog.db.query_row("SELECT selected,recognized,exif_calls,transfer_bytes,hash_bytes FROM import_stats WHERE job=?",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
-        let(local_ready,archive_committed,waiting,conflicting,association_warnings):(u64,u64,u64,u64,u64)=self.catalog.db.query_row("SELECT coalesce(sum(local_ready),0),coalesce(sum(archived),0),coalesce(sum(local_ready=0 AND archived=0 AND state<>'conflict'),0),coalesce(sum(state='conflict'),0),coalesce(sum(warning),0) FROM import_items WHERE parent=?",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
-        let pending_archive = selected - archive_committed;
+        let(local_ready,archive_committed,waiting,conflicting,association_warnings):(u64,u64,u64,u64,u64)=self.catalog.db.query_row("SELECT coalesce(sum(local_ready),0),coalesce(sum(archived),0),coalesce(sum(local_ready=0 AND archived=0 AND state NOT IN('conflict','image_duplicate')),0),coalesce(sum(state='conflict'),0),coalesce(sum(warning),0) FROM import_items WHERE parent=?",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+        let image_duplicates: u64 = self.catalog.db.query_row(
+            "SELECT count(*) FROM import_items WHERE parent=? AND state='image_duplicate'",
+            [job.to_string()],
+            |row| row.get(0),
+        )?;
+        let pending_archive = selected - archive_committed - image_duplicates;
         let skipped = self
             .catalog
             .db
@@ -505,6 +546,7 @@ impl ImportCoordinator {
             recognized,
             local_ready,
             archive_committed,
+            image_duplicates,
             pending_archive,
             waiting,
             conflicting,
