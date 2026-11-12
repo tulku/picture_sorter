@@ -503,7 +503,7 @@ impl<'a> BootstrapCoordinator<'a> {
                             |r| Ok((r.get(0)?, r.get(1)?)),
                         )
                         .optional()?;
-                    if let Some((_, digest)) = old {
+                    let group = if let Some((group, digest)) = old {
                         if digest != entry.digest.as_str() {
                             self.catalog.block_record(
                                 entry.path.as_str(),
@@ -513,23 +513,32 @@ impl<'a> BootstrapCoordinator<'a> {
                                 "existing committed original changed; preserved and protected",
                             ));
                         }
+                        let archived: bool = self.catalog.db.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM placements WHERE group_id=? AND path=? AND digest=? AND archived=1)",
+                            params![group, entry.path.as_str(), entry.digest.as_str()],
+                            |row| row.get(0),
+                        )?;
+                        if archived {
+                            continue;
+                        }
+                        serde_json::from_value(group.into())?
                     } else {
-                        let group = GroupId::new();
-                        records.push(ArchiveRecord::GroupCreated { id: group });
-                        records.push(ArchiveRecord::MemberAttached {
-                            group,
-                            member: OriginalMember {
-                                digest: entry.digest.clone(),
-                                size: entry.size,
-                                path: entry.path.clone(),
-                                role,
-                            },
-                            evidence: PairEvidence::ObservedPlacement {
-                                path: entry.path.clone(),
-                                digest: entry.digest.clone(),
-                            },
-                        });
-                    }
+                        GroupId::new()
+                    };
+                    records.push(ArchiveRecord::GroupCreated { id: group });
+                    records.push(ArchiveRecord::MemberAttached {
+                        group,
+                        member: OriginalMember {
+                            digest: entry.digest.clone(),
+                            size: entry.size,
+                            path: entry.path.clone(),
+                            role,
+                        },
+                        evidence: PairEvidence::ObservedPlacement {
+                            path: entry.path.clone(),
+                            digest: entry.digest.clone(),
+                        },
+                    });
                 }
                 SourceRole::Companion(_) => {
                     let old: Option<String> = self

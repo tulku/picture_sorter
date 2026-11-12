@@ -490,3 +490,107 @@ fn journal_audit_works_while_publication_lock_is_held() {
     assert!(store.acquire_publication().is_err());
     store.release(guard).unwrap();
 }
+
+#[test]
+fn bootstrap_archives_matching_pending_member_in_place() {
+    let r = TestRig::new();
+    std::fs::write(r.archive.join("A.ORF"), b"raw").unwrap();
+    let c = initialized(&r);
+    let state = RootHandle::open(&r.state, RootPolicy::Local).unwrap();
+    let cat = Catalog::open(&state).unwrap();
+    let mut engine = ImportCoordinator::new(c.clone(), cat);
+    engine.bind_archive().unwrap();
+    let mut cat = engine.catalog;
+    let group = cat.create_group(false).unwrap();
+    cat.attach_member(
+        group,
+        OriginalMember {
+            path: ArchivePath::parse("A.ORF").unwrap(),
+            digest: Digest::of(b"raw"),
+            size: 3,
+            role: MediaRole::Raw,
+        },
+        PairEvidence::UserSelected {
+            reason: "pending card import".into(),
+        },
+    )
+    .unwrap();
+    let revision = cat.group(group).unwrap().membership_revision;
+    let mut driver = BootstrapDriver::default();
+    let mut worker =
+        WorkerSupervisor::new_test(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+    for _ in 0..2 {
+        let job = BootstrapCoordinator::new(&c, &mut cat, &mut driver, &mut worker)
+            .start(BootstrapRequest {
+                operation: OperationId::new(),
+                archive: c.archive_id.unwrap(),
+                scope: None,
+                batch_size: 1,
+            })
+            .unwrap();
+        let report = run_bootstrap(&c, &mut cat, &mut driver, &mut worker, job);
+        assert_eq!(report.originals, 1);
+        let db = rusqlite::Connection::open(r.state.join("catalog.sqlite")).unwrap();
+        let archived: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM placements WHERE group_id=? AND path='A.ORF' AND digest=? AND archived=1)", rusqlite::params![group.to_string(), Digest::of(b"raw").as_str()], |row| row.get(0)).unwrap();
+        assert!(
+            archived,
+            "matching NAS bytes must provide archival evidence for the pending member"
+        );
+        assert_eq!(cat.group(group).unwrap().membership_revision, revision);
+        assert_eq!(cat.group_batch(None, 128).unwrap().len(), 1);
+        assert_eq!(std::fs::read(r.archive.join("A.ORF")).unwrap(), b"raw");
+        assert!(!r.local.join("A.ORF").exists());
+    }
+}
+
+#[test]
+fn bootstrap_preserves_different_nas_bytes_for_pending_member() {
+    let r = TestRig::new();
+    std::fs::write(r.archive.join("A.ORF"), b"nas").unwrap();
+    let c = initialized(&r);
+    let state = RootHandle::open(&r.state, RootPolicy::Local).unwrap();
+    let mut engine = ImportCoordinator::new(c.clone(), Catalog::open(&state).unwrap());
+    engine.bind_archive().unwrap();
+    let mut cat = engine.catalog;
+    let group = cat.create_group(false).unwrap();
+    cat.attach_member(
+        group,
+        OriginalMember {
+            path: ArchivePath::parse("A.ORF").unwrap(),
+            digest: Digest::of(b"raw"),
+            size: 3,
+            role: MediaRole::Raw,
+        },
+        PairEvidence::UserSelected {
+            reason: "pending card import".into(),
+        },
+    )
+    .unwrap();
+    let revision = cat.group(group).unwrap().membership_revision;
+    let mut driver = BootstrapDriver::default();
+    let mut worker =
+        WorkerSupervisor::new_test(env!("CARGO_BIN_EXE_photo_sorter").into(), vec![]).unwrap();
+    let job = BootstrapCoordinator::new(&c, &mut cat, &mut driver, &mut worker)
+        .start(BootstrapRequest {
+            operation: OperationId::new(),
+            archive: c.archive_id.unwrap(),
+            scope: None,
+            batch_size: 1,
+        })
+        .unwrap();
+    let start = Instant::now();
+    let error = loop {
+        match BootstrapCoordinator::new(&c, &mut cat, &mut driver, &mut worker).advance(job) {
+            Ok(report) => assert!(!report.complete),
+            Err(error) => break error,
+        }
+        assert!(start.elapsed() < Duration::from_secs(15));
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(error.code, photo_sorter::error::ErrorCode::Integrity);
+    let current = cat.group(group).unwrap();
+    assert_eq!(current.membership_revision, revision);
+    assert_eq!(current.members[0].digest, Digest::of(b"raw"));
+    assert_eq!(std::fs::read(r.archive.join("A.ORF")).unwrap(), b"nas");
+    assert!(!r.local.join("A.ORF").exists());
+}
