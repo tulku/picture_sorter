@@ -117,7 +117,7 @@ impl StatusSnapshot {
             writer_id: engine.config.writer_id,
             archive_id: engine.config.archive_id,
             archive,
-            capabilities: serde_json::json!({"nas_publication":{"allowed":false,"reason":"deployment qualification must match this mount and writer mode"},"immich_ratings":{"allowed":false,"reason":"outbound writes require matching runtime evidence and explicit best_effort"},"immich_favorites":{"allowed":false,"reason":"Favorite writes require separate runtime evidence, native Pick qualification and explicit best_effort"}}),
+            capabilities: serde_json::json!({"nas_publication":{"allowed":false,"reason":"deployment qualification must match this mount and writer mode"},"nas_metadata_replacement":{"allowed":false,"reason":"metadata replacement requires qualified atomic exchange"},"immich_ratings":{"allowed":false,"reason":"outbound writes require matching runtime evidence and explicit best_effort"},"immich_favorites":{"allowed":false,"reason":"Favorite writes require separate runtime evidence, native Pick qualification and explicit best_effort"}}),
             space,
             last_successful_operations: catalog.successful_operations(query.limit)?,
             jobs,

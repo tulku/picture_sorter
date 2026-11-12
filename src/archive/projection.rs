@@ -97,6 +97,9 @@ impl ArchiveStore {
                 preserved: None,
             });
         }
+        if matches!(observed, VersionBody::Content { .. }) {
+            self.require_exchange()?;
+        }
         let displaced = path(&format!(
             ".photo-sorter/staging/displaced-{}-{}",
             plan.sidecar,

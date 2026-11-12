@@ -102,7 +102,7 @@ impl ArchiveStore {
         if self.marker != journal.previous {
             return Err(AppError::new(ErrorCode::Conflict, "stale mode revision"));
         }
-        Self::check_write(
+        Self::check_exchange(
             &self.root,
             next.archive_id,
             next.writer_id,

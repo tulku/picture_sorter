@@ -572,7 +572,20 @@ impl Runtime {
                     nas.reason =
                         "worker outcome is uncertain; no replacement publisher is allowed".into();
                 }
+                let exchange = if !nas.allowed {
+                    nas.clone()
+                } else {
+                    self.worker
+                        .nas_exchange_decision()
+                        .unwrap_or(crate::qualification::CapabilityDecision {
+                        allowed: false,
+                        reason:
+                            "metadata replacement capability has not been observed by the worker"
+                                .into(),
+                    })
+                };
                 status.capabilities["nas_publication"] = serde_json::to_value(nas)?;
+                status.capabilities["nas_metadata_replacement"] = serde_json::to_value(exchange)?;
                 status.worker["publication_reason"] =
                     serde_json::to_value(&self.shared_publisher.reason)?;
                 status.watcher = serde_json::to_value(&self.observation.status)?;

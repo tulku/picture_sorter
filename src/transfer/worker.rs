@@ -263,6 +263,8 @@ struct Reply {
     metrics: crate::metrics::Metrics,
     #[serde(default)]
     nas_decision: Option<crate::qualification::CapabilityDecision>,
+    #[serde(default)]
+    nas_exchange_decision: Option<crate::qualification::CapabilityDecision>,
     ticket: WorkerTicket,
     result: AppResult<NasReply>,
 }
@@ -392,6 +394,7 @@ impl WorkerSettings {
 }
 pub struct WorkerSupervisor {
     nas_decision: Option<crate::qualification::CapabilityDecision>,
+    nas_exchange_decision: Option<crate::qualification::CapabilityDecision>,
     metrics: crate::metrics::Metrics,
     child: Child,
     input: std::process::ChildStdin,
@@ -530,6 +533,7 @@ impl WorkerSupervisor {
         nonblocking(output.as_raw_fd())?;
         Ok(Self {
             nas_decision: None,
+            nas_exchange_decision: None,
             metrics: crate::metrics::Metrics::default(),
             child,
             input,
@@ -545,6 +549,9 @@ impl WorkerSupervisor {
     }
     pub fn nas_decision(&self) -> Option<crate::qualification::CapabilityDecision> {
         self.nas_decision.clone()
+    }
+    pub fn nas_exchange_decision(&self) -> Option<crate::qualification::CapabilityDecision> {
+        self.nas_exchange_decision.clone()
     }
     pub fn latest_ticket(&self) -> Option<WorkerTicket> {
         self.pending
@@ -655,6 +662,7 @@ impl WorkerSupervisor {
             }
             self.metrics.add(&reply.metrics);
             self.nas_decision = reply.nas_decision;
+            self.nas_exchange_decision = reply.nas_exchange_decision;
             let state = match reply.result {
                 Ok(value) => WorkerState::Completed(value),
                 Err(e) => WorkerState::Failed(e),
@@ -774,8 +782,14 @@ fn run_worker_mode(local_only: bool) -> AppResult<()> {
                     })
             })
         };
+        let nas_exchange_decision = match nas_decision.as_ref() {
+            Some(decision) if !decision.allowed => Some(decision.clone()),
+            _ if local_only => None,
+            _ => runtime.last_exchange_decision.clone(),
+        };
         let reply = Reply {
             nas_decision,
+            nas_exchange_decision,
             metrics: crate::metrics::snapshot().difference(&before_metrics),
             ticket: message.ticket,
             result,
@@ -790,6 +804,7 @@ fn run_worker_mode(local_only: bool) -> AppResult<()> {
 #[derive(Default)]
 struct ArchiveRuntime {
     last_decision: Option<crate::qualification::CapabilityDecision>,
+    last_exchange_decision: Option<crate::qualification::CapabilityDecision>,
     settings: WorkerSettings,
     readonly: Option<ReadOnlyJournal>,
     inventory: Option<ArchiveInventory>,
@@ -806,14 +821,17 @@ impl ArchiveRuntime {
         let store = ArchiveStore::open(self.settings.root(root)?, archive, writer)?
             .with_registry(self.settings.registry());
         self.last_decision = Some(store.write_decision());
+        self.last_exchange_decision = Some(store.exchange_decision());
         Ok(store)
     }
     fn execute(&mut self, command: NasCommand) -> AppResult<NasReply> {
         self.last_decision = None;
+        self.last_exchange_decision = None;
         let registry = self.settings.registry();
         if let Some(store) = self.store.as_mut() {
             store.set_registry(registry);
             self.last_decision = Some(store.write_decision());
+            self.last_exchange_decision = Some(store.exchange_decision());
         }
         match command {
             NasCommand::CaptureHistory {
@@ -983,6 +1001,7 @@ impl ArchiveRuntime {
                 let store = ArchiveStore::open(root, marker.archive_id, marker.writer_id)?
                     .with_registry(registry);
                 self.last_decision = Some(store.write_decision());
+                self.last_exchange_decision = Some(store.exchange_decision());
                 Ok(NasReply::Marker(marker))
             }
             NasCommand::BeginArchive {

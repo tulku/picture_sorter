@@ -57,6 +57,11 @@ pub enum OperationKind<'a> {
         fingerprint: &'a Digest,
         mode: &'a crate::archive::PublicationMode,
     },
+    ArchiveExchange {
+        mount_identity: &'a str,
+        fingerprint: &'a Digest,
+        mode: &'a crate::archive::PublicationMode,
+    },
     EditorPickTransform {
         version: &'a str,
         fingerprint: &'a Digest,
@@ -180,7 +185,12 @@ impl CapabilityRegistry {
                 mount_identity,
                 fingerprint,
                 mode,
-            } => return self.archive_decision(mount_identity, fingerprint, mode),
+            } => return self.archive_decision(mount_identity, fingerprint, mode, false),
+            OperationKind::ArchiveExchange {
+                mount_identity,
+                fingerprint,
+                mode,
+            } => return self.archive_decision(mount_identity, fingerprint, mode, true),
         };
         let fingerprint = if favorite {
             favorite_fingerprint(origin, version)
@@ -261,12 +271,12 @@ impl CapabilityRegistry {
         mount_identity: &str,
         fingerprint: &Digest,
         mode: &crate::archive::PublicationMode,
+        exchange: bool,
     ) -> CapabilityDecision {
         use crate::archive::PublicationMode;
         let required = [
             "exclusive_init",
             "no_replace",
-            "rename_exchange",
             "lock_exclusion",
             "flush_reopen",
         ];
@@ -283,6 +293,10 @@ impl CapabilityRegistry {
                         .iter()
                         .any(|r| r.name == *name && matches!(r.outcome, ProbeOutcome::Pass))
                 })
+                && (!(exchange || *mode == PublicationMode::MultiWriter)
+                    || report.results.iter().any(|r| {
+                        r.name == "rename_exchange" && matches!(r.outcome, ProbeOutcome::Pass)
+                    }))
                 && match mode {
                     PublicationMode::SingleWriter => matches!(
                         report.scope,
@@ -303,6 +317,8 @@ impl CapabilityRegistry {
             allowed: matches,
             reason: if matches {
                 "matching runtime filesystem evidence"
+            } else if exchange {
+                "NAS metadata replacement requires matching atomic exchange evidence"
             } else {
                 "no matching filesystem/version/mode qualification"
             }

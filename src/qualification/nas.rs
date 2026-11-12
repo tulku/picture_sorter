@@ -1,5 +1,5 @@
 use crate::{archive::PublicationMode, domain::*, error::AppResult, fs::RootHandle};
-pub const NAS_IMPLEMENTATION: &str = concat!("photo-archive-linux-v1/", env!("CARGO_PKG_VERSION"));
+pub const NAS_IMPLEMENTATION: &str = concat!("photo-archive-linux-v2/", env!("CARGO_PKG_VERSION"));
 pub fn nas_fingerprint(
     root: &RootHandle,
     archive: ArchiveId,

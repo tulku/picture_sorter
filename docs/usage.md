@@ -30,6 +30,8 @@ photo_sorter --config /absolute/profile.toml jobs wait JOB_UUID --wait-for archi
 photo_sorter --config /absolute/profile.toml jobs cancel JOB_UUID
 ```
 
+On a qualified single-writer mount without atomic exchange, imports and immutable metadata history can publish while replacement or reset of existing live NAS metadata remains disabled. Check `status --json`: `capabilities.nas_publication` permits imports; `capabilities.nas_metadata_replacement` reports whether existing content can be replaced. Unsupported replacement retains the old live file and immutable incoming history rather than overwriting either.
+
 Default import completion is **ingested**: every selected non-conflicting original has a verified durable local copy or committed direct archive copy. Output distinguishes pending archive publication. `--wait-for archived` requires committed archive evidence; unavailable dependencies return waiting with job ID. `--no-wait` acknowledges a durable job only. Disconnect/Ctrl-C stops waiting, not the job. Use explicit cancellation; uncertain writing workers retain their reservations/session until positively completed or recovered. Conflicting groups make aggregate completion nonzero even when independent files succeed.
 
 Offline edits are observed through local events plus periodic reconciliation. The service preserves each coherently captured saved state; it cannot capture unsaved editor memory or intermediate saves overwritten before observation. Stable malformed, rejected or oversized metadata remains preserved/protected rather than transformed. Deleting a sidecar is an explicit Reset version only after readable, debounced absence, never inferred from an unavailable root. Saved source companions are imported independently of unchanged originals.

@@ -181,6 +181,52 @@ impl ArchiveStore {
         }
         Ok(())
     }
+    pub(crate) fn check_exchange(
+        root: &RootHandle,
+        archive: ArchiveId,
+        writer: WriterId,
+        mode: &PublicationMode,
+        revision: u64,
+        registry: &crate::qualification::CapabilityRegistry,
+    ) -> AppResult<()> {
+        Self::check_write(root, archive, writer, mode, revision, registry)?;
+        if root.is_test_archive() {
+            return Ok(());
+        }
+        let mount = root.mount_identity()?;
+        let fingerprint =
+            crate::qualification::nas_fingerprint(root, archive, writer, mode, revision)?;
+        let decision = registry.allows(crate::qualification::OperationKind::ArchiveExchange {
+            mount_identity: &mount,
+            fingerprint: &fingerprint,
+            mode,
+        });
+        if !decision.allowed {
+            return Err(AppError::new(ErrorCode::Unsupported, decision.reason));
+        }
+        Ok(())
+    }
+    pub fn require_exchange(&self) -> AppResult<()> {
+        self.require_writable()?;
+        Self::check_exchange(
+            &self.root,
+            self.marker.archive_id,
+            self.writer,
+            &self.marker.mode,
+            self.marker.mode_revision,
+            &self.registry,
+        )
+    }
+    pub fn exchange_decision(&self) -> crate::qualification::CapabilityDecision {
+        let result = self.require_exchange();
+        crate::qualification::CapabilityDecision {
+            allowed: result.is_ok(),
+            reason: match result {
+                Ok(()) => "matching atomic exchange evidence and publisher identity".into(),
+                Err(error) => error.to_string(),
+            },
+        }
+    }
     pub fn write_decision(&self) -> crate::qualification::CapabilityDecision {
         let result = self.require_writable();
         crate::qualification::CapabilityDecision {

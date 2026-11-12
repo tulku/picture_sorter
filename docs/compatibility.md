@@ -4,13 +4,16 @@ Normal startup and `doctor` never probe or mutate NAS objects or application sta
 
 | Capability | Automated evidence | Deployment requirement |
 |---|---|---|
-| Linux publication | Actual exclusive creation, no-replace, exchange, lock exclusion, flush/reopen on generated temporary files | Run the same probe on a separate explicit scratch directory on the target mount |
+| Single-writer immutable publication | Actual exclusive creation, no-replace, lock exclusion and flush/reopen on generated temporary files | Run the probe on a separate explicit scratch directory on the target mount |
+| Existing NAS metadata replacement | Atomic exchange in addition to immutable publication checks | Requires a passing exchange probe; unsupported mounts retain existing live metadata |
 | Multiple publishers | Independent daemon tests on an explicitly local test archive | Distinct machines/writer IDs, peer handoff, disconnect observation and positive shutdown/quiescence; single-client results cannot enable this mode |
 | RapidRAW 1.6.7 | Exact source profile `a4f2cf5cb867fa1def9f6d5ca2a16654b56fb8a8`, ordinary-folder Pick/Reject schema | Separate native star/flag saves and executable qualification required; native Immich cache is outside this bridge |
 | RapidRAW 1.6.6 | Source-backed native schema, ratings, default/reset, unknown fields and masks | Supply native saves, reopened and reset-regenerated documents from the installed binary; attest the isolated runtime steps |
 | RapidRAW inspected development revision | Source-backed adapter tests | Exact matching version/binary and native runtime validation |
 | Immich 3.3.5 | Synthetic HTTP schema, nullable-zero PUT/readback, uncertainty and identity tests | Run an explicitly authorized isolated JPEG asset probe against the installed server |
 | Other application versions | Opaque edit capture remains available | Transformations and outgoing rating writes remain disabled until a supported adapter and matching qualification exist |
+
+Single-writer imports can qualify when `rename_exchange` fails: the four immutable-publication checks must still pass for the exact mount, writer, archive, mode revision and client boot. The failed exchange result remains in the report. `qualified` describes publication for the requested mode, not every operation in the report. Status reports `nas_publication` and `nas_metadata_replacement` separately. A previously absent sidecar can be published without overwriting, and identical content remains a no-op; replacing or resetting existing content remains disabled without exchange evidence. Saved immutable metadata history may be retained while its live projection is pending. Mode changes also require exchange evidence before writing an administration intent. Multi-writer publication retains its exchange and two-client requirements. The v2 filesystem qualification fingerprint requires a fresh probe after upgrading from v1.
 
 `qualify --request /absolute/request.json` submits a durable qualification job. JSON requests are tagged `{"kind":"nas|rapidraw|immich","request":{...}}`; the tagged kind is one of those strings. Unknown fields are rejected. CLI output includes the report, whether it qualifies, and the immutable local evidence path. Completed but incomplete qualification exits 3; failed checks exit 4. Failed evidence replaces the active report for the same fingerprint while retaining history. Reports and the active registry require owned regular mode-0600 JSON files.
 

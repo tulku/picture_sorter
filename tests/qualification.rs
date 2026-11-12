@@ -721,3 +721,554 @@ fn pick_transform_requires_native_flag_evidence_independent_of_stars() {
     .unwrap();
     assert!(!decision(qualify_rapidraw(req).unwrap()));
 }
+
+fn report_without_exchange(
+    root: &RootHandle,
+    archive: ArchiveId,
+    writer: WriterId,
+    mode: &PublicationMode,
+    revision: u64,
+) -> CapabilityReport {
+    CapabilityReport {
+        schema_version: 1,
+        capability: "nas-publication".into(),
+        backend_or_application: "linux-filesystem".into(),
+        tested_version: NAS_IMPLEMENTATION.into(),
+        mount_identity: Some(root.mount_identity().unwrap()),
+        config_fingerprint: nas_fingerprint(root, archive, writer, mode, revision).unwrap(),
+        scope: ProbeScope::SingleClient,
+        results: [
+            "exclusive_init",
+            "no_replace",
+            "lock_exclusion",
+            "flush_reopen",
+        ]
+        .into_iter()
+        .map(|name| ProbeResult {
+            name: name.into(),
+            outcome: ProbeOutcome::Pass,
+            detail: "fixture evidence".into(),
+        })
+        .chain([ProbeResult {
+            name: "rename_exchange".into(),
+            outcome: ProbeOutcome::Fail,
+            detail: "exchange unsupported".into(),
+        }])
+        .collect(),
+        limitations: vec!["metadata replacement unavailable".into()],
+    }
+}
+
+#[test]
+fn single_writer_immutable_publication_does_not_require_exchange() {
+    let r = support::TestRig::new();
+    let root = production_root(&r);
+    let archive = ArchiveId::new();
+    let writer = WriterId::new();
+    let report = report_without_exchange(&root, archive, writer, &PublicationMode::SingleWriter, 1);
+    let registry = CapabilityRegistry::new(vec![report.clone()]);
+    assert!(
+        registry
+            .allows(OperationKind::ArchiveWrite {
+                mount_identity: &root.mount_identity().unwrap(),
+                fingerprint: &report.config_fingerprint,
+                mode: &PublicationMode::SingleWriter,
+            })
+            .allowed
+    );
+    ArchiveStore::initialize_qualified(
+        &root,
+        InitArchive {
+            archive_id: archive,
+            writer_id: writer,
+        },
+        &registry,
+    )
+    .unwrap();
+    let store = ArchiveStore::open(root, archive, writer)
+        .unwrap()
+        .with_registry(registry);
+    assert!(store.require_writable().is_ok());
+    assert_eq!(store.marker().mode, PublicationMode::SingleWriter);
+}
+
+#[test]
+fn single_writer_still_requires_every_immutable_publication_probe() {
+    let r = support::TestRig::new();
+    let root = production_root(&r);
+    let report = report_without_exchange(
+        &root,
+        ArchiveId::new(),
+        WriterId::new(),
+        &PublicationMode::SingleWriter,
+        1,
+    );
+    for required in [
+        "exclusive_init",
+        "no_replace",
+        "lock_exclusion",
+        "flush_reopen",
+    ] {
+        for outcome in [
+            ProbeOutcome::Fail,
+            ProbeOutcome::Unrun,
+            ProbeOutcome::Inconclusive,
+        ] {
+            let mut incomplete = report.clone();
+            incomplete
+                .results
+                .iter_mut()
+                .find(|p| p.name == required)
+                .unwrap()
+                .outcome = outcome;
+            assert!(
+                !CapabilityRegistry::new(vec![incomplete])
+                    .allows(OperationKind::ArchiveWrite {
+                        mount_identity: &root.mount_identity().unwrap(),
+                        fingerprint: &report.config_fingerprint,
+                        mode: &PublicationMode::SingleWriter,
+                    })
+                    .allowed,
+                "{required} must pass"
+            );
+        }
+        let mut missing = report.clone();
+        missing.results.retain(|p| p.name != required);
+        assert!(
+            !CapabilityRegistry::new(vec![missing])
+                .allows(OperationKind::ArchiveWrite {
+                    mount_identity: &root.mount_identity().unwrap(),
+                    fingerprint: &report.config_fingerprint,
+                    mode: &PublicationMode::SingleWriter,
+                })
+                .allowed
+        );
+    }
+}
+
+#[test]
+fn multi_writer_still_requires_exchange_with_two_client_evidence() {
+    let r = support::TestRig::new();
+    let root = production_root(&r);
+    let mut report = report_without_exchange(
+        &root,
+        ArchiveId::new(),
+        WriterId::new(),
+        &PublicationMode::MultiWriter,
+        2,
+    );
+    report.scope = ProbeScope::TwoClient;
+    for name in ["peer_handoff", "disconnect_recovery"] {
+        report.results.push(ProbeResult {
+            name: name.into(),
+            outcome: ProbeOutcome::Pass,
+            detail: "fixture peer evidence".into(),
+        });
+    }
+    assert!(
+        !CapabilityRegistry::new(vec![report.clone()])
+            .allows(OperationKind::ArchiveWrite {
+                mount_identity: &root.mount_identity().unwrap(),
+                fingerprint: &report.config_fingerprint,
+                mode: &PublicationMode::MultiWriter,
+            })
+            .allowed
+    );
+}
+
+#[test]
+fn service_reports_imports_allowed_and_metadata_replacement_disabled() {
+    let fixture = support::service::ServiceFixture::with_config(|config, r| {
+        config.local_test_backend = false;
+        let report = report_without_exchange(
+            &production_root(r),
+            config.archive_id.unwrap(),
+            config.writer_id,
+            &PublicationMode::SingleWriter,
+            1,
+        );
+        persist_report(config, &report).unwrap();
+        std::fs::write(r.source.join("A.ORF"), b"camera original").unwrap();
+    });
+    let initialized = fixture.cli(&["archive", "init"]);
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stdout)
+    );
+    let status = fixture.status();
+    assert_eq!(status["capabilities"]["nas_publication"]["allowed"], true);
+    assert_eq!(
+        status["capabilities"]["nas_metadata_replacement"]["allowed"],
+        false
+    );
+    let imported = fixture.cli(&[
+        "import",
+        fixture.r.source.to_str().unwrap(),
+        "--wait-for",
+        "archived",
+    ]);
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stdout)
+    );
+    let audit = fixture.cli(&["verify", "--archive"]);
+    assert!(
+        audit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&audit.stdout)
+    );
+}
+
+fn store_without_exchange(r: &support::TestRig) -> ArchiveStore {
+    let root = production_root(r);
+    let archive = ArchiveId::new();
+    let writer = WriterId::new();
+    let registry = CapabilityRegistry::new(vec![report_without_exchange(
+        &root,
+        archive,
+        writer,
+        &PublicationMode::SingleWriter,
+        1,
+    )]);
+    ArchiveStore::initialize_qualified(
+        &root,
+        InitArchive {
+            archive_id: archive,
+            writer_id: writer,
+        },
+        &registry,
+    )
+    .unwrap();
+    ArchiveStore::open(root, archive, writer)
+        .unwrap()
+        .with_registry(registry)
+}
+
+fn commit_projection(store: &ArchiveStore, plan: &ProjectionPlan) -> CommittedProjection {
+    let version = Version {
+        id: plan.version,
+        sidecar: plan.sidecar,
+        parents: vec![],
+        body: plan.body.clone(),
+        origin: VersionOrigin::Observed,
+    };
+    let commit = CommitEnvelope::new(
+        store.marker().archive_id,
+        store.marker().writer_id,
+        1,
+        vec![],
+        vec![
+            ArchiveRecord::SidecarCreated {
+                id: plan.sidecar,
+                group: None,
+                path: plan.path.clone(),
+                owner: plan.owner.clone(),
+            },
+            ArchiveRecord::VersionAdded {
+                version,
+                operation: OperationId::new(),
+            },
+            ArchiveRecord::HeadsChanged {
+                sidecar: plan.sidecar,
+                expected: vec![],
+                heads: vec![plan.version],
+            },
+            ArchiveRecord::ProjectionPlanned { plan: plan.clone() },
+        ],
+    )
+    .unwrap();
+    let mut guard = store.acquire_publication().unwrap();
+    loop {
+        let batch = store.journal_batch(&mut guard, 128).unwrap();
+        let end = batch.end;
+        store.ack_journal(&mut guard, batch.token).unwrap();
+        if end {
+            break;
+        }
+    }
+    store
+        .publish_originals(
+            &mut guard,
+            PublicationPlan {
+                commit: commit.clone(),
+                staged: vec![],
+                attempt: OperationId::new(),
+            },
+            &NoFaults,
+        )
+        .unwrap();
+    store.release(guard).unwrap();
+    store.committed_projection(&commit, plan).unwrap()
+}
+
+#[test]
+fn unsupported_exchange_preserves_existing_metadata_and_allows_safe_creates() {
+    for existing in [None, Some(b"old".as_slice()), Some(b"incoming".as_slice())] {
+        let r = support::TestRig::new();
+        let store = store_without_exchange(&r);
+        let root = production_root(&r);
+        let live = ArchivePath::parse("RAW/a.ORF.rrdata").unwrap();
+        root.mkdir_all(&ArchivePath::parse("RAW").unwrap()).unwrap();
+        if let Some(bytes) = existing {
+            root.write_new(&live, bytes).unwrap();
+        }
+        let digest = Digest::of(b"incoming");
+        let staged = ArchivePath::parse(".photo-sorter/staging/history").unwrap();
+        root.write_new(&staged, b"incoming").unwrap();
+        store.store_history(&staged, &digest, 8).unwrap();
+        let plan = ProjectionPlan {
+            sidecar: SidecarId::new(),
+            path: live.clone(),
+            version: VersionId::new(),
+            expected: existing
+                .map(|bytes| VersionBody::Content {
+                    digest: Digest::of(bytes),
+                    size: bytes.len() as u64,
+                })
+                .unwrap_or(VersionBody::Reset),
+            body: VersionBody::Content {
+                digest: digest.clone(),
+                size: 8,
+            },
+            owner: "rapidraw-base".into(),
+        };
+        let proof = commit_projection(&store, &plan);
+        let staging_before = std::fs::read_dir(r.archive.join(".photo-sorter/staging"))
+            .unwrap()
+            .count();
+        let result = store.apply_projection(&proof);
+        if existing == Some(b"old".as_slice()) {
+            assert_eq!(
+                result.unwrap_err().code,
+                photo_sorter::error::ErrorCode::Unsupported
+            );
+            assert_eq!(root.read(&live, 32).unwrap(), b"old");
+            assert_eq!(
+                std::fs::read_dir(r.archive.join(".photo-sorter/staging"))
+                    .unwrap()
+                    .count(),
+                staging_before
+            );
+        } else {
+            assert!(matches!(
+                result.unwrap(),
+                ProjectionOutcome::Applied | ProjectionOutcome::AlreadyCurrent
+            ));
+            assert_eq!(root.read(&live, 32).unwrap(), b"incoming");
+        }
+        assert_eq!(
+            root.read(&history_path(&digest).unwrap(), 32).unwrap(),
+            b"incoming"
+        );
+        assert!(!store.exchange_decision().allowed);
+    }
+}
+
+#[test]
+fn unsupported_exchange_blocks_mode_change_before_administration_intent() {
+    let r = support::TestRig::new();
+    let root = production_root(&r);
+    let mut store = store_without_exchange(&r);
+    let before = store.marker().clone();
+    store = store.with_registry(CapabilityRegistry::new(vec![
+        report_without_exchange(
+            &root,
+            before.archive_id,
+            before.writer_id,
+            &PublicationMode::SingleWriter,
+            1,
+        ),
+        report_without_exchange(
+            &root,
+            before.archive_id,
+            before.writer_id,
+            &PublicationMode::SingleWriter,
+            2,
+        ),
+    ]));
+    let request = ModeChangeRequest {
+        operation: OperationId::new(),
+        expected: before.clone(),
+        mode: PublicationMode::SingleWriter,
+        new_owner: before.writer_id,
+        all_writers_quiescent: true,
+        prior_owner_stopped: true,
+        no_unresolved_io: true,
+        recover: false,
+    };
+    assert_eq!(
+        store.change_mode(request).unwrap_err().code,
+        photo_sorter::error::ErrorCode::Unsupported
+    );
+    assert_eq!(store.marker(), &before);
+    let marker: ArchiveMarker = serde_json::from_slice(
+        &root
+            .read(
+                &ArchivePath::parse(".photo-sorter/archive.json").unwrap(),
+                65536,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(marker, before);
+    for path in [
+        ".photo-sorter/mode-pending.json",
+        ".photo-sorter/modes",
+        ".photo-sorter/locks/publication",
+    ] {
+        assert!(
+            !r.archive.join(path).exists(),
+            "unsupported exchange must not create {path}"
+        );
+    }
+}
+
+#[test]
+fn unsupported_exchange_preserves_existing_metadata_on_reset() {
+    let r = support::TestRig::new();
+    let store = store_without_exchange(&r);
+    let root = production_root(&r);
+    let live = ArchivePath::parse("RAW/a.ORF.rrdata").unwrap();
+    root.mkdir_all(&ArchivePath::parse("RAW").unwrap()).unwrap();
+    root.write_new(&live, b"saved edits").unwrap();
+    let plan = ProjectionPlan {
+        sidecar: SidecarId::new(),
+        path: live.clone(),
+        version: VersionId::new(),
+        expected: VersionBody::Content {
+            digest: Digest::of(b"saved edits"),
+            size: 11,
+        },
+        body: VersionBody::Reset,
+        owner: "rapidraw-base".into(),
+    };
+    let proof = commit_projection(&store, &plan);
+    let staging_before = std::fs::read_dir(r.archive.join(".photo-sorter/staging"))
+        .unwrap()
+        .count();
+    assert_eq!(
+        store.apply_projection(&proof).unwrap_err().code,
+        photo_sorter::error::ErrorCode::Unsupported
+    );
+    assert_eq!(root.read(&live, 32).unwrap(), b"saved edits");
+    assert_eq!(
+        std::fs::read_dir(r.archive.join(".photo-sorter/staging"))
+            .unwrap()
+            .count(),
+        staging_before
+    );
+}
+
+#[test]
+fn pending_unsupported_metadata_update_does_not_block_another_import() {
+    use std::time::{Duration, Instant};
+    let fixture = support::service::ServiceFixture::with_config(|config, r| {
+        config.local_test_backend = false;
+        config.debounce_seconds = 0;
+        config.reconcile_seconds = 1;
+        config.poll_seconds = 1;
+        let report = report_without_exchange(
+            &production_root(r),
+            config.archive_id.unwrap(),
+            config.writer_id,
+            &PublicationMode::SingleWriter,
+            1,
+        );
+        persist_report(config, &report).unwrap();
+        std::fs::write(r.source.join("A.ORF"), b"original A").unwrap();
+    });
+    assert!(fixture.cli(&["archive", "init"]).status.success());
+    let first_import = fixture.cli(&[
+        "import",
+        fixture.r.source.to_str().unwrap(),
+        "--wait-for",
+        "archived",
+    ]);
+    assert!(
+        first_import.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first_import.stdout)
+    );
+    let status = fixture.status();
+    let path = status["groups"][0]["group"]["members"][0]["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let sidecar = format!("{path}.rrdata");
+    let before = br#"{"version":1,"rating":3,"adjustments":{"exposure":1},"tags":null}"#;
+    let incoming = br#"{"version":1,"rating":3,"adjustments":{"exposure":2},"tags":null}"#;
+    std::fs::write(fixture.r.local.join(&sidecar), before).unwrap();
+    let deadline = Instant::now();
+    while std::fs::read(fixture.r.archive.join(&sidecar))
+        .ok()
+        .as_deref()
+        != Some(before.as_slice())
+    {
+        assert!(
+            deadline.elapsed() < Duration::from_secs(10),
+            "initial metadata was not published: {}",
+            fixture.status()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    std::fs::write(fixture.r.local.join(&sidecar), incoming).unwrap();
+    let history = history_path(&Digest::of(incoming)).unwrap();
+    let deadline = Instant::now();
+    loop {
+        let status = fixture.status();
+        let deferred = status["worker"]["publication_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("exchange"));
+        if deferred
+            && fixture.r.archive.join(history.as_str()).exists()
+            && !fixture
+                .r
+                .archive
+                .join(".photo-sorter/locks/publication")
+                .exists()
+        {
+            break;
+        }
+        assert!(
+            deadline.elapsed() < Duration::from_secs(10),
+            "unsupported replacement did not release its session: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let second_card = fixture.r._temp.path().join("second-card");
+    std::fs::create_dir(&second_card).unwrap();
+    std::fs::write(second_card.join("B.ORF"), b"independent original").unwrap();
+    let imported = fixture.cli(&[
+        "import",
+        second_card.to_str().unwrap(),
+        "--wait-for",
+        "archived",
+    ]);
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stdout)
+    );
+    assert_eq!(
+        std::fs::read(fixture.r.archive.join(&sidecar)).unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read(fixture.r.archive.join(history.as_str())).unwrap(),
+        incoming
+    );
+    let status = fixture.status();
+    let member = status["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["group"]["members"].as_array().unwrap())
+        .find(|m| m["path"].as_str().unwrap().ends_with("B.ORF"))
+        .unwrap();
+    assert_eq!(
+        std::fs::read(fixture.r.archive.join(member["path"].as_str().unwrap())).unwrap(),
+        b"independent original"
+    );
+}
