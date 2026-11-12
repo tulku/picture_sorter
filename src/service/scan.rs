@@ -21,6 +21,7 @@ enum ScanReply {
     Batch {
         entries: Vec<SourceEntry>,
         digests: Vec<Digest>,
+        jpegs: Vec<JpegInspection>,
         skipped: u64,
     },
     Metadata(Vec<MetadataResult>),
@@ -112,13 +113,24 @@ fn next(
         .as_mut()
         .ok_or_else(|| AppError::integrity("scan not started"))?;
     *entries = inventory.next_batch(limit)?;
+    let mut jpegs = Vec::new();
     *digests = entries
         .iter()
-        .map(hash_source)
+        .map(|entry| {
+            if matches!(entry.role, SourceRole::Original(MediaRole::Jpeg)) {
+                let inspection = inspect_jpeg_source(entry)?;
+                let digest = inspection.digest.clone();
+                jpegs.push(inspection);
+                Ok(digest)
+            } else {
+                hash_source(entry)
+            }
+        })
         .collect::<AppResult<Vec<_>>>()?;
     Ok(ScanReply::Batch {
         entries: entries.clone(),
         digests: digests.clone(),
+        jpegs,
         skipped: inventory.skipped,
     })
 }
@@ -205,12 +217,29 @@ impl ScanDriver {
             ScanReply::Batch {
                 entries,
                 digests,
+                jpegs,
                 skipped,
             } => {
                 if entries.is_empty() {
                     engine.finish_scan(job, skipped)?;
                     self.active = None;
                     return Ok(());
+                }
+                for inspection in jpegs {
+                    let entry = entries
+                        .iter()
+                        .zip(&digests)
+                        .find(|(entry, digest)| {
+                            matches!(entry.role, SourceRole::Original(MediaRole::Jpeg))
+                                && **digest == inspection.digest
+                                && entry.size == inspection.size
+                        })
+                        .map(|(entry, _)| entry)
+                        .ok_or_else(|| {
+                            AppError::integrity("JPEG inspection left its scan batch")
+                        })?;
+                    entry.validate()?;
+                    engine.catalog.cache_jpeg_inspection(&inspection)?;
                 }
                 let mut paths = vec![];
                 for (entry, digest) in entries.iter().zip(&digests) {

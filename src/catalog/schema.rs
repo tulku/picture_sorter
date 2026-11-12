@@ -95,3 +95,5 @@ CREATE TABLE independent_groups(group_id TEXT PRIMARY KEY REFERENCES groups(id),
 CREATE TABLE retained_companions(sidecar TEXT PRIMARY KEY REFERENCES sidecars(id),operation TEXT NOT NULL);
 CREATE TABLE archived_versions(version TEXT PRIMARY KEY REFERENCES versions(id));
 "#;
+
+pub const JPEG_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS jpeg_fingerprints(digest TEXT NOT NULL REFERENCES blobs(digest), algorithm TEXT NOT NULL, fingerprint TEXT, PRIMARY KEY(digest,algorithm));";

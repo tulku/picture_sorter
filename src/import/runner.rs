@@ -192,6 +192,18 @@ impl ImportCoordinator {
         for (entry, digest) in entries.iter().zip(digests) {
             entry.validate()?;
             self.catalog.remember_source(entry, &identity, digest)?;
+            if matches!(entry.role, SourceRole::Original(MediaRole::Jpeg))
+                && self.catalog.jpeg_fingerprint(digest)?.is_none()
+            {
+                let inspection = inspect_jpeg_source(entry)?;
+                if inspection.digest != *digest || inspection.size != entry.size {
+                    return Err(AppError::new(
+                        ErrorCode::SourceChanged,
+                        "JPEG inspection differs from its source scan",
+                    ));
+                }
+                self.catalog.cache_jpeg_inspection(&inspection)?;
+            }
             let cached = self.catalog.metadata(digest)?;
             if cached.is_none() && matches!(entry.role, SourceRole::Original(_)) {
                 new.push(entry.clone());

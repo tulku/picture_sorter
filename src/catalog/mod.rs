@@ -1,4 +1,5 @@
 mod jobs;
+mod jpeg;
 mod models;
 pub(crate) mod schema;
 mod vfs;
@@ -80,6 +81,7 @@ CREATE TABLE IF NOT EXISTS favorite_intents(id TEXT PRIMARY KEY,group_id TEXT NO
 CREATE TABLE IF NOT EXISTS favorite_baseline_history(id TEXT PRIMARY KEY,group_id TEXT NOT NULL,body TEXT NOT NULL,source_version TEXT,pending_version TEXT);
 CREATE TABLE IF NOT EXISTS favorite_receipts(id TEXT PRIMARY KEY,intent TEXT NOT NULL REFERENCES favorite_intents(id),body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS merged_favorite_evidence(group_id TEXT NOT NULL,original_group TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(group_id,original_group));")?;
+        db.execute_batch(schema::JPEG_SCHEMA)?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
         state.sync()?;
