@@ -76,3 +76,21 @@ Outgoing Favorite writes default to disabled and require explicit Immich `best_e
 HTTP results that become uncertain remain durable across service restarts. The service checks the exact mapped JPEG and reads back before settling; it does not blindly resend an ambiguous update. Immich's API has no compare-and-set, so a user change between GET and PUT can still race. No deployment Favorite/flag qualification was performed by the build.
 
 Changing the explicitly selected JPEG or primary RAW retires unsent Favorite work and preserves the old baseline and pending metadata as history. Sent requests keep their receipts. Different JPEG assets have independent ordered queues, so an unavailable old asset cannot starve the newly selected JPEG. For a field-only readback race with Reject, the old operation and observation remain durable; a new clear requires a fresh saved-flag observation and full JPEG preflight. Path, library or media-identity changes remain blocking identity failures.
+
+## Nix package
+
+The repository flake builds `photo_sorter` and `photo_sorter_legacy` on Linux and supplies ExifTool and rsync at runtime:
+
+```sh
+nix build .
+./result/bin/photo_sorter --config /absolute/profile.toml doctor --json
+nix develop
+```
+
+A consuming NixOS flake can pin GitHub main through its lock file:
+
+```nix
+inputs.picture-sorter.url = "git+ssh://git@github.com/tulku/picture_sorter.git?ref=main";
+```
+
+Select `inputs.picture-sorter.packages.${pkgs.stdenv.hostPlatform.system}.default` in the consuming configuration. Updating that input advances the source revision; ordinary rebuilds retain the locked revision. Service/profile installation and archive qualification remain separate from building the package.
