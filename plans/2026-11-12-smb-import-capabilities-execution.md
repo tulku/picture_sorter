@@ -4,3 +4,20 @@
 - Native execution in existing clean feature worktree at db3c1bc, matching main; all planning remains on meta/superpowers-plans.
 - Pre-flight: task 1 exchange decision flows into task 2 worker status; task 3 deployment requires published and verified task 1/2 source. No interface conflict.
 - Real probe job db8376e7-97b5-4419-9562-c861e8277b8e passed four base probes but exchange returned EINVAL. Archive uninitialized; personal photos unchanged.
+- Task 1 RED: single_writer_immutable_publication_does_not_require_exchange failed at ArchiveWrite decision, confirming the overly broad gate.
+- Task 1 GREEN: all 19 qualification tests passed after splitting ArchiveExchange, retaining all base and MultiWriter checks and adding early projection/mode guards. Additional mutation-boundary regressions and worker status verification in progress before commit.
+- Mutation regressions RED: without the guards, existing metadata was replaced and mode revision advanced despite failed exchange evidence. Restoring guards makes all 22 qualification tests pass.
+- Service regression RED→GREEN: status previously omitted metadata capability; new worker/status propagation reports publication allowed and replacement denied, then imports an original to archived and verifies the archive.
+- Ruling: bump NAS implementation fingerprint v1→v2 to require a fresh probe for the split policy, preserving the failed-exchange result rather than reusing prior failed evidence implicitly.
+- Reviewer requested guarding Content→Reset as well as Content→Content to match import-only scope; additional regression/fix queued after current full-suite run. Reader/session review found no retained-publication-lock deadlock on unsupported projection.
+- Camera card detected as /dev/mmcblk0p1, OM SYSTEM; mounting read-only for later validation.
+- Review Important gap fixed with RED→GREEN Reset test: any differing existing Content now needs exchange before staging/moving. New sidecars and unchanged content remain allowed.
+- Service regression proves deferred metadata replacement retains the predecessor and immutable incoming history, releases the publication lock, and permits an independent original to archive.
+- All 24 focused qualification tests pass. Final independent review reports no Critical/Important blockers. Minor pre-existing stale mode-change capability status is deferred; real SMB mode administration stays blocked today.
+- Final full native suite/format/strict Clippy and Nix package checks running against the final source. No metadata synchronization or MultiWriter enablement was added.
+- Tasks 1/2 complete: all 401 native all-target tests, rustfmt and strict Clippy passed. Reviewed source committed/fast-forwarded to main as 6819fdf and pushed; Nix package final tests are still running.
+- Camera mounted read-only. Prepared PB111084, PB111085 and PB111086 RAW/JPEG pairs (six files, ~96 MiB) in an isolated selection directory for post-deployment validation; original card unchanged.
+- NAS Camera Syncthing folder still shares with Eskarina; native API confirms that peer disconnected. No old photo_sorter/rsync process found on NAS. Do not enable Eskarina before reviewing its legacy Camera synchronization.
+- NAS recovery snapshot created: tank/files@photo-sorter-before-init-20261112T120008Z. Personal archive remains uninitialized while awaiting deployed v2 qualification.
+- Final Nix package build passed all 401 tests. Full syl system built from locked published source 6819fdf: /nix/store/2ymxi0ppz2ayc52253qb3k95v0jy3xvv-nixos-system-syl-26.05.20261108.ac588ef.
+- Updated only picture-sorter source lock in /home/tulku/nixos; package output /nix/store/327n2m8a8ml5gapnm7wy92jpkpj9wwk2-photo-sorter-0.1.0. Awaiting user interactive sudo activation before actual v2 qualification and import.
