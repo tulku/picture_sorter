@@ -87,6 +87,10 @@ CREATE TABLE IF NOT EXISTS merged_favorite_evidence(group_id TEXT NOT NULL,origi
             tx.pragma_update(None, "user_version", schema::VERSION)?;
         }
         tx.commit()?;
+        db.execute_batch(
+            "CREATE INDEX IF NOT EXISTS members_by_group_path ON members(group_id,path);
+CREATE INDEX IF NOT EXISTS placements_by_group_readiness ON placements(group_id,local_ready);",
+        )?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
         state.sync()?;

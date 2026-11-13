@@ -29,7 +29,7 @@ impl EvictionPlanner {
         hold: u64,
     ) -> AppResult<Vec<EvictionIntent>> {
         let mut result = Vec::new();
-        let mut query=catalog.db.prepare("SELECT g.id FROM groups g JOIN residency r ON r.group_id=g.id WHERE g.id NOT IN(SELECT alias FROM aliases) ORDER BY r.last_activity,g.id")?;
+        let mut query=catalog.db.prepare("SELECT g.id FROM groups g JOIN residency r ON r.group_id=g.id WHERE g.id NOT IN(SELECT alias FROM aliases) AND g.id IN(SELECT group_id FROM placements WHERE local_ready=1) ORDER BY r.last_activity,g.id")?;
         let mut rows = query.query([])?;
         while let Some(row) = rows.next()? {
             let id: String = row.get(0)?;

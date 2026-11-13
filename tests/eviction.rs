@@ -196,3 +196,52 @@ fn only_verified_unreferenced_snapshots_collected() {
     assert_eq!(report.removed, 1);
     assert_eq!(report.bytes, 8);
 }
+
+#[test]
+fn archived_only_catalogue_does_not_make_eviction_walk_every_group() {
+    let r = support::TestRig::new();
+    let (engine, resident) = archived_fixture(&r);
+    let member = engine.catalog.group(resident).unwrap().members[0].clone();
+    let archive = engine.config.archive_id.unwrap().to_string();
+    let mut db = rusqlite::Connection::open(r.state.join("catalog.sqlite")).unwrap();
+    let tx = db.transaction().unwrap();
+    for n in 0..5000 {
+        let id = GroupId::new().to_string();
+        let path = format!("archive-only/{n}.ORF");
+        tx.execute("INSERT INTO groups(id,published) VALUES(?,1)", [&id])
+            .unwrap();
+        tx.execute("INSERT INTO residency(group_id) VALUES(?)", [&id])
+            .unwrap();
+        tx.execute(
+            "INSERT INTO members(archive,path,group_id,digest,role) VALUES(?,?,?,?,?)",
+            rusqlite::params![
+                archive,
+                path,
+                id,
+                member.digest.as_str(),
+                serde_json::to_string(&member.role).unwrap()
+            ],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO placements(id,group_id,path,digest,archived) VALUES(?,?,?,?,1)",
+            rusqlite::params![
+                uuid::Uuid::new_v4().to_string(),
+                id,
+                path,
+                member.digest.as_str()
+            ],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    let started = std::time::Instant::now();
+    let candidates = EvictionPlanner::candidates_with_hold(&engine.catalog, u64::MAX, 0).unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "archive-only groups delayed local eviction: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].group, resident);
+}
