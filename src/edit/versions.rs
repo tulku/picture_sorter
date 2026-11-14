@@ -98,6 +98,17 @@ impl<'a> VersionStore<'a> {
             },
             SnapshotPayload::Reset => VersionBody::Reset,
         };
+        let (path, owner): (String, String) = self.catalog.db.query_row(
+            "SELECT path,owner FROM sidecars WHERE id=?",
+            [intent.sidecar.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        validate_saved_path(&ArchivePath::parse(&path)?, &owner)?;
+        if owner == GENERATED_OUTPUT_OWNER && body == VersionBody::Reset {
+            return Err(AppError::integrity(
+                "generated output absence cannot reset saved content",
+            ));
+        }
         let mut parents = intent.parents.clone();
         parents.sort();
         if parents.windows(2).any(|p| p[0] == p[1]) {
@@ -261,8 +272,11 @@ impl Catalog {
         path: ArchivePath,
         owner: &str,
     ) -> AppResult<()> {
-        validate_sidecar_path(&path)?;
+        validate_saved_path(&path, owner)?;
         let group = group.map(|g| self.canonical_group(g)).transpose()?;
+        if owner == GENERATED_OUTPUT_OWNER {
+            crate::catalog::generated::validate_generated_identity(&self.db, id, group, &path)?;
+        }
         let old: Option<(Option<String>, String, String)> = self
             .db
             .query_row(

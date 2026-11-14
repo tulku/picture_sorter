@@ -7,6 +7,8 @@ mod rapidraw;
 pub use rapidraw::*;
 mod nas;
 pub use nas::*;
+mod generated;
+pub use generated::*;
 mod report;
 pub use report::*;
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +55,11 @@ pub enum OperationKind<'a> {
         fingerprint: &'a Digest,
     },
     ArchiveWrite {
+        mount_identity: &'a str,
+        fingerprint: &'a Digest,
+        mode: &'a crate::archive::PublicationMode,
+    },
+    GeneratedReplacement {
         mount_identity: &'a str,
         fingerprint: &'a Digest,
         mode: &'a crate::archive::PublicationMode,
@@ -186,6 +193,11 @@ impl CapabilityRegistry {
                 fingerprint,
                 mode,
             } => return self.archive_decision(mount_identity, fingerprint, mode, false),
+            OperationKind::GeneratedReplacement {
+                mount_identity,
+                fingerprint,
+                mode,
+            } => return self.generated_decision(mount_identity, fingerprint, mode),
             OperationKind::ArchiveExchange {
                 mount_identity,
                 fingerprint,
@@ -338,6 +350,7 @@ pub use doctor::doctor;
     deny_unknown_fields
 )]
 pub enum QualificationRequest {
+    GeneratedOutputs,
     Nas(NasProbeRequest),
     Rapidraw(EditorProbeRequest),
     Immich(ImmichProbeRequest),
@@ -347,6 +360,7 @@ pub fn validate_request(
     request: &QualificationRequest,
 ) -> crate::error::AppResult<()> {
     let request = match request {
+        QualificationRequest::GeneratedOutputs => return Ok(()),
         QualificationRequest::Nas(r) => r,
         QualificationRequest::Immich(r) => {
             let configured = config.immich.as_ref().ok_or_else(|| {
@@ -408,6 +422,16 @@ pub fn validate_request(
 }
 pub fn report_qualified(request: &QualificationRequest, report: &CapabilityReport) -> bool {
     let request = match request {
+        QualificationRequest::GeneratedOutputs => {
+            return report.capability == "nas-generated-replacement"
+                && report.tested_version == GENERATED_IMPLEMENTATION
+                && GENERATED_CHECKS.iter().all(|name| {
+                    report
+                        .results
+                        .iter()
+                        .any(|r| r.name == *name && matches!(r.outcome, ProbeOutcome::Pass))
+                });
+        }
         QualificationRequest::Nas(r) => r,
         QualificationRequest::Immich(r) => {
             return CapabilityRegistry::new(vec![report.clone()])

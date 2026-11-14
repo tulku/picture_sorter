@@ -101,3 +101,5 @@ CREATE TABLE IF NOT EXISTS jpeg_checks(item TEXT PRIMARY KEY REFERENCES import_i
 CREATE TABLE IF NOT EXISTS jpeg_duplicates(item TEXT PRIMARY KEY REFERENCES import_items(id),archive TEXT NOT NULL,canonical_group TEXT NOT NULL,canonical_path TEXT NOT NULL,canonical_digest TEXT NOT NULL REFERENCES blobs(digest),canonical_size INTEGER NOT NULL,image TEXT NOT NULL);";
 
 pub const SOURCE_CACHE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS import_source_bindings(job TEXT PRIMARY KEY REFERENCES jobs(id),incarnation TEXT NOT NULL,reliable INTEGER NOT NULL,source_root TEXT NOT NULL);";
+
+pub const GENERATED_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS generated_observations(path TEXT PRIMARY KEY,stamp TEXT,stable_since INTEGER,captured_stamp TEXT,present INTEGER);";

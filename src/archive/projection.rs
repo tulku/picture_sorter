@@ -21,6 +21,7 @@ pub fn owns_projection(owner: &str, path: &ArchivePath) -> bool {
 }
 pub struct CommittedProjection {
     plan: ProjectionPlan,
+    authorization: Option<crate::catalog::GeneratedProjectionAuthorization>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProjectionOutcome {
@@ -37,6 +38,8 @@ pub struct VersionPublication {
     pub history: Vec<StagedHistory>,
     pub projections: Vec<ProjectionPlan>,
     pub attempt: OperationId,
+    #[serde(default)]
+    pub generated_authorizations: Vec<crate::catalog::GeneratedProjectionAuthorization>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StagedHistory {
@@ -63,11 +66,47 @@ impl ArchiveStore {
             ));
         }
         if !commit.records()?.iter().any(|record|matches!(record,ArchiveRecord::ProjectionPlanned{plan:expected} if expected==plan)){return Err(AppError::integrity("projection intent not present in commit"));}
-        Ok(CommittedProjection { plan: plan.clone() })
+        Ok(CommittedProjection {
+            plan: plan.clone(),
+            authorization: None,
+        })
+    }
+    pub fn authorize_projection(
+        &self,
+        mut proof: CommittedProjection,
+        authorization: crate::catalog::GeneratedProjectionAuthorization,
+    ) -> AppResult<CommittedProjection> {
+        if !authorization.matches(self.marker.archive_id, &proof.plan) {
+            return Err(AppError::integrity(
+                "generated authorization mismatches projection",
+            ));
+        }
+        proof.authorization = Some(authorization);
+        Ok(proof)
     }
     pub fn apply_projection(&self, proof: &CommittedProjection) -> AppResult<ProjectionOutcome> {
+        self.apply_projection_with_faults(proof, &NoFaults)
+    }
+    pub fn apply_projection_with_faults(
+        &self,
+        proof: &CommittedProjection,
+        faults: &dyn FaultInjector,
+    ) -> AppResult<ProjectionOutcome> {
         self.require_writable()?;
         let plan = &proof.plan;
+        if plan.owner == GENERATED_OUTPUT_OWNER {
+            if !(self.root.is_test_archive() && self.marker.mode == PublicationMode::LocalTest)
+                && !proof
+                    .authorization
+                    .as_ref()
+                    .is_some_and(|a| a.matches(self.marker.archive_id, plan))
+            {
+                return Err(AppError::integrity(
+                    "generated projection requires fresh catalog ownership authorization",
+                ));
+            }
+            return self.apply_generated_projection(plan, faults);
+        }
         validate_sidecar_path(&plan.path)?;
         self.validate()?;
         if !owns_projection(&plan.owner, &plan.path) {
@@ -163,7 +202,7 @@ impl ArchiveStore {
         self.validate()?;
         Ok(ProjectionOutcome::Applied)
     }
-    fn observed_body(&self, path: &ArchivePath) -> AppResult<VersionBody> {
+    pub(crate) fn observed_body(&self, path: &ArchivePath) -> AppResult<VersionBody> {
         let mut file = self
             .root
             .open_relative(path, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
@@ -190,9 +229,16 @@ impl ArchiveStore {
             faults,
         )?;
         for projection in &plan.projections {
-            let proof = self.committed_projection(&plan.commit, projection)?;
+            let mut proof = self.committed_projection(&plan.commit, projection)?;
+            if let Some(authorization) = plan
+                .generated_authorizations
+                .iter()
+                .find(|a| a.matches(self.marker.archive_id, projection))
+            {
+                proof = self.authorize_projection(proof, authorization.clone())?;
+            }
             if matches!(
-                self.apply_projection(&proof)?,
+                self.apply_projection_with_faults(&proof, faults)?,
                 ProjectionOutcome::Conflict { .. }
             ) {
                 receipt.projection_pending = true;

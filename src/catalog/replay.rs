@@ -297,7 +297,9 @@ fn apply_record(
         } => {
             evidence.validate()?;
             member.validate()?;
+            super::generated::reject_generated_claim(db, &member.path)?;
             let group = super::identity::canonical(db, group)?;
+            super::generated::reject_generated_group(db, group)?;
             let old: Option<(String, String)> = db
                 .query_row(
                     "SELECT group_id,digest FROM members WHERE archive=? AND path=?",
@@ -355,10 +357,13 @@ fn apply_record(
             path,
             owner,
         } => {
-            validate_sidecar_path(&path)?;
+            validate_saved_path(&path, &owner)?;
             let group = group
                 .map(|g| super::identity::canonical(db, g))
                 .transpose()?;
+            if owner == GENERATED_OUTPUT_OWNER {
+                super::generated::validate_generated_identity(db, id, group, &path)?;
+            }
             let old: Option<(Option<String>, String, String)> = db
                 .query_row(
                     "SELECT group_id,path,owner FROM sidecars WHERE id=?",
@@ -381,6 +386,17 @@ fn apply_record(
             )?;
         }
         ArchiveRecord::VersionAdded { version, operation } => {
+            let owner: String = db.query_row(
+                "SELECT owner FROM sidecars WHERE id=?",
+                [version.sidecar.to_string()],
+                |r| r.get(0),
+            )?;
+            if owner == GENERATED_OUTPUT_OWNER && version.body == VersionBody::Reset {
+                return Err(AppError::integrity(
+                    "generated output journal cannot reset saved content",
+                ));
+            }
+
             let old: Option<(String, String, String, String)> = db
                 .query_row(
                     "SELECT sidecar,body,origin,operation FROM versions WHERE id=?",
@@ -602,4 +618,87 @@ fn apply_record(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod generated_replay_tests {
+    use super::*;
+    #[test]
+    fn generated_replay_reconstructs_owner_and_protects_camera_paths_both_ways() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::fs::RootHandle::open(dir.path(), crate::fs::RootPolicy::Local).unwrap();
+        let mut catalog = Catalog::open(&root).unwrap();
+        let group = catalog.create_group(true).unwrap();
+        let path = ArchivePath::parse("render.TIF").unwrap();
+        let id = SidecarId::new();
+        apply_record(
+            &catalog.db,
+            "archive",
+            "commit",
+            ArchiveRecord::SidecarCreated {
+                id,
+                group: Some(group),
+                path: path.clone(),
+                owner: GENERATED_OUTPUT_OWNER.into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(catalog.generated_owner(&path).unwrap().unwrap().id, id);
+        let member = OriginalMember {
+            path: ArchivePath::parse("RENDER.tif").unwrap(),
+            digest: Digest::of(b"camera"),
+            size: 6,
+            role: MediaRole::OtherStill,
+        };
+        assert!(
+            apply_record(
+                &catalog.db,
+                "archive",
+                "commit",
+                ArchiveRecord::MemberAttached {
+                    group,
+                    member,
+                    evidence: crate::catalog::PairEvidence::UserSelected {
+                        reason: "test".into()
+                    }
+                }
+            )
+            .is_err()
+        );
+        let group2 = catalog.create_group(true).unwrap();
+        let camera = OriginalMember {
+            path: ArchivePath::parse("camera.ORF").unwrap(),
+            digest: Digest::of(b"raw"),
+            size: 3,
+            role: MediaRole::Raw,
+        };
+        apply_record(
+            &catalog.db,
+            "archive",
+            "commit",
+            ArchiveRecord::MemberAttached {
+                group: group2,
+                member: camera,
+                evidence: crate::catalog::PairEvidence::UserSelected {
+                    reason: "test".into(),
+                },
+            },
+        )
+        .unwrap();
+        let group3 = catalog.create_group(true).unwrap();
+        assert!(
+            apply_record(
+                &catalog.db,
+                "archive",
+                "commit",
+                ArchiveRecord::SidecarCreated {
+                    id: SidecarId::new(),
+                    group: Some(group3),
+                    path: ArchivePath::parse("CAMERA.orf").unwrap(),
+                    owner: GENERATED_OUTPUT_OWNER.into()
+                }
+            )
+            .is_err()
+        );
+    }
 }

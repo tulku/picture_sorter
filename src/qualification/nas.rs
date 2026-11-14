@@ -168,7 +168,7 @@ fn verify(root: &RootHandle, name: &str, bytes: &[u8]) -> AppResult<()> {
     }
     Ok(())
 }
-fn basic(root: &RootHandle) -> Vec<ProbeResult> {
+pub(super) fn basic(root: &RootHandle) -> Vec<ProbeResult> {
     vec![
         result("exclusive_init", || {
             retain(root, "exclusive.json", b"owned probe")?;

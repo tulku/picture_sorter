@@ -255,6 +255,7 @@ pub fn run(base: &Path, faults: &dyn FaultInjector) {
         owner: "rapidraw-base".into(),
     };
     let metadata = persisted_plan(&state, "metadata-plan.json", || VersionPublication {
+        generated_authorizations: vec![],
         commit: CommitEnvelope::new(
             m.archive,
             m.writer,
@@ -340,6 +341,7 @@ pub fn run(base: &Path, faults: &dyn FaultInjector) {
             owner: "rapidraw-base".into(),
         };
         VersionPublication {
+            generated_authorizations: vec![],
             commit: CommitEnvelope::new(
                 m.archive,
                 m.writer,

@@ -126,11 +126,17 @@ fn capture_with_stage(
     local.require_local()?;
     state.require_local()?;
     if !path.as_str().starts_with(".photo-sorter/captures/") {
-        validate_sidecar_path(path)?;
+        validate_saved_path(path, kind.saved_owner())?;
     }
     let mut source = match local.open_relative(path, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
         Ok(file) => file,
         Err(e) if e.errno == Some(libc::ENOENT) => {
+            if kind == SidecarKind::Generated {
+                return Err(AppError::new(
+                    ErrorCode::Unavailable,
+                    "generated output is absent; last save retained",
+                ));
+            }
             let (parent, name) = local.parent(path)?;
             let wanted = name
                 .to_str()
@@ -381,7 +387,7 @@ pub(crate) fn capture_history(
     ceiling: u64,
 ) -> AppResult<SnapshotReceipt> {
     local.require_local()?;
-    validate_sidecar_path(&context.owner.path)?;
+    validate_saved_path(&context.owner.path, context.owner.kind.saved_owner())?;
     archive.validate_identity()?;
     let directory = ArchivePath::parse(&format!(
         ".photo-sorter/staging/history-capture-{}",
@@ -736,6 +742,81 @@ mod direct_history_tests {
         assert_eq!(
             archive.metadata_relative(&unused).unwrap_err().errno,
             Some(libc::ENOENT)
+        );
+    }
+}
+
+#[cfg(test)]
+mod generated_capture_tests {
+    use super::*;
+    #[test]
+    fn generated_capture_keeps_versions_and_refuses_absence_reset() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let state = temp.path().join("state");
+        std::fs::create_dir(&local).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        let local = RootHandle::open(&local, RootPolicy::Local).unwrap();
+        let state = RootHandle::open(&state, RootPolicy::Local).unwrap();
+        let mut catalog = crate::catalog::Catalog::open(&state).unwrap();
+        let path = ArchivePath::parse("render.TIF").unwrap();
+        let owner = catalog.register_generated_output(&path).unwrap();
+        local.write_new(&path, b"first save").unwrap();
+        let first = capture_local(&local, &state, &path, SidecarKind::Generated, 1024).unwrap();
+        assert_eq!(
+            first.body,
+            VersionBody::Content {
+                digest: Digest::of(b"first save"),
+                size: 10
+            }
+        );
+        let first_snapshot = first.snapshot.clone().unwrap();
+        let first_version = super::super::VersionStore::new(&mut catalog, &state)
+            .record(super::super::SnapshotIntent {
+                sidecar: owner.id,
+                parents: vec![],
+                operation: OperationId::new(),
+                payload: super::super::SnapshotPayload::Stored(
+                    StoredSnapshot::from_receipt(first, &state).unwrap(),
+                ),
+                origin: VersionOrigin::Observed,
+            })
+            .unwrap();
+        std::fs::write(local.path().join(path.as_str()), b"second save").unwrap();
+        let second = capture_local(&local, &state, &path, SidecarKind::Generated, 1024).unwrap();
+        let second_snapshot = second.snapshot.clone().unwrap();
+        let second_version = super::super::VersionStore::new(&mut catalog, &state)
+            .record(super::super::SnapshotIntent {
+                sidecar: owner.id,
+                parents: vec![first_version],
+                operation: OperationId::new(),
+                payload: super::super::SnapshotPayload::Stored(
+                    StoredSnapshot::from_receipt(second, &state).unwrap(),
+                ),
+                origin: VersionOrigin::Observed,
+            })
+            .unwrap();
+        assert_eq!(state.read(&first_snapshot, 1024).unwrap(), b"first save");
+        assert_eq!(state.read(&second_snapshot, 1024).unwrap(), b"second save");
+        drop(catalog);
+        let mut catalog = crate::catalog::Catalog::open(&state).unwrap();
+        assert_eq!(catalog.local_head(owner.id).unwrap(), Some(second_version));
+        assert_eq!(
+            catalog.version(second_version).unwrap().parents,
+            vec![first_version]
+        );
+        local.unlink(&path, false).unwrap();
+        assert!(capture_local(&local, &state, &path, SidecarKind::Generated, 1024).is_err());
+        assert!(
+            super::super::VersionStore::new(&mut catalog, &state)
+                .record(super::super::SnapshotIntent {
+                    sidecar: owner.id,
+                    parents: vec![],
+                    operation: OperationId::new(),
+                    payload: super::super::SnapshotPayload::Reset,
+                    origin: VersionOrigin::Observed
+                })
+                .is_err()
         );
     }
 }

@@ -93,6 +93,7 @@ struct Cursor {
 }
 pub struct Inventory {
     forensic: bool,
+    working: bool,
     root: Arc<RootHandle>,
     stack: Vec<Cursor>,
     pub skipped: u64,
@@ -125,6 +126,7 @@ impl Inventory {
         Ok(Self {
             root,
             forensic: false,
+            working: false,
             stack: vec![Cursor {
                 _dir: dir,
                 iter,
@@ -151,6 +153,7 @@ impl Inventory {
         Ok(Self {
             root,
             forensic: false,
+            working: false,
             stack: vec![Cursor {
                 _dir: dir,
                 iter,
@@ -159,6 +162,11 @@ impl Inventory {
             skipped: 0,
             diagnostics: vec![],
         })
+    }
+    pub fn open_working(source: RootHandle) -> AppResult<Self> {
+        let mut inventory = Self::open_all(source, None)?;
+        inventory.working = true;
+        Ok(inventory)
     }
     pub fn open_forensic(source: RootHandle) -> AppResult<Self> {
         let mut inventory = Self::open_all(source, None)?;
@@ -219,10 +227,16 @@ impl Inventory {
                 self.skip("symlink or special file excluded");
                 continue;
             }
-            let Some(role) = source_role(name).or_else(|| {
-                self.forensic
-                    .then_some(SourceRole::Companion(CompanionKind::Opaque))
-            }) else {
+            let Some(role) = source_role(name)
+                .or_else(|| {
+                    (self.working && is_generated_output_path(&path))
+                        .then_some(SourceRole::Original(MediaRole::OtherStill))
+                })
+                .or_else(|| {
+                    self.forensic
+                        .then_some(SourceRole::Companion(CompanionKind::Opaque))
+                })
+            else {
                 self.skip("unsupported source file preserved");
                 continue;
             };

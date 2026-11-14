@@ -128,6 +128,11 @@ pub(crate) fn merge(
         .iter()
         .map(|id| canonical(db, *id))
         .collect::<AppResult<BTreeSet<_>>>()?;
+    if canonical_ids.len() > 1 {
+        for id in &canonical_ids {
+            super::generated::reject_generated_group(db, *id)?;
+        }
+    }
     if canonical_ids.is_empty() {
         return Err(AppError::invalid("merge needs groups"));
     }
@@ -409,8 +414,10 @@ impl Catalog {
     ) -> AppResult<MembershipRevision> {
         evidence.validate()?;
         member.validate()?;
+        super::generated::reject_generated_claim(&self.db, &member.path)?;
         let tx = self.db.transaction()?;
         let id = canonical(&tx, id)?;
+        super::generated::reject_generated_group(&tx, id)?;
         let archive: String = tx
             .query_row("SELECT id FROM archives ORDER BY id LIMIT 1", [], |r| {
                 r.get(0)
@@ -598,5 +605,78 @@ mod rating_merge_tests {
             .optional()
             .unwrap();
         assert_eq!(chosen, Some(asset));
+    }
+}
+
+#[cfg(test)]
+mod generated_tests {
+    use super::*;
+    #[test]
+    fn generated_registration_preserves_identity_and_rejects_camera_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::fs::RootHandle::open(dir.path(), crate::fs::RootPolicy::Local).unwrap();
+        let mut catalog = Catalog::open(&root).unwrap();
+        let path = ArchivePath::parse("HDR/render.TIF").unwrap();
+        let saved = catalog.register_generated_output(&path).unwrap();
+        assert!(
+            catalog
+                .group(saved.group.unwrap())
+                .unwrap()
+                .members
+                .is_empty()
+        );
+        assert_eq!(
+            saved.id,
+            catalog.register_generated_output(&path).unwrap().id
+        );
+        assert!(
+            catalog
+                .register_generated_output(&ArchivePath::parse("hdr/RENDER.tif").unwrap())
+                .is_err()
+        );
+        let group = catalog.create_group(false).unwrap();
+        let member = OriginalMember {
+            path: path.clone(),
+            digest: Digest::of(b"camera"),
+            size: 6,
+            role: MediaRole::OtherStill,
+        };
+        assert!(
+            catalog
+                .attach_member(
+                    group,
+                    member,
+                    PairEvidence::UserSelected {
+                        reason: "test".into()
+                    }
+                )
+                .is_err()
+        );
+        let camera = ArchivePath::parse("camera.ORF").unwrap();
+        catalog
+            .attach_member(
+                group,
+                OriginalMember {
+                    path: camera,
+                    digest: Digest::of(b"raw"),
+                    size: 3,
+                    role: MediaRole::Raw,
+                },
+                PairEvidence::UserSelected {
+                    reason: "test".into(),
+                },
+            )
+            .unwrap();
+        assert!(
+            catalog
+                .register_generated_output(&ArchivePath::parse("CAMERA.orf").unwrap())
+                .is_err()
+        );
+        drop(catalog);
+        let catalog = Catalog::open(&root).unwrap();
+        let restored = catalog.generated_owner(&path).unwrap().unwrap();
+        assert_eq!(saved.id, restored.id);
+        assert_eq!(saved.group, restored.group);
+        assert_eq!(restored.kind, crate::edit::SidecarKind::Generated);
     }
 }

@@ -2,6 +2,7 @@ use crate::domain::*;
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SidecarKind {
+    Generated,
     RapidRaw,
     Rrexif,
     RawXmp,
@@ -63,4 +64,14 @@ pub fn resolve_owner(path: &ArchivePath, members: &[OriginalMember]) -> OwnerDec
         }
     }
     OwnerDecision::Unassociated
+}
+
+impl SidecarKind {
+    pub fn saved_owner(self) -> &'static str {
+        if self == Self::Generated {
+            GENERATED_OUTPUT_OWNER
+        } else {
+            "opaque"
+        }
+    }
 }

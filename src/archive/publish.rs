@@ -398,9 +398,11 @@ impl ArchiveStore {
                         return Err(AppError::integrity("commit references unavailable history"));
                     }
                 }
-                ArchiveRecord::SidecarCreated { path: sidecar, .. } => {
-                    validate_sidecar_path(&sidecar)?
-                }
+                ArchiveRecord::SidecarCreated {
+                    path: sidecar,
+                    owner,
+                    ..
+                } => validate_saved_path(&sidecar, &owner)?,
                 _ => {}
             }
         }

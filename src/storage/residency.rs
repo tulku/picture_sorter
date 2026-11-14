@@ -160,7 +160,17 @@ impl Catalog {
         let group = self.group(group)?;
         let missing:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM members m LEFT JOIN placements p ON p.group_id=m.group_id AND p.path=m.path AND p.digest=m.digest WHERE m.group_id=? AND (p.id IS NULL OR p.local_ready=0))",[group.id.to_string()],|r|r.get(0))?;
         let protection = self.protection(group.id)?;
-        let originals_ready = !group.members.is_empty() && !missing;
+        let generated: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sidecars WHERE group_id=? AND owner=?)",
+            params![group.id.to_string(), GENERATED_OUTPUT_OWNER],
+            |r| r.get(0),
+        )?;
+        let generated_saved: bool = generated && self.db.query_row("SELECT EXISTS(SELECT 1 FROM sidecars s JOIN local_heads h ON h.sidecar=s.id JOIN versions v ON v.id=h.version JOIN generated_observations o ON o.path=s.path WHERE s.group_id=? AND s.owner=? AND json_type(v.body,'$.Content')='object' AND o.present=1 AND o.captured_stamp IS NOT NULL AND o.captured_stamp=o.stamp)",params![group.id.to_string(),GENERATED_OUTPUT_OWNER], |r|r.get(0))?;
+        let originals_ready = if generated {
+            generated_saved
+        } else {
+            !group.members.is_empty() && !missing
+        };
         let no_sidecars: bool = self.db.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM sidecars WHERE group_id=?)",
             [group.id.to_string()],
@@ -170,7 +180,14 @@ impl Catalog {
         let reason = if protection.conflict {
             Some("unresolved conflict".into())
         } else if !originals_ready {
-            Some("originals are not resident".into())
+            Some(
+                if generated {
+                    "generated output requires a current local capture"
+                } else {
+                    "originals are not resident"
+                }
+                .into(),
+            )
         } else if !metadata_current {
             Some("metadata requires editor-closed refresh".into())
         } else {
@@ -189,6 +206,57 @@ impl Catalog {
 mod tests {
     use super::*;
     use crate::fs::{RootHandle, RootPolicy};
+
+    #[test]
+    fn generated_readiness_requires_a_present_matching_captured_stamp() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = RootHandle::open(directory.path(), RootPolicy::Local).unwrap();
+        let mut catalog = Catalog::open(&root).unwrap();
+        let owner = catalog
+            .register_generated_output(&ArchivePath::parse("render.tif").unwrap())
+            .unwrap();
+        let version = crate::edit::VersionStore::new(&mut catalog, &root)
+            .record(crate::edit::SnapshotIntent {
+                sidecar: owner.id,
+                parents: vec![],
+                operation: OperationId::new(),
+                payload: crate::edit::SnapshotPayload::Content(b"saved render".to_vec()),
+                origin: VersionOrigin::Observed,
+            })
+            .unwrap();
+        let group = owner.group.unwrap();
+        assert!(!catalog.readiness(group).unwrap().originals_ready);
+        catalog.db.execute("INSERT INTO generated_observations(path,stamp,captured_stamp,present) VALUES(?,'captured','captured',1)",[owner.path.as_str()]).unwrap();
+        assert!(catalog.readiness(group).unwrap().originals_ready);
+        catalog
+            .db
+            .execute("UPDATE generated_observations SET present=0", [])
+            .unwrap();
+        assert!(!catalog.readiness(group).unwrap().originals_ready);
+        catalog
+            .db
+            .execute(
+                "UPDATE generated_observations SET present=1,stamp='new-save'",
+                [],
+            )
+            .unwrap();
+        assert!(!catalog.readiness(group).unwrap().originals_ready);
+        catalog
+            .db
+            .execute("UPDATE generated_observations SET captured_stamp=NULL", [])
+            .unwrap();
+        assert!(!catalog.readiness(group).unwrap().originals_ready);
+        catalog
+            .db
+            .execute("UPDATE generated_observations SET captured_stamp=stamp", [])
+            .unwrap();
+        assert!(catalog.readiness(group).unwrap().originals_ready);
+        assert_eq!(catalog.local_head(owner.id).unwrap(), Some(version));
+        assert!(matches!(
+            catalog.version(version).unwrap().body,
+            VersionBody::Content { .. }
+        ));
+    }
 
     #[test]
     fn unchanged_reservation_poll_does_not_write_catalogue() {

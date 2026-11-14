@@ -87,6 +87,16 @@ HTTP results that become uncertain remain durable across service restarts. The s
 
 Changing the explicitly selected JPEG or primary RAW retires unsent Favorite work and preserves the old baseline and pending metadata as history. Sent requests keep their receipts. Different JPEG assets have independent ordered queues, so an unavailable old asset cannot starve the newly selected JPEG. For a field-only readback race with Reject, the old operation and observation remain durable; a new clear requires a fresh saved-flag observation and full JPEG preflight. Path, library or media-identity changes remain blocking identity failures.
 
+## Generated editing files
+
+Save rendered TIFFs, JPEGs, PNGs and supported editing projects inside Working. The service discovers new files and watches later saves, preserving saved versions in archive history and publishing the current file at the same relative NAS pathname. HDR/burst subdirectories stay in place. Camera RAW formats are excluded from automatic generated-file discovery. Existing imported camera originals retain their immutable protection; export to a new filename rather than overwriting an original.
+
+Generated files include rendered images, videos and PSD, XCF, KRA, ORA, EXR, HDR and AFPHOTO projects. Hidden, internal, temporary and partial files are excluded. Unchanged files reuse their recorded filesystem stamp across reconciliation and restarts. Saved image bytes and adjacent edit metadata are observed independently; metadata is associated by its exact generated filename.
+
+Local deletion retains the last archived save. Generated live files are initially excluded from automatic eviction. Uploads can wait for the NAS or available snapshot space; `status` shows pending generated files.
+
+Same-filename NAS updates preserve the old file and require separate generated-replacement qualification on a single-writer archive. The recovery protocol may briefly leave the visible pathname absent between retaining the old file and publishing the new one. Its journal intent and immutable history allow recovery after interruption. Ordinary metadata replacement retains its existing qualification requirements.
+
 ## Nix package
 
 The repository flake builds `photo_sorter` and `photo_sorter_legacy` on Linux and supplies ExifTool and rsync at runtime:

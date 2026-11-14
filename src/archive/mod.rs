@@ -14,3 +14,5 @@ pub use inventory::{ArchiveInventoryBatch, ArchiveObservation};
 
 mod mode;
 pub use mode::*;
+
+mod generated;

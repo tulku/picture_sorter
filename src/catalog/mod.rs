@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS merged_favorite_evidence(group_id TEXT NOT NULL,origi
         let tx = db.transaction()?;
         tx.execute_batch(schema::JPEG_SCHEMA)?;
         tx.execute_batch(schema::SOURCE_CACHE_SCHEMA)?;
+        tx.execute_batch(schema::GENERATED_SCHEMA)?;
         if version < schema::VERSION {
             tx.pragma_update(None, "user_version", schema::VERSION)?;
         }
@@ -99,7 +100,10 @@ CREATE INDEX IF NOT EXISTS members_by_archive_digest_role ON members(archive,dig
 CREATE INDEX IF NOT EXISTS placements_by_archived_member ON placements(group_id,path,digest,archived);
 CREATE INDEX IF NOT EXISTS jpeg_by_image ON jpeg_fingerprints(algorithm,fingerprint,digest);
 CREATE INDEX IF NOT EXISTS retired_import_by_digest ON retired_import_plans(json_extract(previous,'$.digest'));
-CREATE INDEX IF NOT EXISTS sidecars_by_group ON sidecars(group_id);",
+CREATE INDEX IF NOT EXISTS sidecars_by_group ON sidecars(group_id);
+CREATE INDEX IF NOT EXISTS members_path_nocase ON members(path COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS placements_path_nocase ON placements(path COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS import_destination_nocase ON import_items(destination COLLATE NOCASE);",
         )?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
@@ -173,6 +177,8 @@ pub(crate) fn encode<T: serde::Serialize>(value: &T) -> AppResult<String> {
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(value: String) -> AppResult<T> {
     Ok(serde_json::from_str(&value)?)
 }
+pub(crate) mod generated;
+pub use generated::GeneratedProjectionAuthorization;
 mod identity;
 pub use identity::{PairEvidence, PairFacts, Protection};
 mod replay;

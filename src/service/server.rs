@@ -2027,6 +2027,17 @@ impl Runtime {
                     serde_json::from_value(request.clone())?;
                 crate::qualification::validate_request(&config, &request)?;
                 match request {
+                    crate::qualification::QualificationRequest::GeneratedOutputs => {
+                        if self.nas_job_allowed(job)
+                            && self.control.is_none()
+                            && self.worker.available()?
+                        {
+                            let ticket = self
+                                .worker
+                                .submit(NasCommand::QualifyGeneratedOutputs(config.clone()))?;
+                            self.control = Some(Control { job, ticket });
+                        }
+                    }
                     crate::qualification::QualificationRequest::Nas(request) => {
                         if self.nas_job_allowed(job)
                             && self.control.is_none()

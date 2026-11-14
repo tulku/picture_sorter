@@ -206,7 +206,9 @@ impl ArchiveStore {
                         return Err(AppError::integrity("journal references corrupt original"));
                     }
                 }
-                ArchiveRecord::SidecarCreated { path, .. } => validate_sidecar_path(&path)?,
+                ArchiveRecord::SidecarCreated { path, owner, .. } => {
+                    validate_saved_path(&path, &owner)?
+                }
                 _ => {}
             }
         }

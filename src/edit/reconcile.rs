@@ -72,7 +72,9 @@ impl<'a> EditTracker<'a> {
                         .map(|g| serde_json::from_str(&format!("\"{g}\"")))
                         .transpose()?,
                     path: ArchivePath::parse(&path)?,
-                    kind: if owner == "rapidraw-base" || owner == "rapidraw-virtual" {
+                    kind: if owner == GENERATED_OUTPUT_OWNER {
+                        SidecarKind::Generated
+                    } else if owner == "rapidraw-base" || owner == "rapidraw-virtual" {
                         SidecarKind::RapidRaw
                     } else if owner == "jpeg-xmp-external" {
                         SidecarKind::JpegXmpExternal
@@ -177,6 +179,7 @@ impl EditTracker<'_> {
                             SidecarKind::RawXmp => "raw-xmp",
                             SidecarKind::JpegXmpExternal => "jpeg-xmp-external",
                             SidecarKind::Opaque => "opaque",
+                            SidecarKind::Generated => GENERATED_OUTPUT_OWNER,
                         };
                         (group, owner)
                     }

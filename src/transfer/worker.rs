@@ -45,6 +45,7 @@ pub enum NasCommand {
         writer: crate::domain::WriterId,
         request: crate::archive::ModeChangeRequest,
     },
+    QualifyGeneratedOutputs(crate::config::Config),
     QualifyNas(crate::qualification::NasProbeRequest),
     QualifyImmich(crate::qualification::ImmichProbeRequest),
     QualifyEditor(crate::qualification::EditorProbeRequest),
@@ -207,6 +208,7 @@ pub enum NasCommand {
         plan: VersionPublication,
     },
     RepairProjection {
+        authorization: Option<crate::catalog::GeneratedProjectionAuthorization>,
         session: OperationId,
         commit: CommitEnvelope,
         plan: ProjectionPlan,
@@ -903,6 +905,15 @@ impl ArchiveRuntime {
                 let mut store = self.open_store(&root, archive, writer)?;
                 store.change_mode(request).map(NasReply::Marker)
             }
+            NasCommand::QualifyGeneratedOutputs(config) => {
+                if config.local_test_backend != self.settings.local_test_backend {
+                    return Err(AppError::invalid(
+                        "probe backend differs from worker backend",
+                    ));
+                }
+                self.settings.root(&config.archive_root)?;
+                crate::qualification::qualify_generated_outputs(&config).map(NasReply::Capability)
+            }
             NasCommand::QualifyNas(request) => {
                 if request.local_test_backend != self.settings.local_test_backend {
                     return Err(AppError::invalid(
@@ -1098,12 +1109,16 @@ impl ArchiveRuntime {
                 )?))
             }
             NasCommand::RepairProjection {
+                authorization,
                 session,
                 commit,
                 plan,
             } => {
                 let (store, _) = self.session(session)?;
-                let proof = store.committed_projection(&commit, &plan)?;
+                let mut proof = store.committed_projection(&commit, &plan)?;
+                if let Some(authorization) = authorization {
+                    proof = store.authorize_projection(proof, authorization)?;
+                }
                 Ok(NasReply::Projection(store.apply_projection(&proof)?))
             }
             NasCommand::EndArchive { session } => {
@@ -1326,9 +1341,8 @@ impl LocalRuntime {
                 Ok(NasReply::Staged(receipt))
             }
             NasCommand::LocalInventoryStart { root } => {
-                self.inventory = Some(crate::import::Inventory::open_all(
+                self.inventory = Some(crate::import::Inventory::open_working(
                     self.settings.local_root(&root)?,
-                    None,
                 )?);
                 Ok(NasReply::Done)
             }

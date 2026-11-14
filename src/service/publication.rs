@@ -259,6 +259,17 @@ impl SharedPublisher {
                         NasCommand::EndArchive {
                             session: session(&active)?,
                         }
+                    } else if let Candidate::Version(version) = active.candidate
+                        && engine.catalog.db.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM archived_versions WHERE version=?)",
+                            [version.to_string()],
+                            |r| r.get::<_, bool>(0),
+                        )?
+                    {
+                        active.phase = Phase::End;
+                        NasCommand::EndArchive {
+                            session: session(&active)?,
+                        }
                     } else if let Candidate::Projection(sidecar, version) = active.candidate {
                         if engine.catalog.heads(sidecar)? != vec![version] {
                             active.phase = Phase::End;
@@ -274,10 +285,23 @@ impl SharedPublisher {
                                     "projection repair identity changed",
                                 ));
                             }
+                            let authorization = if plan.owner == GENERATED_OUTPUT_OWNER {
+                                Some(engine.catalog.authorize_generated_projection(&plan)?)
+                            } else {
+                                None
+                            };
+                            active.plan = Some(VersionPublication {
+                                commit: commit.clone(),
+                                history: vec![],
+                                projections: vec![plan.clone()],
+                                attempt: OperationId::new(),
+                                generated_authorizations: authorization.iter().cloned().collect(),
+                            });
                             active.phase = Phase::Repair;
                             NasCommand::RepairProjection {
                                 session: session(&active)?,
                                 commit,
+                                authorization,
                                 plan,
                             }
                         }
@@ -340,9 +364,23 @@ impl SharedPublisher {
                     );
                     active.phase = Phase::Abort;
                 } else {
-                    engine.catalog.db.execute(
-                        "UPDATE nas_projections SET applied=1 WHERE sidecar=? AND version=?",
-                        params![sidecar.to_string(), version.to_string()],
+                    let commit = active
+                        .plan
+                        .as_ref()
+                        .ok_or_else(|| {
+                            AppError::integrity("projection repair acknowledgment missing intent")
+                        })?
+                        .commit
+                        .clone();
+                    acknowledge(
+                        &mut engine.catalog,
+                        &active,
+                        &PublicationReceipt {
+                            commit,
+                            groups: vec![],
+                            projection_pending: false,
+                        },
+                        state,
                     )?;
                     active.phase = Phase::End;
                 }
@@ -409,7 +447,7 @@ fn select(catalog: &Catalog) -> AppResult<Option<Candidate>> {
             id.into(),
         )?)));
     }
-    let version:Option<String>=catalog.db.query_row("SELECT v.id FROM versions v JOIN sidecars s ON s.id=v.sidecar WHERE NOT EXISTS(SELECT 1 FROM archived_versions a WHERE a.version=v.id) AND NOT EXISTS(SELECT 1 FROM version_parents p WHERE p.version=v.id AND NOT EXISTS(SELECT 1 FROM archived_versions a WHERE a.version=p.parent)) AND (s.group_id IS NULL OR EXISTS(SELECT 1 FROM members m JOIN placements p ON p.group_id=m.group_id AND p.path=m.path AND p.digest=m.digest WHERE m.group_id=s.group_id AND p.archived=1 AND substr(s.path,1,length(m.path))=m.path)) AND NOT EXISTS(SELECT 1 FROM publication_failures f WHERE f.source='version:'||v.id AND f.next_attempt>?) ORDER BY v.rowid LIMIT 1",[now],|r|r.get(0)).optional()?;
+    let version:Option<String>=catalog.db.query_row("SELECT v.id FROM versions v JOIN sidecars s ON s.id=v.sidecar WHERE NOT EXISTS(SELECT 1 FROM archived_versions a WHERE a.version=v.id) AND (s.owner<>'generated-output' OR NOT EXISTS(SELECT 1 FROM nas_projections n WHERE n.sidecar=s.id AND n.applied=0)) AND NOT EXISTS(SELECT 1 FROM version_parents p WHERE p.version=v.id AND NOT EXISTS(SELECT 1 FROM archived_versions a WHERE a.version=p.parent)) AND (s.group_id IS NULL OR s.owner='generated-output' OR EXISTS(SELECT 1 FROM sidecars g JOIN versions gv ON gv.sidecar=g.id JOIN archived_versions a ON a.version=gv.id WHERE g.group_id=s.group_id AND g.owner='generated-output' AND (s.path IN(g.path||'.xmp',g.path||'.rrdata',g.path||'.rrexif',g.path||'.orig',g.path||'.pp3',g.path||'.dop',g.path||'.on1') OR (length(s.path)=length(g.path)+14 AND substr(s.path,1,length(g.path)+1)=g.path||'.' AND substr(s.path,-7)='.rrdata'))) OR EXISTS(SELECT 1 FROM members m JOIN placements p ON p.group_id=m.group_id AND p.path=m.path AND p.digest=m.digest WHERE m.group_id=s.group_id AND p.archived=1 AND substr(s.path,1,length(m.path))=m.path)) AND NOT EXISTS(SELECT 1 FROM publication_failures f WHERE f.source='version:'||v.id AND f.next_attempt>?) ORDER BY v.rowid LIMIT 1",[now],|r|r.get(0)).optional()?;
     version
         .map(|v| {
             Ok(Candidate::Version(serde_json::from_str(&format!(
@@ -603,6 +641,9 @@ fn prepare(engine: &mut ImportCoordinator, candidate: &Candidate) -> AppResult<V
                 |r| r.get(0),
             )?;
             if !shared {
+                if let Some(id) = group {
+                    records.push(ArchiveRecord::GroupCreated { id });
+                }
                 records.push(ArchiveRecord::SidecarCreated {
                     id: version.sidecar,
                     group,
@@ -756,7 +797,13 @@ fn prepare(engine: &mut ImportCoordinator, candidate: &Candidate) -> AppResult<V
         records,
     )?;
     engine.catalog.db.execute("INSERT INTO publication_revisions(source,revision,operation) SELECT ?,coalesce(max(revision),0)+1,? FROM publication_revisions WHERE source=? ON CONFLICT(operation) DO NOTHING",params![source,operation.to_string(),source])?;
+    let generated_authorizations = projections
+        .iter()
+        .filter(|p| p.owner == GENERATED_OUTPUT_OWNER)
+        .map(|p| engine.catalog.authorize_generated_projection(p))
+        .collect::<AppResult<Vec<_>>>()?;
     Ok(VersionPublication {
+        generated_authorizations,
         commit: plan.commit,
         history: vec![],
         projections,
@@ -817,20 +864,294 @@ fn acknowledge(
         [candidate_key(&active.candidate)],
     )?;
     tx.commit()?;
-    let sidecar = match active.candidate {
-        Candidate::Version(version) => Some(catalog.version(version)?.sidecar),
-        Candidate::Projection(sidecar, _) => Some(sidecar),
-        Candidate::Records(_) | Candidate::Ambiguity(_) => None,
-    };
-    if let Some(sidecar) = sidecar {
+    let mut sidecars = std::collections::BTreeSet::new();
+    let mut groups = std::collections::BTreeSet::new();
+    match active.candidate {
+        Candidate::Version(version) => {
+            sidecars.insert(catalog.version(version)?.sidecar);
+        }
+        Candidate::Projection(sidecar, _) => {
+            sidecars.insert(sidecar);
+        }
+        Candidate::Records(_) | Candidate::Ambiguity(_) => {}
+    }
+    if let Some(plan) = &active.plan {
+        for projection in &plan.projections {
+            sidecars.insert(projection.sidecar);
+        }
+        for record in plan.commit.records()? {
+            match record {
+                ArchiveRecord::GroupCreated { id } => {
+                    groups.insert(id);
+                }
+                ArchiveRecord::AmbiguityResolved { request }
+                | ArchiveRecord::SemanticAmbiguityResolved { request, .. } => {
+                    groups.extend(request.expected_memberships.iter().map(|(group, _)| *group));
+                    if let ConflictResolution::AssociateSidecar { sidecar, group } =
+                        request.resolution
+                    {
+                        sidecars.insert(sidecar);
+                        groups.insert(group);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for sidecar in sidecars {
         let group: Option<String> = catalog.db.query_row(
             "SELECT group_id FROM sidecars WHERE id=?",
             [sidecar.to_string()],
             |r| r.get(0),
         )?;
         if let Some(group) = group {
-            catalog.refresh_protection(serde_json::from_str(&format!("\"{group}\""))?)?;
+            groups.insert(group.parse()?);
         }
     }
+    for group in groups {
+        catalog.refresh_protection(catalog.canonical_group(group)?)?;
+    }
     Ok(())
+}
+#[cfg(test)]
+mod generated_order_tests {
+    use super::*;
+    use crate::fs::RootPolicy;
+    fn p(s: &str) -> ArchivePath {
+        ArchivePath::parse(s).unwrap()
+    }
+    fn body(bytes: &[u8]) -> VersionBody {
+        VersionBody::Content {
+            digest: Digest::of(bytes),
+            size: bytes.len() as u64,
+        }
+    }
+    struct StopAfterMove;
+    impl FaultInjector for StopAfterMove {
+        fn hit(&self, point: FaultPoint) -> AppResult<()> {
+            if point == FaultPoint::OriginalPublished {
+                Err(AppError::integrity("injected after old move"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    fn publish(
+        store: &ArchiveStore,
+        catalog: &mut Catalog,
+        sidecar: SidecarId,
+        group: GroupId,
+        bytes: &[u8],
+        previous: Option<&ProjectionPlan>,
+        sequence: u64,
+    ) -> (CommittedProjection, ProjectionPlan) {
+        let plan = ProjectionPlan {
+            sidecar,
+            path: p("render.tif"),
+            version: VersionId::new(),
+            expected: previous
+                .map(|p| p.body.clone())
+                .unwrap_or(VersionBody::Reset),
+            body: body(bytes),
+            owner: GENERATED_OUTPUT_OWNER.into(),
+        };
+        let source = p(&format!(
+            ".photo-sorter/staging/input-{}",
+            OperationId::new()
+        ));
+        let root = RootHandle::open(store.root_path(), RootPolicy::TestArchive).unwrap();
+        root.write_new(&source, bytes).unwrap();
+        store
+            .store_history(&source, &Digest::of(bytes), bytes.len() as u64)
+            .unwrap();
+        let parents = previous.map(|p| vec![p.version]).unwrap_or_default();
+        let mut records = vec![];
+        if previous.is_none() {
+            records.push(ArchiveRecord::GroupCreated { id: group });
+            records.push(ArchiveRecord::SidecarCreated {
+                id: sidecar,
+                group: Some(group),
+                path: plan.path.clone(),
+                owner: plan.owner.clone(),
+            });
+        }
+        records.push(ArchiveRecord::VersionAdded {
+            version: Version {
+                id: plan.version,
+                sidecar,
+                parents: parents.clone(),
+                body: plan.body.clone(),
+                origin: VersionOrigin::Observed,
+            },
+            operation: OperationId::new(),
+        });
+        records.push(ArchiveRecord::HeadsChanged {
+            sidecar,
+            expected: parents,
+            heads: vec![plan.version],
+        });
+        records.push(ArchiveRecord::ProjectionPlanned { plan: plan.clone() });
+        let commit = CommitEnvelope::new(
+            store.marker().archive_id,
+            store.marker().writer_id,
+            sequence,
+            vec![],
+            records,
+        )
+        .unwrap();
+        let mut guard = store.acquire_publication().unwrap();
+        loop {
+            let batch = store.journal_batch(&mut guard, 128).unwrap();
+            let end = batch.end;
+            store.ack_journal(&mut guard, batch.token).unwrap();
+            if end {
+                break;
+            }
+        }
+        store
+            .publish_originals(
+                &mut guard,
+                PublicationPlan {
+                    commit: commit.clone(),
+                    staged: vec![],
+                    attempt: OperationId::new(),
+                },
+                &NoFaults,
+            )
+            .unwrap();
+        store.release(guard).unwrap();
+        catalog.apply_commit(&commit).unwrap();
+        (store.committed_projection(&commit, &plan).unwrap(), plan)
+    }
+    #[test]
+    fn deferred_generated_projection_finishes_before_newer_save_advances() {
+        for after_old_move in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let archive_dir = temp.path().join("archive");
+            let state_dir = temp.path().join("state");
+            std::fs::create_dir(&archive_dir).unwrap();
+            std::fs::create_dir(&state_dir).unwrap();
+            let archive = ArchiveId::new();
+            let writer = WriterId::new();
+            let root = RootHandle::open(&archive_dir, RootPolicy::TestArchive).unwrap();
+            ArchiveStore::initialize(
+                &root,
+                InitArchive {
+                    archive_id: archive,
+                    writer_id: writer,
+                },
+            )
+            .unwrap();
+            let mut store = ArchiveStore::open(root, archive, writer).unwrap();
+            store
+                .change_mode(ModeChangeRequest {
+                    operation: OperationId::new(),
+                    expected: store.marker().clone(),
+                    mode: PublicationMode::LocalTest,
+                    new_owner: writer,
+                    all_writers_quiescent: true,
+                    prior_owner_stopped: true,
+                    no_unresolved_io: true,
+                    recover: false,
+                })
+                .unwrap();
+            let state = RootHandle::open(&state_dir, RootPolicy::Local).unwrap();
+            let mut catalog = Catalog::open(&state).unwrap();
+            let sidecar = SidecarId::new();
+            let group = GroupId::new();
+            let previous = if after_old_move {
+                let (proof, plan) = publish(&store, &mut catalog, sidecar, group, b"old", None, 1);
+                store.apply_projection(&proof).unwrap();
+                catalog
+                    .db
+                    .execute(
+                        "UPDATE nas_projections SET applied=1 WHERE sidecar=?",
+                        [sidecar.to_string()],
+                    )
+                    .unwrap();
+                Some(plan)
+            } else {
+                None
+            };
+            let (proof, plan) = publish(
+                &store,
+                &mut catalog,
+                sidecar,
+                group,
+                b"first",
+                previous.as_ref(),
+                if after_old_move { 2 } else { 1 },
+            );
+            if after_old_move {
+                assert!(
+                    store
+                        .apply_projection_with_faults(&proof, &StopAfterMove)
+                        .is_err()
+                );
+                assert!(!archive_dir.join("render.tif").exists());
+            } else {
+                assert!(
+                    !archive_dir
+                        .join(format!(".photo-sorter/generated/{sidecar}/owner.json"))
+                        .exists()
+                );
+            }
+            let newer = crate::edit::VersionStore::new(&mut catalog, &state)
+                .record(crate::edit::SnapshotIntent {
+                    sidecar,
+                    parents: vec![plan.version],
+                    operation: OperationId::new(),
+                    payload: crate::edit::SnapshotPayload::Content(b"second".to_vec()),
+                    origin: VersionOrigin::Observed,
+                })
+                .unwrap();
+            let source = format!("projection:{sidecar}:{}", plan.version);
+            catalog.db.execute("INSERT INTO publication_failures(source,next_attempt,failures,reason) VALUES(?,?,1,'injected')",params![source,SystemClock::default().now()+3600]).unwrap();
+            assert!(
+                select(&catalog).unwrap().is_none(),
+                "newer save overtook an interrupted generated projection"
+            );
+            let unrelated = catalog.register_generated_output(&p("other.tif")).unwrap();
+            let other = crate::edit::VersionStore::new(&mut catalog, &state)
+                .record(crate::edit::SnapshotIntent {
+                    sidecar: unrelated.id,
+                    parents: vec![],
+                    operation: OperationId::new(),
+                    payload: crate::edit::SnapshotPayload::Content(b"independent".to_vec()),
+                    origin: VersionOrigin::Observed,
+                })
+                .unwrap();
+            assert!(matches!(select(&catalog).unwrap(),Some(Candidate::Version(id)) if id==other));
+            catalog
+                .db
+                .execute(
+                    "INSERT INTO archived_versions(version) VALUES(?)",
+                    [other.to_string()],
+                )
+                .unwrap();
+            catalog
+                .db
+                .execute("DELETE FROM publication_failures WHERE source=?", [source])
+                .unwrap();
+            assert!(
+                matches!(select(&catalog).unwrap(),Some(Candidate::Projection(id,version)) if id==sidecar && version==plan.version)
+            );
+            assert!(matches!(
+                store.apply_projection(&proof).unwrap(),
+                ProjectionOutcome::Applied
+            ));
+            catalog
+                .db
+                .execute(
+                    "UPDATE nas_projections SET applied=1 WHERE sidecar=?",
+                    [sidecar.to_string()],
+                )
+                .unwrap();
+            assert!(matches!(select(&catalog).unwrap(),Some(Candidate::Version(id)) if id==newer));
+            assert_eq!(
+                std::fs::read(archive_dir.join("render.tif")).unwrap(),
+                b"first"
+            );
+        }
+    }
 }

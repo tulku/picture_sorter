@@ -227,6 +227,8 @@ impl Clock for ManualClock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FaultPoint {
     IntentSaved,
+    GeneratedOwnerStaged,
+    GeneratedPreparedStaged,
     BeforeProjection,
     BeforeUnlink,
     StagePartial,
@@ -295,5 +297,85 @@ impl std::str::FromStr for ArchivePath {
     type Err = AppError;
     fn from_str(s: &str) -> AppResult<Self> {
         Self::parse(s)
+    }
+}
+
+pub const GENERATED_OUTPUT_OWNER: &str = "generated-output";
+pub fn is_generated_output_path(path: &ArchivePath) -> bool {
+    if path.as_str().split('/').any(|component| {
+        let name = component.to_ascii_lowercase();
+        name.starts_with('.')
+            || name.starts_with('~')
+            || name.ends_with('~')
+            || name
+                .split('.')
+                .any(|part| matches!(part, "tmp" | "temp" | "partial" | "part"))
+    }) {
+        return false;
+    }
+    matches!(
+        MediaRole::for_filename(path.as_str()),
+        Some(MediaRole::Jpeg | MediaRole::OtherStill | MediaRole::Video)
+    ) || matches!(
+        path.as_str()
+            .rsplit('.')
+            .next()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("psd" | "xcf" | "kra" | "ora" | "exr" | "hdr" | "afphoto")
+    )
+}
+pub fn validate_saved_path(path: &ArchivePath, owner: &str) -> AppResult<()> {
+    if owner == GENERATED_OUTPUT_OWNER {
+        if !is_generated_output_path(path) {
+            return Err(AppError::integrity("invalid generated output path"));
+        }
+        Ok(())
+    } else {
+        validate_sidecar_path(path)
+    }
+}
+
+#[cfg(test)]
+mod generated_path_tests {
+    use super::*;
+    #[test]
+    fn generated_role_accepts_visible_media_and_projects_only() {
+        for name in [
+            "HDR/render.TIFF",
+            "exports/render.jpg",
+            "exports/render.mp4",
+            "edit.psd",
+            "edit.xcf",
+            "edit.kra",
+            "edit.ora",
+            "edit.exr",
+            "edit.hdr",
+            "edit.afphoto",
+        ] {
+            let path = ArchivePath::parse(name).unwrap();
+            assert!(is_generated_output_path(&path), "{name}");
+            assert!(validate_saved_path(&path, GENERATED_OUTPUT_OWNER).is_ok());
+            assert!(validate_sidecar_path(&path).is_err());
+        }
+        for name in [
+            "camera.ORF",
+            "camera.DNG",
+            "camera.CR2",
+            ".hidden.tif",
+            "HDR/.hidden/render.tif",
+            "render.tmp.tif",
+            "render.partial.tif",
+            "render.tif~",
+            "render.xmp",
+            "Thumbs.db",
+            ".photo-sorter/render.tif",
+        ] {
+            assert!(
+                !is_generated_output_path(&ArchivePath::parse(name).unwrap()),
+                "{name}"
+            );
+        }
+        assert!(validate_saved_path(&ArchivePath::parse("render.tif").unwrap(), "opaque").is_err());
     }
 }

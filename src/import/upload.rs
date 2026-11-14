@@ -746,6 +746,7 @@ fn source_owner(
                 SidecarKind::RawXmp => "raw-xmp",
                 SidecarKind::JpegXmpExternal => "jpeg-xmp-external",
                 SidecarKind::Opaque => "opaque",
+                SidecarKind::Generated => GENERATED_OUTPUT_OWNER,
             };
             return Ok(Some((Some(group), path, owner.into())));
         }

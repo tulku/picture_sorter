@@ -177,7 +177,10 @@ impl<'a> Snapshotter<'a> {
         let Some(previous) = previous else {
             return Ok(SnapshotObservation::Retry);
         };
-        if owner.kind == SidecarKind::JpegXmpExternal {
+        if matches!(
+            owner.kind,
+            SidecarKind::JpegXmpExternal | SidecarKind::Generated
+        ) {
             return Ok(SnapshotObservation::Retry);
         }
         let parent = match self.local.parent(&owner.path) {

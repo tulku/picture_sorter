@@ -136,7 +136,16 @@ impl StatusSnapshot {
             .into_iter()
             .map(|id| catalog.job(id))
             .collect::<AppResult<Vec<_>>>()?;
-        let activity = serde_json::json!({"active_count":active_count,"active":active,"recent":recent,"pending_upload":pending_upload});
+        let generated_total: u64 = catalog.db.query_row(
+            "SELECT count(*) FROM sidecars WHERE owner=?",
+            [GENERATED_OUTPUT_OWNER],
+            |row| row.get(0),
+        )?;
+        let generated_pending: u64 = catalog.db.query_row(
+            "SELECT count(*) FROM sidecars s WHERE s.owner=? AND (EXISTS(SELECT 1 FROM generated_observations o WHERE o.path=s.path AND o.present=1 AND (o.captured_stamp IS NULL OR o.captured_stamp<>o.stamp)) OR EXISTS(SELECT 1 FROM local_heads l WHERE l.sidecar=s.id AND NOT EXISTS(SELECT 1 FROM nas_projections n WHERE n.sidecar=l.sidecar AND n.version=l.version AND n.applied=1)) OR EXISTS(SELECT 1 FROM heads h WHERE h.sidecar=s.id AND NOT EXISTS(SELECT 1 FROM archived_versions a WHERE a.version=h.version)) OR EXISTS(SELECT 1 FROM nas_projections p WHERE p.sidecar=s.id AND p.applied=0))",
+            [GENERATED_OUTPUT_OWNER], |row| row.get(0),
+        )?;
+        let activity = serde_json::json!({"active_count":active_count,"active":active,"recent":recent,"pending_upload":pending_upload,"generated":{"total":generated_total,"pending":generated_pending}});
 
         Ok(Self {
             activity,
@@ -163,6 +172,46 @@ impl StatusSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_status_counts_local_saved_heads_before_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["local", "state", "archive"] {
+            std::fs::create_dir(temp.path().join(name)).unwrap();
+        }
+        let config = crate::config::Config::new(
+            temp.path().join("local"),
+            temp.path().join("state"),
+            temp.path().join("archive"),
+        );
+        let root =
+            crate::fs::RootHandle::open(&config.state_root, crate::fs::RootPolicy::Local).unwrap();
+        let mut catalog = Catalog::open(&root).unwrap();
+        let output = catalog
+            .register_generated_output(&ArchivePath::parse("render.tif").unwrap())
+            .unwrap();
+        crate::edit::VersionStore::new(&mut catalog, &root)
+            .record(crate::edit::SnapshotIntent {
+                sidecar: output.id,
+                parents: vec![],
+                operation: OperationId::new(),
+                payload: crate::edit::SnapshotPayload::Content(b"saved HDR".to_vec()),
+                origin: VersionOrigin::Observed,
+            })
+            .unwrap();
+        let engine = ImportCoordinator::new(config, catalog);
+        let status = StatusSnapshot::collect_page(
+            &engine,
+            &super::super::space::SpaceMeter::default(),
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            &super::super::protocol::StatusQuery::default(),
+        )
+        .unwrap();
+        assert_eq!(status.activity["generated"]["total"], 1);
+        assert_eq!(status.activity["generated"]["pending"], 1);
+    }
+
     #[test]
     fn activity_ignores_cancelled_uploads_and_finds_active_jobs_beyond_the_page() {
         let temp = tempfile::tempdir().unwrap();

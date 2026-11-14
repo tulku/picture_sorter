@@ -328,6 +328,18 @@ pub(super) fn status(data: &Value) -> String {
                         format!("Import {}", compact(&source.display().to_string()))
                     }
                     JobKind::LocalTransfer { .. } => "Local copy".into(),
+                    JobKind::SnapshotCapture { context, .. }
+                        if context["owner"]["kind"].as_str() == Some("Generated") =>
+                    {
+                        format!(
+                            "Saving {}",
+                            compact(
+                                context["owner"]["path"]
+                                    .as_str()
+                                    .unwrap_or("generated file")
+                            )
+                        )
+                    }
                     _ => "Background work".into(),
                 };
                 lines.push(format!("  {label}: {}", describe(&job, &entry["detail"])));
@@ -344,6 +356,16 @@ pub(super) fn status(data: &Value) -> String {
             .as_str()
             .unwrap_or("unknown")
     ));
+    if activity["generated"]["total"].as_u64().unwrap_or(0) > 0 {
+        lines.push(format!(
+            "Generated files: {} tracked; {} pending",
+            activity["generated"]["total"].as_u64().unwrap_or(0),
+            activity["generated"]["pending"].as_u64().unwrap_or(0),
+        ));
+    }
+    if let Some(reason) = data["worker"]["publication_reason"].as_str() {
+        lines.push(format!("Waiting: {}", compact(reason)));
+    }
     let space = &data["space"];
     let bytes = |value: &Value| {
         value
