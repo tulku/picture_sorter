@@ -639,6 +639,7 @@ fn record_finding(
         verified: vec![],
         checked: 0,
         verified_absent: vec![],
+        stable_failures: vec![],
         findings: vec![finding.clone()],
     };
     engine

@@ -141,6 +141,15 @@ impl Catalog {
                 .iter()
                 .find(|finding| finding.path == object.path)
             {
+                let stable_failure = report
+                    .stable_failures
+                    .iter()
+                    .find(|(path, _)| *path == object.path);
+                if stable_failure.is_some_and(|(path, stamp)| {
+                    !current_stamp(local, path).is_ok_and(|current| current == *stamp)
+                }) {
+                    continue;
+                }
                 tx.execute(
                     "DELETE FROM local_verifications WHERE path=?",
                     [object.path.as_str()],
@@ -150,6 +159,9 @@ impl Catalog {
                     params![object.path.as_str(), object.digest.as_str()],
                 )?;
                 tx.execute("INSERT INTO physical_findings(path,group_id,digest,size,status,reason) SELECT s.path,p.group_id,s.digest,s.size,?,? FROM startup_checks s JOIN placements p ON p.id=s.placement WHERE s.path=? AND s.digest=? ON CONFLICT(path) DO UPDATE SET group_id=excluded.group_id,digest=excluded.digest,size=excluded.size,status=excluded.status,reason=excluded.reason",params![format!("{:?}",finding.status),finding.reason,object.path.as_str(),object.digest.as_str()])?;
+                if let Some((_, stamp)) = stable_failure {
+                    tx.execute("INSERT INTO local_verifications(path,digest,size,stamp) VALUES(?,?,?,?) ON CONFLICT(path) DO UPDATE SET digest=excluded.digest,size=excluded.size,stamp=excluded.stamp", params![object.path.as_str(),object.digest.as_str(),object.size,serde_json::to_string(stamp)?])?;
+                }
             } else if let Some((_, stamp)) = report.verified.iter().find(|(path, stamp)| {
                 *path == object.path
                     && current_stamp(local, path).is_ok_and(|current| current == *stamp)
@@ -180,7 +192,7 @@ impl Catalog {
         present: bool,
         local: &crate::fs::RootHandle,
     ) -> AppResult<()> {
-        if self.original_verification_current(local, path)? {
+        if self.original_verification_unchanged(local, path)? {
             return Ok(());
         }
         let tx = self.db.transaction()?;
@@ -206,7 +218,7 @@ impl Catalog {
         let mut changed = Vec::new();
         for path in paths {
             let path = crate::domain::ArchivePath::parse(&path)?;
-            if !self.original_verification_current(local, &path)? {
+            if !self.original_verification_unchanged(local, &path)? {
                 changed.push(path);
             }
         }
@@ -227,7 +239,7 @@ impl Catalog {
         tx.commit()?;
         Ok(())
     }
-    fn original_verification_current(
+    fn original_verification_unchanged(
         &self,
         local: &crate::fs::RootHandle,
         path: &crate::domain::ArchivePath,
@@ -398,35 +410,164 @@ INSERT INTO startup_checks(placement,group_id,path,digest,size) VALUES('remote',
     }
     #[test]
     fn changed_worker_proof_keeps_check_pending() {
+        for initial in [b"fixture", b"invalid"] {
+            use crate::{catalog::IntegrityReport, domain::*};
+            let temp = tempfile::tempdir().unwrap();
+            let root = RootHandle::open(temp.path(), RootPolicy::Local).unwrap();
+            let mut catalog = Catalog::open(&root).unwrap();
+            let group = catalog.create_group(false).unwrap();
+            let path = ArchivePath::parse("resident.ORF").unwrap();
+            let digest = Digest::of(b"fixture");
+            let object = crate::catalog::VerifyObject {
+                path: path.clone(),
+                digest: digest.clone(),
+                size: 7,
+            };
+            std::fs::write(temp.path().join(path.as_str()), initial).unwrap();
+            catalog
+                .db
+                .execute(
+                    "INSERT INTO blobs(digest,size) VALUES(?,7)",
+                    [digest.as_str()],
+                )
+                .unwrap();
+            catalog.db.execute("INSERT INTO placements(id,group_id,path,digest,local_ready) VALUES('p',?,'resident.ORF',?,1)", rusqlite::params![group.to_string(),digest.as_str()]).unwrap();
+            catalog.queue_physical_checks(&root).unwrap();
+            let report =
+                IntegrityReport::audit_objects(&root, std::slice::from_ref(&object)).unwrap();
+            std::fs::write(temp.path().join(path.as_str()), b"changed").unwrap();
+            catalog
+                .complete_physical_checks(&root, vec![object], report)
+                .unwrap();
+            assert_eq!(pending(&catalog), 1);
+            assert!(!catalog.readiness(group).unwrap().originals_ready);
+        }
+    }
+    #[test]
+    fn unchanged_mismatch_is_not_rehashed_but_remains_unverified() {
         use crate::{catalog::IntegrityReport, domain::*};
         let temp = tempfile::tempdir().unwrap();
         let root = RootHandle::open(temp.path(), RootPolicy::Local).unwrap();
         let mut catalog = Catalog::open(&root).unwrap();
         let group = catalog.create_group(false).unwrap();
-        let path = ArchivePath::parse("resident.ORF").unwrap();
-        let digest = Digest::of(b"fixture");
+        let path = ArchivePath::parse("photo.JPG").unwrap();
+        let digest = Digest::of(b"expected");
         let object = crate::catalog::VerifyObject {
             path: path.clone(),
             digest: digest.clone(),
-            size: 7,
+            size: 8,
         };
-        std::fs::write(temp.path().join(path.as_str()), b"fixture").unwrap();
+        std::fs::write(temp.path().join(path.as_str()), b"modified").unwrap();
         catalog
             .db
             .execute(
-                "INSERT INTO blobs(digest,size) VALUES(?,7)",
+                "INSERT INTO blobs(digest,size) VALUES(?,8)",
                 [digest.as_str()],
             )
             .unwrap();
-        catalog.db.execute("INSERT INTO placements(id,group_id,path,digest,local_ready) VALUES('p',?,'resident.ORF',?,1)", rusqlite::params![group.to_string(),digest.as_str()]).unwrap();
+        catalog.db.execute("INSERT INTO placements(id,group_id,path,digest,local_ready) VALUES('p',?,'photo.JPG',?,1)",rusqlite::params![group.to_string(),digest.as_str()]).unwrap();
         catalog.queue_physical_checks(&root).unwrap();
         let report = IntegrityReport::audit_objects(&root, std::slice::from_ref(&object)).unwrap();
-        std::fs::write(temp.path().join(path.as_str()), b"changed").unwrap();
+        assert_eq!(report.findings.len(), 1);
+        catalog
+            .complete_physical_checks(&root, vec![object.clone()], report)
+            .unwrap();
+        drop(catalog);
+        let mut catalog = Catalog::open(&root).unwrap();
+        catalog.queue_physical_checks(&root).unwrap();
+        catalog.queue_observed_original(&path, true, &root).unwrap();
+        assert_eq!(
+            pending(&catalog),
+            0,
+            "unchanged failed bytes must not be reread"
+        );
+        assert_eq!(
+            catalog
+                .db
+                .query_row("SELECT local_ready FROM placements WHERE id='p'", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(catalog.db.query_row("SELECT count(*) FROM physical_findings WHERE path='photo.JPG' AND status='Corrupt'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        let explicit =
+            IntegrityReport::audit_objects(&root, std::slice::from_ref(&object)).unwrap();
+        assert_eq!(explicit.checked, 1);
+        assert_eq!(explicit.findings.len(), 1);
+        std::fs::write(temp.path().join(path.as_str()), b"expected").unwrap();
+        catalog.queue_observed_original(&path, true, &root).unwrap();
+        assert_eq!(pending(&catalog), 1);
+        let report = IntegrityReport::audit_objects(&root, std::slice::from_ref(&object)).unwrap();
         catalog
             .complete_physical_checks(&root, vec![object], report)
             .unwrap();
-        assert_eq!(pending(&catalog), 1);
-        assert!(!catalog.readiness(group).unwrap().originals_ready);
+        assert_eq!(
+            catalog
+                .db
+                .query_row("SELECT local_ready FROM placements WHERE id='p'", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            catalog
+                .db
+                .query_row("SELECT count(*) FROM physical_findings", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn changed_expectation_invalidates_failed_check() {
+        use crate::{catalog::IntegrityReport, domain::*};
+        let temp = tempfile::tempdir().unwrap();
+        let root = RootHandle::open(temp.path(), RootPolicy::Local).unwrap();
+        let mut catalog = Catalog::open(&root).unwrap();
+        let group = catalog.create_group(false).unwrap();
+        let path = ArchivePath::parse("photo.JPG").unwrap();
+        let digest = Digest::of(b"expected");
+        let object = crate::catalog::VerifyObject {
+            path: path.clone(),
+            digest: digest.clone(),
+            size: 8,
+        };
+        std::fs::write(temp.path().join(path.as_str()), b"modified").unwrap();
+        catalog
+            .db
+            .execute(
+                "INSERT INTO blobs(digest,size) VALUES(?,8)",
+                [digest.as_str()],
+            )
+            .unwrap();
+        catalog.db.execute("INSERT INTO placements(id,group_id,path,digest,local_ready) VALUES('p',?,'photo.JPG',?,1)",rusqlite::params![group.to_string(),digest.as_str()]).unwrap();
+        catalog.queue_physical_checks(&root).unwrap();
+        let report = IntegrityReport::audit_objects(&root, std::slice::from_ref(&object)).unwrap();
+        assert_eq!(report.findings.len(), 1);
+        catalog
+            .complete_physical_checks(&root, vec![object.clone()], report)
+            .unwrap();
+        let new_digest = Digest::of(b"different expectation");
+        catalog
+            .db
+            .execute(
+                "INSERT INTO blobs(digest,size) VALUES(?,21)",
+                [new_digest.as_str()],
+            )
+            .unwrap();
+        catalog
+            .db
+            .execute(
+                "UPDATE placements SET digest=? WHERE id='p'",
+                [new_digest.as_str()],
+            )
+            .unwrap();
+        catalog.queue_physical_checks(&root).unwrap();
+        assert_eq!(
+            pending(&catalog),
+            1,
+            "changed expectations must invalidate a failed check"
+        );
     }
     fn pending(catalog: &Catalog) -> u64 {
         catalog
