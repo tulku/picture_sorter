@@ -1,7 +1,7 @@
 use super::*;
 use crate::archive::*;
 use crate::{
-    domain::OperationId,
+    domain::{ArchiveId, OperationId, WriterId},
     error::{AppError, AppResult, ErrorCode},
     fs::{RootHandle, RootPolicy},
 };
@@ -207,6 +207,17 @@ pub enum NasCommand {
         session: OperationId,
         plan: VersionPublication,
     },
+    CheckHistory {
+        root: std::path::PathBuf,
+        archive: ArchiveId,
+        writer: WriterId,
+        digest: crate::domain::Digest,
+        size: u64,
+    },
+    RetireGenerated {
+        session: OperationId,
+        plan: crate::catalog::GeneratedRetentionPlan,
+    },
     RepairProjection {
         authorization: Option<crate::catalog::GeneratedProjectionAuthorization>,
         session: OperationId,
@@ -253,6 +264,8 @@ pub enum NasReply {
     Commit(CommitEnvelope),
     Published(PublicationReceipt),
     Projection(ProjectionOutcome),
+    Retained(crate::catalog::GeneratedRetentionReceipt),
+    HistoryAvailable(bool),
     Done,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1103,6 +1116,40 @@ impl ArchiveRuntime {
             NasCommand::PublishVersions { session, plan } => {
                 let (store, guard) = self.session(session)?;
                 Ok(NasReply::Published(store.publish_versions(
+                    guard,
+                    plan,
+                    &crate::domain::NoFaults,
+                )?))
+            }
+            NasCommand::CheckHistory {
+                root,
+                archive,
+                writer,
+                digest,
+                size,
+            } => {
+                let store = self.open_store(&root, archive, writer)?;
+                let available = match store.root.open_relative(
+                    &history_path(&digest)?,
+                    libc::O_RDONLY | libc::O_NONBLOCK,
+                    0,
+                ) {
+                    Ok(file) => {
+                        let metadata = file.metadata()?;
+                        if !metadata.is_file() || metadata.len() != size {
+                            return Err(AppError::integrity("history object size or type differs"));
+                        }
+                        true
+                    }
+                    Err(error) if error.errno == Some(libc::ENOENT) => false,
+                    Err(error) => return Err(error),
+                };
+                store.validate()?;
+                Ok(NasReply::HistoryAvailable(available))
+            }
+            NasCommand::RetireGenerated { session, plan } => {
+                let (store, guard) = self.session(session)?;
+                Ok(NasReply::Retained(store.retire_generated(
                     guard,
                     plan,
                     &crate::domain::NoFaults,

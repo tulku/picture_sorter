@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod generated_retention_tests;
 mod jobs;
 mod jpeg;
 mod models;
@@ -89,6 +91,7 @@ CREATE TABLE IF NOT EXISTS merged_favorite_evidence(group_id TEXT NOT NULL,origi
         tx.execute_batch(schema::JPEG_SCHEMA)?;
         tx.execute_batch(schema::SOURCE_CACHE_SCHEMA)?;
         tx.execute_batch(schema::GENERATED_SCHEMA)?;
+        tx.execute_batch(schema::GENERATED_RETENTION_SCHEMA)?;
         if version < schema::VERSION {
             tx.pragma_update(None, "user_version", schema::VERSION)?;
         }
@@ -178,7 +181,11 @@ pub(crate) fn decode<T: serde::de::DeserializeOwned>(value: String) -> AppResult
     Ok(serde_json::from_str(&value)?)
 }
 pub(crate) mod generated;
+mod generated_retention;
 pub use generated::GeneratedProjectionAuthorization;
+pub use generated_retention::{
+    GeneratedRetentionAuthorization, GeneratedRetentionPlan, GeneratedRetentionReceipt,
+};
 mod identity;
 pub use identity::{PairEvidence, PairFacts, Protection};
 mod replay;

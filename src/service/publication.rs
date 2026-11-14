@@ -30,10 +30,12 @@ enum Candidate {
     Version(VersionId),
     Records(OperationId),
     Projection(SidecarId, VersionId),
+    Retention(SidecarId, VersionId),
 }
 #[derive(Clone, Copy)]
 enum Phase {
     Stage,
+    HistoryCheck,
     History,
     Begin,
     List,
@@ -41,11 +43,27 @@ enum Phase {
     Ack,
     Publish,
     Repair,
+    Retention,
     End,
     Abort,
     Drain,
 }
 impl SharedPublisher {
+    pub fn activity(&self, catalog: &Catalog) -> AppResult<Option<String>> {
+        let Some(Active {
+            candidate: Candidate::Retention(sidecar, _),
+            ..
+        }) = self.active.as_ref()
+        else {
+            return Ok(None);
+        };
+        let path: String = catalog.db.query_row(
+            "SELECT path FROM sidecars WHERE id=?",
+            [sidecar.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(Some(format!("Cleaning superseded copies of {path}")))
+    }
     pub fn busy(&self) -> bool {
         self.active.is_some()
     }
@@ -89,30 +107,16 @@ impl SharedPublisher {
                 return Ok(());
             };
             let (phase, command) = if let Candidate::Version(version) = candidate {
-                match engine.catalog.version(version)?.body {
+                let saved = engine.catalog.version(version)?;
+                let generated: bool = engine.catalog.db.query_row(
+                    "SELECT owner=? FROM sidecars WHERE id=?",
+                    params![GENERATED_OUTPUT_OWNER, saved.sidecar.to_string()],
+                    |row| row.get(0),
+                )?;
+                match saved.body {
+                    VersionBody::Content { digest, size } if generated => (Phase::HistoryCheck, NasCommand::CheckHistory { root: config.archive_root.clone(), archive, writer: config.writer_id, digest, size }),
                     VersionBody::Content {ref digest,size} if engine.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM history_receipts WHERE archive=? AND digest=? AND size=?)",params![archive.to_string(),digest.as_str(),size],|r|r.get::<_,bool>(0))? =>(Phase::Begin,begin(&config)?),
-                    VersionBody::Content { digest, size } => {
-                        let source = crate::edit::snapshot_path(&digest)?;
-                        (
-                            Phase::Stage,
-                            NasCommand::StageArchive {
-                                archive,
-                                writer: config.writer_id,
-                                spec: TransferSpec {
-                                    job: JobId(version.0),
-                                    generation: 1,
-                                    source: SourceLocation {
-                                        root: config.state_root.clone(),
-                                        path: source,
-                                    },
-                                    destination_root: config.archive_root.clone(),
-                                    staged_path: staging_path(JobId(version.0), 1),
-                                    expected_digest: digest,
-                                    expected_size: size,
-                                },
-                            },
-                        )
-                    }
+                    VersionBody::Content { digest, size } => (Phase::Stage, stage_version(&config, archive, version, digest, size)?),
                     VersionBody::Reset => (Phase::Begin, begin(&config)?),
                 }
             } else {
@@ -199,6 +203,27 @@ impl SharedPublisher {
                     return Ok(());
                 }
             }
+            (Phase::HistoryCheck, NasReply::HistoryAvailable(available)) => {
+                if available {
+                    active.phase = Phase::Begin;
+                    begin(&config)?
+                } else {
+                    let Candidate::Version(version) = active.candidate else {
+                        return Err(AppError::integrity("history check has wrong candidate"));
+                    };
+                    let VersionBody::Content { digest, size } =
+                        engine.catalog.version(version)?.body
+                    else {
+                        return Err(AppError::integrity("history check lacks content"));
+                    };
+                    engine.catalog.db.execute(
+                        "DELETE FROM history_receipts WHERE archive=? AND digest=?",
+                        params![archive.to_string(), digest.as_str()],
+                    )?;
+                    active.phase = Phase::Stage;
+                    stage_version(&config, archive, version, digest, size)?
+                }
+            }
             (Phase::Stage, NasReply::Staged(receipt)) => {
                 let Candidate::Version(version) = active.candidate else {
                     return Err(AppError::integrity("version stage has wrong candidate"));
@@ -270,6 +295,28 @@ impl SharedPublisher {
                         NasCommand::EndArchive {
                             session: session(&active)?,
                         }
+                    } else if let Candidate::Retention(sidecar, version) = active.candidate {
+                        match engine.catalog.prepare_generated_retention(
+                            archive,
+                            config.writer_id,
+                            sidecar,
+                            version,
+                        ) {
+                            Ok(plan) => {
+                                active.phase = Phase::Retention;
+                                NasCommand::RetireGenerated {
+                                    session: session(&active)?,
+                                    plan,
+                                }
+                            }
+                            Err(error) => {
+                                self.reason = Some(error.to_string());
+                                active.phase = Phase::Abort;
+                                NasCommand::EndArchive {
+                                    session: session(&active)?,
+                                }
+                            }
+                        }
                     } else if let Candidate::Projection(sidecar, version) = active.candidate {
                         if engine.catalog.heads(sidecar)? != vec![version] {
                             active.phase = Phase::End;
@@ -331,6 +378,18 @@ impl SharedPublisher {
                         session: session(&active)?,
                         limit: 128,
                     }
+                }
+            }
+            (Phase::Retention, NasReply::Retained(receipt)) => {
+                engine.catalog.apply_commit(&receipt.commit)?;
+                engine.catalog.acknowledge_generated_retention(&receipt)?;
+                engine.catalog.db.execute(
+                    "DELETE FROM publication_failures WHERE source=?",
+                    [candidate_key(&active.candidate)],
+                )?;
+                active.phase = Phase::End;
+                NasCommand::EndArchive {
+                    session: session(&active)?,
                 }
             }
             (Phase::Publish, NasReply::Published(receipt)) => {
@@ -419,6 +478,7 @@ fn candidate_key(candidate: &Candidate) -> String {
         Candidate::Version(v) => format!("version:{v}"),
         Candidate::Projection(sidecar, version) => format!("projection:{sidecar}:{version}"),
         Candidate::Records(op) => format!("records:{op}"),
+        Candidate::Retention(sidecar, version) => format!("retention:{sidecar}:{version}"),
     }
 }
 fn defer(catalog: &mut Catalog, candidate: &Candidate, reason: &str) -> AppResult<()> {
@@ -448,13 +508,36 @@ fn select(catalog: &Catalog) -> AppResult<Option<Candidate>> {
         )?)));
     }
     let version:Option<String>=catalog.db.query_row("SELECT v.id FROM versions v JOIN sidecars s ON s.id=v.sidecar WHERE NOT EXISTS(SELECT 1 FROM archived_versions a WHERE a.version=v.id) AND (s.owner<>'generated-output' OR NOT EXISTS(SELECT 1 FROM nas_projections n WHERE n.sidecar=s.id AND n.applied=0)) AND NOT EXISTS(SELECT 1 FROM version_parents p WHERE p.version=v.id AND NOT EXISTS(SELECT 1 FROM archived_versions a WHERE a.version=p.parent)) AND (s.group_id IS NULL OR s.owner='generated-output' OR EXISTS(SELECT 1 FROM sidecars g JOIN versions gv ON gv.sidecar=g.id JOIN archived_versions a ON a.version=gv.id WHERE g.group_id=s.group_id AND g.owner='generated-output' AND (s.path IN(g.path||'.xmp',g.path||'.rrdata',g.path||'.rrexif',g.path||'.orig',g.path||'.pp3',g.path||'.dop',g.path||'.on1') OR (length(s.path)=length(g.path)+14 AND substr(s.path,1,length(g.path)+1)=g.path||'.' AND substr(s.path,-7)='.rrdata'))) OR EXISTS(SELECT 1 FROM members m JOIN placements p ON p.group_id=m.group_id AND p.path=m.path AND p.digest=m.digest WHERE m.group_id=s.group_id AND p.archived=1 AND substr(s.path,1,length(m.path))=m.path)) AND NOT EXISTS(SELECT 1 FROM publication_failures f WHERE f.source='version:'||v.id AND f.next_attempt>?) ORDER BY v.rowid LIMIT 1",[now],|r|r.get(0)).optional()?;
-    version
-        .map(|v| {
-            Ok(Candidate::Version(serde_json::from_str(&format!(
-                "\"{v}\""
-            ))?))
-        })
-        .transpose()
+    if let Some(version) = version {
+        return Ok(Some(Candidate::Version(version.parse()?)));
+    }
+    Ok(catalog
+        .generated_retention_candidate()?
+        .map(|(sidecar, version)| Candidate::Retention(sidecar, version)))
+}
+fn stage_version(
+    config: &Config,
+    archive: ArchiveId,
+    version: VersionId,
+    digest: Digest,
+    size: u64,
+) -> AppResult<NasCommand> {
+    Ok(NasCommand::StageArchive {
+        archive,
+        writer: config.writer_id,
+        spec: TransferSpec {
+            job: JobId(version.0),
+            generation: 1,
+            source: SourceLocation {
+                root: config.state_root.clone(),
+                path: crate::edit::snapshot_path(&digest)?,
+            },
+            destination_root: config.archive_root.clone(),
+            staged_path: staging_path(JobId(version.0), 1),
+            expected_digest: digest,
+            expected_size: size,
+        },
+    })
 }
 fn begin(config: &Config) -> AppResult<NasCommand> {
     Ok(NasCommand::BeginArchive {
@@ -502,7 +585,7 @@ fn prepare(engine: &mut ImportCoordinator, candidate: &Candidate) -> AppResult<V
     let mut projections = vec![];
     let mut records = vec![];
     match candidate {
-        Candidate::Projection(..) => {
+        Candidate::Projection(..) | Candidate::Retention(..) => {
             return Err(AppError::integrity(
                 "projection repair cannot create a new commit",
             ));
@@ -873,7 +956,7 @@ fn acknowledge(
         Candidate::Projection(sidecar, _) => {
             sidecars.insert(sidecar);
         }
-        Candidate::Records(_) | Candidate::Ambiguity(_) => {}
+        Candidate::Records(_) | Candidate::Ambiguity(_) | Candidate::Retention(..) => {}
     }
     if let Some(plan) = &active.plan {
         for projection in &plan.projections {

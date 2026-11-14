@@ -343,7 +343,7 @@ fn archive_history(service: &ServiceFixture, bytes: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn online_large_generated_saves_publish_latest_filename_and_exact_history() {
+fn online_large_generated_saves_keep_latest_payload_and_adjacent_metadata() {
     let service = ServiceFixture::with_config(|config, _| {
         config.debounce_seconds = 0;
         config.json_ceiling = 32;
@@ -363,7 +363,12 @@ fn online_large_generated_saves_publish_latest_filename_and_exact_history() {
     wait_for_online(&service, || {
         std::fs::read(service.r.archive.join("HDR/render.tif")).is_ok_and(|bytes| bytes == second)
     });
-    assert_eq!(archive_history(&service, &first), first);
+    let old_history = service.r.archive.join(
+        photo_sorter::archive::history_path(&photo_sorter::domain::Digest::of(&first))
+            .unwrap()
+            .as_str(),
+    );
+    wait_for_online(&service, || !old_history.exists());
     assert_eq!(archive_history(&service, &second), second);
     assert_eq!(saved_versions(&service, "HDR/render.tif"), 2);
 }
@@ -391,7 +396,12 @@ fn two_offline_generated_saves_reconnect_without_projecting_historical_save() {
         ) == 1
     });
     assert_eq!(service.status()["activity"]["generated"]["pending"], 0);
-    assert_eq!(archive_history(&service, &first), first);
+    let old_history = service.r.archive.join(
+        photo_sorter::archive::history_path(&photo_sorter::domain::Digest::of(&first))
+            .unwrap()
+            .as_str(),
+    );
+    wait_for_online(&service, || !old_history.exists());
     assert_eq!(archive_history(&service, &second), second);
     assert_eq!(
         count(
@@ -441,4 +451,122 @@ fn archived_orphan_metadata_becomes_adjacent_to_new_generated_output() {
             "SELECT count(*) FROM residency WHERE metadata_current=1 AND protected=0",
         ) == 1
     });
+}
+
+#[test]
+fn rewritten_generated_save_reclaims_old_bytes_and_can_return_to_previous_content() {
+    let mut service = ServiceFixture::with_config(|config, _| config.debounce_seconds = 0);
+    initialize_generated_archive(&service);
+    let first = b"first exported image";
+    let second = b"second exported image";
+    let working = service.r.local.join("render.tif");
+    let visible = service.r.archive.join("render.tif");
+    let first_history = service.r.archive.join(
+        photo_sorter::archive::history_path(&photo_sorter::domain::Digest::of(first))
+            .unwrap()
+            .as_str(),
+    );
+    let second_history = service.r.archive.join(
+        photo_sorter::archive::history_path(&photo_sorter::domain::Digest::of(second))
+            .unwrap()
+            .as_str(),
+    );
+    std::fs::write(&working, first).unwrap();
+    wait_for_online(&service, || {
+        std::fs::read(&visible).is_ok_and(|bytes| bytes == first)
+    });
+    std::fs::write(&working, second).unwrap();
+    wait_for_online(&service, || {
+        std::fs::read(&visible).is_ok_and(|bytes| bytes == second) && !first_history.exists()
+    });
+    assert_eq!(std::fs::read(&second_history).unwrap(), second);
+    wait_for_online(&service, || {
+        !service
+            .r
+            .archive
+            .join(".photo-sorter/locks/publication")
+            .exists()
+    });
+    service.stop();
+    let archive: String = Connection::open(service.r.state.join("catalog.sqlite"))
+        .unwrap()
+        .query_row("SELECT id FROM archives LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    Connection::open(service.r.state.join("catalog.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT OR REPLACE INTO history_receipts(archive,digest,size) VALUES(?,?,?)",
+            rusqlite::params![
+                archive,
+                photo_sorter::domain::Digest::of(first).as_str(),
+                first.len() as u64
+            ],
+        )
+        .unwrap();
+    service.restart();
+    std::fs::write(&working, first).unwrap();
+    wait_for_online(&service, || {
+        std::fs::read(&visible).is_ok_and(|bytes| bytes == first) && !second_history.exists()
+    });
+    assert_eq!(std::fs::read(first_history).unwrap(), first);
+    assert_eq!(saved_versions(&service, "render.tif"), 3);
+    wait_for_online(&service, || {
+        !service
+            .r
+            .archive
+            .join(".photo-sorter/locks/publication")
+            .exists()
+    });
+    assert_fresh_generated_replay(&service, "render.tif", first);
+}
+
+fn assert_fresh_generated_replay(service: &ServiceFixture, name: &str, bytes: &[u8]) {
+    use photo_sorter::{archive::*, catalog::*, domain::*, fs::*};
+    let marker: ArchiveMarker = serde_json::from_slice(
+        &std::fs::read(service.r.archive.join(".photo-sorter/archive.json")).unwrap(),
+    )
+    .unwrap();
+    let root = RootHandle::open(&service.r.archive, RootPolicy::TestArchive).unwrap();
+    let store = ArchiveStore::open(root, marker.archive_id, marker.writer_id).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let state = RootHandle::open(directory.path(), RootPolicy::Local).unwrap();
+    let mut catalog = Catalog::open(&state).unwrap();
+    let mut journal = store.read_only_journal().unwrap();
+    loop {
+        let page = journal.next_batch(128).unwrap();
+        for descriptor in page.entries {
+            let commit = journal.read(&descriptor.path).unwrap();
+            catalog.apply_commit(&commit).unwrap();
+        }
+        if page.end {
+            break;
+        }
+    }
+    assert!(matches!(
+        catalog.publication_readiness().unwrap(),
+        PublicationReadiness::Ready
+    ));
+    let owner = catalog
+        .generated_owner(&ArchivePath::parse(name).unwrap())
+        .unwrap()
+        .unwrap();
+    let heads = catalog.heads(owner.id).unwrap();
+    assert_eq!(heads.len(), 1);
+    assert_eq!(
+        catalog.version(heads[0]).unwrap().body,
+        VersionBody::Content {
+            digest: Digest::of(bytes),
+            size: bytes.len() as u64
+        }
+    );
+    let directory = service
+        .r
+        .archive
+        .join(format!(".photo-sorter/generated/{}", owner.id));
+    assert!(
+        !std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("retained-"))
+    );
 }

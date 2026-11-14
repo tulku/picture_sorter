@@ -596,6 +596,8 @@ impl Runtime {
                 status.capabilities["nas_metadata_replacement"] = serde_json::to_value(exchange)?;
                 status.worker["publication_reason"] =
                     serde_json::to_value(&self.shared_publisher.reason)?;
+                status.worker["publication_activity"] =
+                    serde_json::to_value(self.shared_publisher.activity(&self.engine.catalog)?)?;
                 status.watcher = serde_json::to_value(&self.observation.status)?;
                 status.watcher["physical_verification_reason"] =
                     serde_json::to_value(&self.startup.reason)?;

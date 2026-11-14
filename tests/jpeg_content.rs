@@ -213,7 +213,7 @@ fn jpeg_accounting_upgrade_preserves_existing_catalogue() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(
-        version, 2,
+        version, 3,
         "old readers must reject new duplicate-accounting states"
     );
     let duplicates: u64 = db

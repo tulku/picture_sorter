@@ -1,4 +1,4 @@
-pub const VERSION: i64 = 2;
+pub const VERSION: i64 = 3;
 pub const SCHEMA: &str = r#"
 CREATE TABLE archives(id TEXT PRIMARY KEY, writer TEXT NOT NULL, sequence INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE blobs(digest TEXT PRIMARY KEY, size INTEGER NOT NULL CHECK(size>=0), metadata TEXT, extractor TEXT);
@@ -32,7 +32,7 @@ CREATE TABLE conflicts(id TEXT PRIMARY KEY,kind TEXT NOT NULL,group_id TEXT,revi
 CREATE TABLE capabilities(id TEXT PRIMARY KEY,report TEXT NOT NULL);
 CREATE TABLE blocked_records(id TEXT PRIMARY KEY,reason TEXT NOT NULL);
 CREATE TABLE observations(path TEXT PRIMARY KEY,digest TEXT,size INTEGER,absent_since INTEGER,readable INTEGER NOT NULL DEFAULT 1,tool_digest TEXT);
-PRAGMA user_version=2;
+PRAGMA user_version=3;
 "#;
 pub const IMPORT_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS capture_facts(digest TEXT NOT NULL,path TEXT NOT NULL,context TEXT NOT NULL,camera TEXT NOT NULL,second INTEGER,payload TEXT NOT NULL,PRIMARY KEY(digest,path));
@@ -103,3 +103,10 @@ CREATE TABLE IF NOT EXISTS jpeg_duplicates(item TEXT PRIMARY KEY REFERENCES impo
 pub const SOURCE_CACHE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS import_source_bindings(job TEXT PRIMARY KEY REFERENCES jobs(id),incarnation TEXT NOT NULL,reliable INTEGER NOT NULL,source_root TEXT NOT NULL);";
 
 pub const GENERATED_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS generated_observations(path TEXT PRIMARY KEY,stamp TEXT,stable_since INTEGER,captured_stamp TEXT,present INTEGER);";
+pub const GENERATED_RETENTION_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS generated_retirement_batches(commit_id TEXT PRIMARY KEY,current TEXT NOT NULL,versions TEXT NOT NULL,envelope BLOB NOT NULL,cleaned INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS generated_retired_versions(version TEXT PRIMARY KEY REFERENCES versions(id));
+CREATE INDEX IF NOT EXISTS versions_by_content_digest ON versions(json_extract(body,'$.Content.digest'));
+CREATE INDEX IF NOT EXISTS versions_by_sidecar ON versions(sidecar);
+CREATE INDEX IF NOT EXISTS sidecars_by_owner ON sidecars(owner);
+"#;

@@ -16,3 +16,5 @@ mod mode;
 pub use mode::*;
 
 mod generated;
+
+mod retention;

@@ -52,6 +52,10 @@ pub enum ArchiveRecord {
     ProjectionPlanned {
         plan: super::ProjectionPlan,
     },
+    GeneratedPayloadsRetired {
+        current: super::ProjectionPlan,
+        versions: Vec<VersionId>,
+    },
     GroupCreated {
         id: GroupId,
     },

@@ -1,8 +1,8 @@
 use super::*;
 use crate::{archive::PublicationMode, error::AppResult, fs::RootHandle};
 pub const GENERATED_IMPLEMENTATION: &str =
-    concat!("photo-generated-replacement-v2/", env!("CARGO_PKG_VERSION"));
-pub const GENERATED_CHECKS: [&str; 10] = [
+    concat!("photo-generated-replacement-v3/", env!("CARGO_PKG_VERSION"));
+pub const GENERATED_CHECKS: [&str; 12] = [
     "first_claim",
     "replacement",
     "recover_staged",
@@ -13,6 +13,8 @@ pub const GENERATED_CHECKS: [&str; 10] = [
     "recover_published",
     "foreign_target",
     "retained_collision",
+    "retirement_cleanup",
+    "completed_retry",
 ];
 pub fn generated_fingerprint(
     root: &RootHandle,
@@ -461,7 +463,152 @@ pub fn qualify_generated_outputs(config: &Config) -> AppResult<CapabilityReport>
             checked(r.read(&foreign, 16)? == b"unknown", "foreign bytes changed")
         }));
     }
+    for name in ["retirement_cleanup", "completed_retry"] {
+        results.push(run(name, &mut |s, r, n| retention_probe(s, r, n)));
+    }
     let report=CapabilityReport{schema_version:1,capability:"nas-generated-replacement".into(),backend_or_application:if config.local_test_backend{"local-test"}else{"linux-filesystem"}.into(),tested_version:GENERATED_IMPLEMENTATION.into(),mount_identity:Some(target.mount_identity()?),config_fingerprint:fingerprint,scope:ProbeScope::SingleClient,results,limitations:vec![format!("Scratch retained at {}",scratch_path.display()),"SingleWriter only; interrupted protocol steps were resumed and bytes reopened; storage power loss was not simulated.".into()]};
     scratch.write_new(&p("report.json")?, &serde_json::to_vec(&report)?)?;
     Ok(report)
+}
+fn retention_probe(store: &ArchiveStore, root: &RootHandle, sequence: &mut u64) -> AppResult<()> {
+    let state_name = format!("retention-state-{}", OperationId::new());
+    let state_path = std::env::temp_dir().join(state_name);
+    std::fs::create_dir(&state_path)?;
+    let state = RootHandle::open(&state_path, RootPolicy::Local)?;
+    let mut catalog = crate::catalog::Catalog::open(&state)?;
+    let sidecar = SidecarId::new();
+    let group = GroupId::new();
+    let filename = format!("retirement-{}.tif", OperationId::new());
+    let mut previous = None;
+    let mut expected = VersionBody::Reset;
+    let mut old_commit_path = None;
+    let mut current = None;
+    let mut guard = store.acquire_publication()?;
+    loop {
+        let batch = store.journal_batch(&mut guard, 128)?;
+        let end = batch.end;
+        store.ack_journal(&mut guard, batch.token)?;
+        if end {
+            break;
+        }
+    }
+    for bytes in [b"old-retention".as_slice(), b"new-retention".as_slice()] {
+        *sequence += 1;
+        let staged = p(&format!(
+            ".photo-sorter/staging/retention-{}",
+            OperationId::new()
+        ))?;
+        root.write_new(&staged, bytes)?;
+        store.store_history(&staged, &Digest::of(bytes), bytes.len() as u64)?;
+        let plan = ProjectionPlan {
+            sidecar,
+            path: p(&filename)?,
+            version: VersionId::new(),
+            expected: expected.clone(),
+            body: body(bytes),
+            owner: GENERATED_OUTPUT_OWNER.into(),
+        };
+        let mut records = vec![];
+        if previous.is_none() {
+            records.push(ArchiveRecord::GroupCreated { id: group });
+            records.push(ArchiveRecord::SidecarCreated {
+                id: sidecar,
+                group: Some(group),
+                path: plan.path.clone(),
+                owner: plan.owner.clone(),
+            });
+        }
+        records.push(ArchiveRecord::VersionAdded {
+            version: Version {
+                id: plan.version,
+                sidecar,
+                parents: previous.into_iter().collect(),
+                body: plan.body.clone(),
+                origin: VersionOrigin::Observed,
+            },
+            operation: OperationId::new(),
+        });
+        records.push(ArchiveRecord::HeadsChanged {
+            sidecar,
+            expected: previous.into_iter().collect(),
+            heads: vec![plan.version],
+        });
+        records.push(ArchiveRecord::ProjectionPlanned { plan: plan.clone() });
+        let commit = CommitEnvelope::new(
+            store.marker().archive_id,
+            store.marker().writer_id,
+            *sequence,
+            vec![],
+            records,
+        )?;
+        store.publish_originals(
+            &mut guard,
+            PublicationPlan {
+                commit: commit.clone(),
+                staged: vec![],
+                attempt: OperationId::new(),
+            },
+            &NoFaults,
+        )?;
+        catalog.apply_commit(&commit)?;
+        store.committed_projection(&commit, &plan)?;
+        store.apply_generated_protocol(&plan, &NoFaults)?;
+        if previous.is_none() {
+            old_commit_path = Some(p(&format!(
+                ".photo-sorter/commits/{}/{}-{}.json",
+                commit.writer_id, commit.writer_sequence, commit.commit_id
+            ))?);
+        }
+        previous = Some(plan.version);
+        expected = plan.body.clone();
+        current = Some(plan);
+    }
+    let current = current.ok_or_else(|| AppError::integrity("scratch current missing"))?;
+    catalog
+        .db
+        .execute("UPDATE nas_projections SET applied=1", [])?;
+    let plan = catalog.prepare_generated_retention(
+        store.marker().archive_id,
+        store.marker().writer_id,
+        sidecar,
+        current.version,
+    )?;
+    *sequence = (*sequence).max(plan.commit.writer_sequence);
+    checked(
+        store
+            .retire_generated_protocol(
+                &mut guard,
+                plan.clone(),
+                &Stop(FaultPoint::GeneratedRetirementPayloadRemoved),
+            )
+            .is_err(),
+        "retirement interruption did not occur",
+    )?;
+    let receipt = store.retire_generated_protocol(&mut guard, plan, &NoFaults)?;
+    catalog.apply_commit(&receipt.commit)?;
+    catalog.acknowledge_generated_retention(&receipt)?;
+    checked(
+        root.read(&history_path(&Digest::of(b"old-retention"))?, 64)
+            .is_err_and(|e| e.errno == Some(libc::ENOENT)),
+        "obsolete scratch payload retained",
+    )?;
+    checked(
+        root.read(&history_path(&Digest::of(b"new-retention"))?, 64)? == b"new-retention",
+        "current scratch payload removed",
+    )?;
+    store.read_commit_readonly(
+        &old_commit_path.ok_or_else(|| AppError::integrity("scratch old commit missing"))?,
+    )?;
+    checked(
+        matches!(
+            store.apply_generated_protocol(&current, &NoFaults)?,
+            ProjectionOutcome::AlreadyCurrent
+        ),
+        "completed projection cannot retry after cleanup",
+    )?;
+    store.release(guard)?;
+    drop(catalog);
+    drop(state);
+    std::fs::remove_dir_all(state_path)?;
+    Ok(())
 }

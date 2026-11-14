@@ -154,9 +154,7 @@ impl ArchiveStore {
         self.validate_guard(guard)?;
         self.read_commit_readonly(relative)
     }
-    pub fn read_commit_readonly(&self, relative: &ArchivePath) -> AppResult<CommitEnvelope> {
-        crate::metrics::journal_read();
-        let _timing = crate::metrics::Timer::start(crate::metrics::Stage::Journal);
+    pub(super) fn read_commit_raw(&self, relative: &ArchivePath) -> AppResult<CommitEnvelope> {
         self.validate()?;
         if !relative.as_str().starts_with(".photo-sorter/commits/") {
             return Err(AppError::invalid("not a journal path"));
@@ -174,23 +172,37 @@ impl ArchiveStore {
                 "commit filename disagrees with envelope",
             ));
         }
+        Ok(commit)
+    }
+    pub fn read_commit_readonly(&self, relative: &ArchivePath) -> AppResult<CommitEnvelope> {
+        crate::metrics::journal_read();
+        let _timing = crate::metrics::Timer::start(crate::metrics::Stage::Journal);
+        let commit = self.read_commit_raw(relative)?;
         for record in commit.records()? {
             match record {
-                ArchiveRecord::VersionAdded {
-                    version:
-                        Version {
-                            body: VersionBody::Content { digest, size },
-                            ..
-                        },
-                    ..
-                } => {
-                    let mut file = self
-                        .root
-                        .open_relative(&history_path(&digest)?, libc::O_RDONLY, 0)
-                        .map_err(|_| {
-                            AppError::integrity("journal references missing history payload")
-                        })?;
-                    if crate::transfer::digest_file(&mut file)? != (digest, size) {
+                ArchiveRecord::VersionAdded { version, .. } => {
+                    let VersionBody::Content { digest, size } = &version.body else {
+                        continue;
+                    };
+                    let mut file = match self.root.open_relative(
+                        &history_path(digest)?,
+                        libc::O_RDONLY | libc::O_NONBLOCK,
+                        0,
+                    ) {
+                        Ok(file) => file,
+                        Err(e)
+                            if e.errno == Some(libc::ENOENT)
+                                && self.retired_version_proven(&version)? =>
+                        {
+                            continue;
+                        }
+                        Err(_) => {
+                            return Err(AppError::integrity(
+                                "journal references missing history payload",
+                            ));
+                        }
+                    };
+                    if crate::transfer::digest_file(&mut file)? != (digest.clone(), *size) {
                         return Err(AppError::integrity(
                             "journal references corrupt history payload",
                         ));

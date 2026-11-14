@@ -1305,6 +1305,8 @@ mod generated_observation_tests {
             .find(|path| path.is_file())
             .unwrap();
         let response = temp.path().join("response");
+        let fifo_name = std::ffi::CString::new(response.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
         let executable = temp.path().join("capture-worker");
         std::fs::write(&executable,format!("#!{}\nwhile read -r command; do while IFS= read -r reply; do printf '%s\\n' \"$reply\"; done < '{}'; done\n",shell.display(),response.display())).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();

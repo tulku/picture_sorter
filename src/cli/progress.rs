@@ -363,6 +363,9 @@ pub(super) fn status(data: &Value) -> String {
             activity["generated"]["pending"].as_u64().unwrap_or(0),
         ));
     }
+    if let Some(activity) = data["worker"]["publication_activity"].as_str() {
+        lines.push(compact(activity));
+    }
     if let Some(reason) = data["worker"]["publication_reason"].as_str() {
         lines.push(format!("Waiting: {}", compact(reason)));
     }

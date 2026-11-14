@@ -113,6 +113,18 @@ impl ArchiveStore {
             directory.as_str(),
             plan.version
         ))?;
+        let completed = path(&format!(
+            "{}/completed-{}.json",
+            directory.as_str(),
+            plan.version
+        ))?;
+        let completed_bytes = serde_json::to_vec(plan)?;
+        let complete = match self.root.read(&completed, 65536) {
+            Ok(bytes) if bytes == completed_bytes => true,
+            Ok(_) => return Err(AppError::integrity("generated completion intent differs")),
+            Err(e) if e.errno == Some(libc::ENOENT) => false,
+            Err(e) => return Err(e),
+        };
         let retained_body = self.generated_body(&retained)?;
         let observed = self.generated_body(&plan.path)?;
         if retained_body != VersionBody::Reset && retained_body != plan.expected {
@@ -132,8 +144,14 @@ impl ArchiveStore {
         if ready
             && staged_body == VersionBody::Reset
             && observed == plan.body
-            && (plan.expected == VersionBody::Reset || retained_body == plan.expected)
+            && (complete || plan.expected == VersionBody::Reset || retained_body == plan.expected)
         {
+            self.publish_generated_marker(
+                &completed,
+                &completed_bytes,
+                FaultPoint::GeneratedCompletedStaged,
+                faults,
+            )?;
             return Ok(ProjectionOutcome::AlreadyCurrent);
         }
         if observed != plan.expected
@@ -209,16 +227,31 @@ impl ArchiveStore {
             });
         }
         faults.hit(FaultPoint::ProjectionPublished)?;
+        if self.generated_body(&plan.path)? != plan.body {
+            return Err(AppError::integrity("generated visible bytes differ"));
+        }
+        self.publish_generated_marker(
+            &completed,
+            &completed_bytes,
+            FaultPoint::GeneratedCompletedStaged,
+            faults,
+        )?;
         self.validate()?;
         Ok(ProjectionOutcome::Applied)
     }
-    fn publish_generated_marker(
+    pub(super) fn publish_generated_marker(
         &self,
         destination: &ArchivePath,
         bytes: &[u8],
         point: FaultPoint,
         faults: &dyn FaultInjector,
     ) -> AppResult<()> {
+        match self.root.read(destination, 65536) {
+            Ok(existing) if existing == bytes => return Ok(()),
+            Ok(_) => return Err(AppError::integrity("generated marker publication collided")),
+            Err(e) if e.errno == Some(libc::ENOENT) => {}
+            Err(e) => return Err(e),
+        }
         let (directory, _) = destination
             .as_str()
             .rsplit_once('/')
@@ -233,7 +266,28 @@ impl ArchiveStore {
         }
         Ok(())
     }
-    fn generated_body(&self, path: &ArchivePath) -> AppResult<VersionBody> {
+    pub(super) fn verify_generated_owner(&self, plan: &ProjectionPlan) -> AppResult<()> {
+        if plan.owner != GENERATED_OUTPUT_OWNER {
+            return Err(AppError::integrity("retirement owner is not generated"));
+        }
+        validate_saved_path(&plan.path, &plan.owner)?;
+        let expected = GeneratedOwner {
+            schema_version: 1,
+            archive: self.marker.archive_id,
+            sidecar: plan.sidecar,
+            path: plan.path.clone(),
+            owner: plan.owner.clone(),
+        };
+        let manifest = path(&format!(
+            ".photo-sorter/generated/{}/owner.json",
+            plan.sidecar
+        ))?;
+        if self.root.read(&manifest, 65536)? != serde_json::to_vec(&expected)? {
+            return Err(AppError::integrity("generated owner manifest differs"));
+        }
+        Ok(())
+    }
+    pub(super) fn generated_body(&self, path: &ArchivePath) -> AppResult<VersionBody> {
         match self.observed_body(path) {
             Err(e) if e.errno == Some(libc::ENOENT) => Ok(VersionBody::Reset),
             other => other,

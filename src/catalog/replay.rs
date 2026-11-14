@@ -280,6 +280,9 @@ fn apply_record(
             }
             db.execute("INSERT INTO projections(sidecar,committed,pending) VALUES(?,?,1) ON CONFLICT(sidecar) DO UPDATE SET committed=excluded.committed,pending=1",params![sidecar,encode(&plan)?])?;
         }
+        ArchiveRecord::GeneratedPayloadsRetired { current, versions } => {
+            super::generated_retention::apply_retirement(db, commit_id, &current, &versions)?;
+        }
         ArchiveRecord::GroupCreated { id } => {
             db.execute("INSERT INTO groups(id,published) VALUES(?,1) ON CONFLICT(id) DO UPDATE SET published=1",[id.to_string()])?;
             db.execute(
