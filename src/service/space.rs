@@ -11,6 +11,9 @@ pub(crate) struct SpaceMeter {
     retry_after: Timestamp,
 }
 impl SpaceMeter {
+    pub(crate) fn retry_deadline(&self) -> Timestamp {
+        self.retry_after
+    }
     pub fn advance(
         &mut self,
         config: &Config,

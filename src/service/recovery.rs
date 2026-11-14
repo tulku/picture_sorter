@@ -47,6 +47,9 @@ pub(crate) struct StartupVerifier {
     )>,
 }
 impl StartupVerifier {
+    pub(crate) fn retry_deadline(&self) -> crate::domain::Timestamp {
+        self.retry_at
+    }
     pub fn advance(
         &mut self,
         engine: &mut crate::import::ImportCoordinator,

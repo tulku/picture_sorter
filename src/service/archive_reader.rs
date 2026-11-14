@@ -65,6 +65,9 @@ struct RebuildIntent {
     writer: WriterId,
 }
 impl ArchiveReader {
+    pub(crate) fn retry_deadline(&self) -> Timestamp {
+        if self.requested { self.retry_at } else { 0 }
+    }
     pub fn request_fresh_sync(&mut self) -> u64 {
         self.requested = true;
         self.retry_at = 0;

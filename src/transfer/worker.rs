@@ -577,6 +577,26 @@ impl WorkerSupervisor {
     pub fn nas_exchange_decision(&self) -> Option<crate::qualification::CapabilityDecision> {
         self.nas_exchange_decision.clone()
     }
+    pub(crate) fn pending(&self) -> bool {
+        self.pending.is_some()
+    }
+    pub(crate) fn wait_descriptors(&mut self, fds: &mut Vec<libc::pollfd>) -> AppResult<()> {
+        if self.pending.is_some() && self.child.try_wait()?.is_none() {
+            fds.push(libc::pollfd {
+                fd: self.output.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            if !self.send.is_empty() {
+                fds.push(libc::pollfd {
+                    fd: self.input.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                });
+            }
+        }
+        Ok(())
+    }
     pub fn latest_ticket(&self) -> Option<WorkerTicket> {
         self.pending
             .or(self.completed.as_ref().map(|(ticket, _)| *ticket))
@@ -629,6 +649,10 @@ impl WorkerSupervisor {
             }
         }
         Ok(())
+    }
+    pub(crate) fn remaining_timeout(&self, deadline: Duration) -> Option<Duration> {
+        (self.pending.is_some() && !self.timed_out)
+            .then(|| deadline.saturating_sub(self.started.elapsed()))
     }
     pub fn timeout(&mut self, deadline: Duration) {
         if self.pending.is_some() && self.started.elapsed() >= deadline {

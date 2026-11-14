@@ -43,7 +43,11 @@ fn startup_reconciles_partials_reservations() {
         .unwrap();
     cat.reserve(job, photo_sorter::storage::FilesystemId(1), 42)
         .unwrap();
-    let report = photo_sorter::service::ServiceRecovery::restore(&mut cat).unwrap();
+    let report = photo_sorter::service::ServiceRecovery::restore(
+        &mut cat,
+        &RootHandle::open(&r.local, RootPolicy::Local).unwrap(),
+    )
+    .unwrap();
     assert_eq!(report.retained_reservations, 1);
     assert_eq!(
         cat.remaining_reservations(photo_sorter::storage::FilesystemId(1))
@@ -103,22 +107,26 @@ fn actual_local_transfer_reserves_before_dispatch_and_reconciles_partial() {
 }
 #[test]
 fn persistent_failure_backoff() {
-    use photo_sorter::service::*;
-    let config = Config::default();
-    let mut scheduler = Scheduler::new(&config);
-    let job = JobId::new();
-    scheduler.tick(100).unwrap();
-    scheduler.handle(ServiceEvent::Failed(job)).unwrap();
-    assert!(!scheduler.may_retry(job));
-    let (failures, at) = scheduler.retry_state(job).unwrap();
-    let mut restored = Scheduler::new(&config);
-    restored.restore_retry(job, failures, at);
-    restored.tick(100).unwrap();
-    assert!(!restored.may_retry(job));
-    restored.tick(101).unwrap();
-    assert!(restored.may_retry(job));
-    restored.handle(ServiceEvent::Failed(job)).unwrap();
-    assert_eq!(restored.retry_state(job).unwrap().1, 103);
+    let rig = TestRig::new();
+    let state = RootHandle::open(&rig.state, RootPolicy::Local).unwrap();
+    let mut catalog = Catalog::open(&state).unwrap();
+    let job = catalog
+        .enqueue(DurableRequest {
+            operation_id: OperationId::new(),
+            kind: JobKind::Clean,
+        })
+        .unwrap();
+    catalog.defer_job(job, 100, "offline").unwrap();
+    assert!(!catalog.job_is_due(job, 100).unwrap());
+    drop(catalog);
+    let mut catalog = Catalog::open(&state).unwrap();
+    assert!(!catalog.job_is_due(job, 100).unwrap());
+    assert!(catalog.job_is_due(job, 101).unwrap());
+    catalog.defer_job(job, 101, "offline").unwrap();
+    assert!(!catalog.job_is_due(job, 102).unwrap());
+    assert!(catalog.job_is_due(job, 103).unwrap());
+    catalog.clear_retry(job).unwrap();
+    assert!(catalog.job_is_due(job, 102).unwrap());
 }
 #[test]
 fn scheduler_runs_two_sixty_three_hundred_and_hold_policies() {
@@ -465,7 +473,11 @@ fn startup_invalidates_physical_readiness_until_local_worker_checks_bytes() {
     engine.advance(report.job.unwrap()).unwrap();
     let group = engine.catalog.group_batch(None, 1).unwrap()[0].id;
     assert!(engine.catalog.readiness(group).unwrap().originals_ready);
-    photo_sorter::service::ServiceRecovery::restore(&mut engine.catalog).unwrap();
+    photo_sorter::service::ServiceRecovery::restore(
+        &mut engine.catalog,
+        &RootHandle::open(&r.local, RootPolicy::Local).unwrap(),
+    )
+    .unwrap();
     assert!(!engine.catalog.readiness(group).unwrap().originals_ready);
 }
 #[test]

@@ -39,6 +39,7 @@ struct Inner {
     favorites: HashMap<uuid::Uuid, AppResult<FavoriteOutcome>>,
 }
 pub(crate) struct AsyncImmich {
+    notification: super::wake::Notification,
     origin: url::Url,
     inner: RefCell<Inner>,
     mode: RatingWriteMode,
@@ -68,6 +69,8 @@ impl AsyncImmich {
         let worker_registry = registry.clone();
         let worker_config = config.clone();
         let worker_roots = [local.try_clone()?, state.try_clone()?];
+        let notification = super::wake::Notification::new()?;
+        let completed = notification.clone();
         std::thread::spawn(move || {
             let mut client: Option<ImmichClient> = None;
             while let Ok(task) = commands.recv() {
@@ -124,9 +127,11 @@ impl AsyncImmich {
                 if results.send(reply).is_err() {
                     break;
                 }
+                completed.signal();
             }
         });
         Ok(Some(Self {
+            notification,
             origin,
             mode,
             config: config.clone(),
@@ -141,7 +146,11 @@ impl AsyncImmich {
             }),
         }))
     }
+    pub fn notification_fd(&self) -> std::os::fd::RawFd {
+        self.notification.fd()
+    }
     pub fn pump(&self) -> AppResult<()> {
+        self.notification.drain();
         let mut inner = self.inner.borrow_mut();
         loop {
             match inner.receive.try_recv() {

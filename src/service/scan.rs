@@ -31,13 +31,16 @@ enum ScanReply {
     Metadata(Vec<MetadataResult>),
 }
 struct Worker {
+    notification: super::wake::Notification,
     send: SyncSender<ScanCommand>,
     receive: Receiver<AppResult<ScanReply>>,
 }
 impl Worker {
-    fn new() -> Self {
+    fn new() -> AppResult<Self> {
         let (send, commands) = mpsc::sync_channel(1);
         let (results, receive) = mpsc::sync_channel(1);
+        let notification = super::wake::Notification::new()?;
+        let completed = notification.clone();
         std::thread::spawn(move || {
             let mut inventory: Option<Inventory> = None;
             let mut entries: Vec<SourceEntry> = vec![];
@@ -127,9 +130,14 @@ impl Worker {
                 if results.send(reply).is_err() {
                     break;
                 }
+                completed.signal();
             }
         });
-        Self { send, receive }
+        Ok(Self {
+            send,
+            receive,
+            notification,
+        })
     }
     fn submit(&self, command: ScanCommand) -> AppResult<()> {
         self.send.try_send(command).map_err(|_| {
@@ -165,13 +173,16 @@ pub(crate) struct ScanDriver {
     active: Option<JobId>,
     pending: Option<Pending>,
 }
-impl Default for ScanDriver {
-    fn default() -> Self {
-        Self {
-            worker: Worker::new(),
+impl ScanDriver {
+    pub fn new() -> AppResult<Self> {
+        Ok(Self {
+            worker: Worker::new()?,
             active: None,
             pending: None,
-        }
+        })
+    }
+    pub fn notification_fd(&self) -> std::os::fd::RawFd {
+        self.worker.notification.fd()
     }
 }
 impl ScanDriver {
@@ -179,6 +190,7 @@ impl ScanDriver {
         if self.active != Some(job) {
             return Ok(());
         }
+        self.worker.notification.drain();
         match self.worker.receive.try_recv() {
             Ok(_) | Err(TryRecvError::Disconnected) => {
                 self.active = None;
@@ -217,6 +229,7 @@ impl ScanDriver {
             self.active = Some(job);
             return Ok(());
         }
+        self.worker.notification.drain();
         let reply = match self.worker.receive.try_recv() {
             Ok(Ok(reply)) => reply,
             Ok(Err(error)) => {

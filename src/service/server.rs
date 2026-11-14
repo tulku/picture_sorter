@@ -230,7 +230,8 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         state.unlink(&ArchivePath::parse("service.sock")?, false)?;
     }
     let mut catalog = Catalog::open(&state)?;
-    let _recovery = super::ServiceRecovery::restore(&mut catalog)?;
+    catalog.settle_cancelled_local_transfers_after_restart(&profile, &work)?;
+    let _recovery = super::ServiceRecovery::restore(&mut catalog, &local)?;
     let maintenance_worker = WorkerSupervisor::new_local_bound(
         std::env::current_exe()?,
         vec![profile.inherit()?, work.inherit()?],
@@ -266,12 +267,8 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         inode: std::fs::symlink_metadata(&socket)?.ino(),
         path: socket,
     };
-    let (http, http_reason) = match super::http::AsyncImmich::new(&config, &local, &state) {
-        Ok(http) => (http, None),
-        Err(error) => (None, Some(error.to_string())),
-    };
     let mut runtime = Runtime {
-        http,
+        integration: super::integration::Integration::new(&config, &local, &state),
         maintenance: maintenance_worker,
         startup: super::recovery::StartupVerifier::default(),
         space: super::space::SpaceMeter::default(),
@@ -279,14 +276,6 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         refresh_application: super::refresh::RefreshApplication::default(),
         cleanup: super::cleanup::CleanupDriver::default(),
         reader: super::archive_reader::ArchiveReader::default(),
-        http_reason,
-        rating_cursor: None,
-        favorite_cursor: None,
-        favorite_intent_cursor: 0,
-        favorite_active_intent: None,
-        favorite_turn: false,
-        rating_intent_cursor: 0,
-        rating_active_intent: None,
         merge_cursor: None,
         job_cursor: None,
         engine: ImportCoordinator::new(config.clone(), catalog),
@@ -295,7 +284,7 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         worker,
         observation: super::observation::ObservationDriver::new(observation_worker),
         shared_publisher: super::publication::SharedPublisher::default(),
-        scan: super::scan::ScanDriver::default(),
+        scan: super::scan::ScanDriver::new()?,
         local_transfer: super::local_transfer::LocalTransferDriver::new(local_worker),
         scheduler: super::Scheduler::new(&config),
         upload: UploadDriver::default(),
@@ -310,7 +299,6 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
             .ok()
             .flatten(),
         archive_status: serde_json::json!({"availability":"unobserved","identity":null}),
-        last_tick: Instant::now(),
     };
     runtime.engine.bind_archive()?;
     runtime.engine.catalog.enable_async_admission();
@@ -320,6 +308,7 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
         .set_admission_limits(runtime.engine.config.budget, runtime.engine.config.reserve);
     let mut peers: Vec<Connection> = vec![];
     loop {
+        let before = runtime.work_generation();
         for _ in 0..32 {
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -417,10 +406,7 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
                 peer.authorization = None;
             }
         }
-        if runtime.last_tick.elapsed() >= Duration::from_millis(20) {
-            runtime.tick()?;
-            runtime.last_tick = Instant::now();
-        }
+        runtime.tick()?;
         for peer in &mut peers {
             if !peer.closed
                 && let (Some(job), Some(request)) = (peer.waiting, peer.request.as_ref())
@@ -437,7 +423,25 @@ pub(crate) fn run(config: Config) -> AppResult<()> {
                 && !(peer.done && peer.output.is_empty())
                 && !(peer.request.is_none() && peer.opened.elapsed() > Duration::from_secs(5))
         });
-        std::thread::sleep(Duration::from_millis(5));
+        let mut delay = runtime.next_delay()?;
+        if runtime.work_generation() != before {
+            delay = Duration::ZERO;
+        }
+        let mut fds = vec![super::wake::descriptor(listener.as_raw_fd(), libc::POLLIN)];
+        for peer in &peers {
+            let events = libc::POLLIN
+                | if peer.output.is_empty() {
+                    0
+                } else {
+                    libc::POLLOUT
+                };
+            fds.push(super::wake::descriptor(peer.stream.as_raw_fd(), events));
+            if peer.request.is_none() {
+                delay = delay.min(Duration::from_secs(5).saturating_sub(peer.opened.elapsed()));
+            }
+        }
+        runtime.wait_descriptors(&mut fds)?;
+        super::wake::wait(&mut fds, delay)?;
     }
 }
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -455,6 +459,14 @@ struct Control {
     job: JobId,
     ticket: WorkerTicket,
 }
+#[derive(PartialEq, Eq)]
+struct WorkGeneration {
+    changes: u64,
+    tickets: [Option<WorkerTicket>; 4],
+    pending: [bool; 4],
+    observation: (String, usize, bool, bool),
+    integration: super::integration::IntegrationProgress,
+}
 struct Runtime {
     engine: ImportCoordinator,
     maintenance: WorkerSupervisor,
@@ -464,15 +476,7 @@ struct Runtime {
     refresh_application: super::refresh::RefreshApplication,
     cleanup: super::cleanup::CleanupDriver,
     reader: super::archive_reader::ArchiveReader,
-    http: Option<super::http::AsyncImmich>,
-    http_reason: Option<String>,
-    rating_cursor: Option<Option<uuid::Uuid>>,
-    favorite_cursor: Option<Option<uuid::Uuid>>,
-    favorite_intent_cursor: i64,
-    favorite_active_intent: Option<(i64, OperationId)>,
-    favorite_turn: bool,
-    rating_intent_cursor: i64,
-    rating_active_intent: Option<(i64, RatingIntentId)>,
+    integration: super::integration::Integration,
     merge_cursor: Option<SidecarId>,
     job_cursor: Option<JobId>,
     local: RootHandle,
@@ -493,7 +497,6 @@ struct Runtime {
     archive_status: serde_json::Value,
     doctor_snapshot: serde_json::Value,
     editor_identity: Option<crate::qualification::EditorRuntimeIdentity>,
-    last_tick: Instant,
 }
 fn waits_for_capacity_measurement(record: &JobRecord) -> bool {
     record.state == JobState::WaitingCapacity
@@ -871,6 +874,7 @@ impl Runtime {
         if let JobKind::PinUrl { asset, .. } = record.request.kind
             && record.state == JobState::WaitingImmich
             && self
+                .integration
                 .http
                 .as_ref()
                 .is_some_and(|http| !http.asset_failed(asset))
@@ -1170,22 +1174,76 @@ impl Runtime {
             .catalog
             .transition(job, record.generation, JobTransition::Wait(state, reason))
     }
+    fn next_delay(&self) -> AppResult<Duration> {
+        let now = SystemClock::default().now();
+        let durable: Option<Timestamp> = self.engine.catalog.db.query_row(
+            "SELECT min(next_attempt) FROM (SELECT next_attempt FROM job_retry UNION ALL SELECT next_attempt FROM publication_failures) WHERE next_attempt>?", [now], |row| row.get(0))?;
+        let mut delay = self.scheduler.next_delay(
+            now,
+            &[
+                durable.unwrap_or(0),
+                self.startup.retry_deadline(),
+                self.reader.retry_deadline(),
+                self.space.retry_deadline(),
+            ],
+        );
+        if let Some(timeout) = self.worker.remaining_timeout(Duration::from_secs(5)) {
+            delay = delay.min(timeout);
+        }
+        Ok(delay)
+    }
+    fn work_generation(&self) -> WorkGeneration {
+        let workers = [
+            &self.worker,
+            &self.maintenance,
+            &self.observation.worker,
+            &self.local_transfer.worker,
+        ];
+        WorkGeneration {
+            changes: self.engine.catalog.db.total_changes(),
+            tickets: workers.map(|worker| worker.latest_ticket()),
+            pending: workers.map(|worker| worker.pending()),
+            observation: self.observation.progress(),
+            integration: self.integration.progress(),
+        }
+    }
+    fn wait_descriptors(&mut self, fds: &mut Vec<libc::pollfd>) -> AppResult<()> {
+        for worker in [
+            &mut self.worker,
+            &mut self.maintenance,
+            &mut self.observation.worker,
+            &mut self.local_transfer.worker,
+        ] {
+            worker.wait_descriptors(fds)?;
+        }
+        if let Some(fd) = self.observation.notification_fd() {
+            fds.push(super::wake::descriptor(fd, libc::POLLIN));
+        }
+        if self.scan.active_job().is_some() {
+            fds.push(super::wake::descriptor(
+                self.scan.notification_fd(),
+                libc::POLLIN,
+            ));
+        }
+        if let Some(http) = &self.integration.http {
+            fds.push(super::wake::descriptor(
+                http.notification_fd(),
+                libc::POLLIN,
+            ));
+        }
+        Ok(())
+    }
     fn tick(&mut self) -> AppResult<()> {
         let clock = SystemClock::default();
         let timing = self.scheduler.tick(clock.now())?;
         if timing.poll_ratings {
-            self.rating_cursor = Some(None);
-            self.favorite_cursor = Some(None);
+            self.integration.request_poll();
         }
         if timing.poll_ratings {
             self.reader.requested = true;
         }
 
-        if let Some(http) = &self.http
-            && let Err(error) = http.pump()
-        {
-            self.http_reason = Some(error.to_string());
-        }
+        self.integration.pump();
 
         if let Err(error) = self.cleanup.advance(
             &mut self.engine,
@@ -1217,10 +1275,10 @@ impl Runtime {
             self.observation.status.reason = Some(error.to_string());
         }
         if timing.reconcile {
-            self.engine.catalog.queue_physical_checks()?;
+            self.engine.catalog.queue_physical_checks(&self.local)?;
         }
         self.startup
-            .advance(&mut self.engine, &mut self.maintenance)?;
+            .advance(&mut self.engine, &mut self.maintenance, &self.local)?;
         self.engine.catalog.finalize_rebuild(
             self.reader.completed_syncs > 0,
             self.observation.status.startup_complete,
@@ -1321,7 +1379,7 @@ impl Runtime {
             if error.code == ErrorCode::Capacity {
                 self.pressure_reclaim(None)?;
             }
-            self.http_reason = Some(error.to_string());
+            self.integration.reason = Some(error.to_string());
         }
         let now = clock.now();
         let mut jobs = self.engine.catalog.jobs_page(self.job_cursor, 128, true)?;
@@ -1351,7 +1409,7 @@ impl Runtime {
             {
                 continue;
             }
-            let http_ready = matches!(record.request.kind,JobKind::PinUrl{asset,..} if self.http.as_ref().is_some_and(|http|http.has_ready_asset(asset)));
+            let http_ready = matches!(record.request.kind,JobKind::PinUrl{asset,..} if self.integration.http.as_ref().is_some_and(|http|http.has_ready_asset(asset)));
             if !matches!(record.request.kind, JobKind::Import { .. })
                 && !active.contains(&Some(record.id))
                 && !http_ready
@@ -1478,142 +1536,8 @@ impl Runtime {
                 )?;
             }
         }
-        let editor_allowed = self.engine.config.local_test_backend
-            || self
-                .editor_identity
-                .as_ref()
-                .is_some_and(|identity| identity.decision(&self.engine.config).allowed);
-        let favorite_allowed = self.engine.config.local_test_backend
-            || self
-                .editor_identity
-                .as_ref()
-                .is_some_and(|identity| identity.pick_decision(&self.engine.config).allowed);
-        if let Some(http) = &self.http {
-            if let Some(after) = self.favorite_cursor.filter(|_| {
-                favorite_allowed
-                    && self.favorite_active_intent.is_none()
-                    && self.rating_active_intent.is_none()
-            }) {
-                let scope = crate::immich::RatingScope {
-                    state_root: self.engine.config.state_root.clone(),
-                    editor_version: self.engine.config.rapidraw_version.clone(),
-                    after,
-                    limit: 1,
-                };
-                match (crate::immich::FavoriteSynchronizer {
-                    catalog: &mut self.engine.catalog,
-                    client: http,
-                })
-                .poll(scope)
-                {
-                    Ok(report) => {
-                        if !report.retry && (report.observed > 0 || !http.in_flight()) {
-                            self.favorite_cursor = report.next.map(Some);
-                        }
-                    }
-                    Err(error) => {
-                        self.http_reason = Some(error.to_string());
-                        if error.code != ErrorCode::Capacity {
-                            self.favorite_cursor = None;
-                        }
-                    }
-                }
-            }
-            if let Some(after) = self.rating_cursor.filter(|_| {
-                editor_allowed
-                    && self.rating_active_intent.is_none()
-                    && self.favorite_active_intent.is_none()
-            }) {
-                let config = &self.engine.config;
-                let scope = crate::immich::RatingScope {
-                    state_root: config.state_root.clone(),
-                    editor_version: config.rapidraw_version.clone(),
-                    after,
-                    limit: 1,
-                };
-                match (crate::immich::RatingSynchronizer {
-                    catalog: &mut self.engine.catalog,
-                    client: http,
-                })
-                .poll(scope)
-                {
-                    Ok(report) => {
-                        if report.observed > 0 || !http.in_flight() {
-                            self.rating_cursor = report.next.map(Some);
-                        }
-                    }
-                    Err(error) => {
-                        self.http_reason = Some(error.to_string());
-                        self.rating_cursor = None;
-                    }
-                }
-            }
-            if self.rating_active_intent.is_none()
-                && self.favorite_active_intent.is_none()
-                && !http.in_flight()
-            {
-                self.favorite_turn = !self.favorite_turn;
-                if self.favorite_turn && favorite_allowed {
-                    self.favorite_active_intent = self
-                        .engine
-                        .catalog
-                        .next_favorite_intent(self.favorite_intent_cursor)?;
-                }
-                if self.favorite_active_intent.is_none() {
-                    self.rating_active_intent = super::rating_queue::next_intent(
-                        &self.engine.catalog,
-                        self.rating_intent_cursor,
-                    )?;
-                }
-                if self.rating_active_intent.is_none()
-                    && self.favorite_active_intent.is_none()
-                    && favorite_allowed
-                {
-                    self.favorite_active_intent = self
-                        .engine
-                        .catalog
-                        .next_favorite_intent(self.favorite_intent_cursor)?;
-                }
-            }
-            if let Some((row, id)) = self.favorite_active_intent {
-                match (crate::immich::FavoriteSynchronizer {
-                    catalog: &mut self.engine.catalog,
-                    client: http,
-                })
-                .advance(id)
-                {
-                    Ok(report) => {
-                        if let Some(reason) = report.reason {
-                            self.http_reason = Some(reason);
-                        }
-                    }
-                    Err(error) => self.http_reason = Some(error.to_string()),
-                }
-                if !http.in_flight() {
-                    self.favorite_intent_cursor = row;
-                    self.favorite_active_intent = None;
-                }
-            }
-            if let Some((row, id)) = self.rating_active_intent {
-                match (crate::immich::RatingSynchronizer {
-                    catalog: &mut self.engine.catalog,
-                    client: http,
-                })
-                .advance(id)
-                {
-                    Ok(report) => {
-                        if let Some(reason) = report.reason {
-                            self.http_reason = Some(reason);
-                        }
-                    }
-                    Err(error) => self.http_reason = Some(error.to_string()),
-                }
-                if !http.in_flight() {
-                    self.rating_intent_cursor = row;
-                    self.rating_active_intent = None;
-                }
-            }
-        }
+        self.integration
+            .advance(&mut self.engine, self.editor_identity.as_ref())?;
         if (self.shared_publisher.busy()
             || (self.control.is_none()
                 && self.upload.active_job().is_none()
@@ -1859,11 +1783,12 @@ impl Runtime {
                     .optional()?;
                 if existing.is_none() {
                     use crate::immich::ImmichAccess;
-                    let Some(http) = &self.http else {
+                    let Some(http) = &self.integration.http else {
                         return self.wait(
                             job,
                             JobState::WaitingImmich,
-                            self.http_reason
+                            self.integration
+                                .reason
                                 .clone()
                                 .unwrap_or_else(|| "Immich is not configured".into()),
                         );
@@ -1891,8 +1816,7 @@ impl Runtime {
                                 current.generation,
                                 JobTransition::Start,
                             )?;
-                            self.rating_cursor = Some(None);
-                            self.favorite_cursor = Some(None);
+                            self.integration.request_poll();
                         }
                         Err(error) => {
                             return self.wait(job, JobState::WaitingImmich, error.to_string());

@@ -56,6 +56,7 @@ mod scheduler;
 pub use scheduler::*;
 mod archive_reader;
 mod http;
+mod integration;
 mod observation;
 mod publication;
 
@@ -78,3 +79,5 @@ pub use catalog_maintenance::{
     JpegIndexReport, SourcePreview, offline_adopt_source, offline_index_jpegs,
     offline_preview_source,
 };
+
+mod wake;

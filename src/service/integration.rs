@@ -7,6 +7,15 @@ use crate::{
     qualification::EditorRuntimeIdentity,
 };
 
+#[derive(PartialEq, Eq)]
+pub(super) struct IntegrationProgress {
+    rating_cursor: Option<Option<uuid::Uuid>>,
+    favorite_cursor: Option<Option<uuid::Uuid>>,
+    rating_intent_cursor: i64,
+    favorite_intent_cursor: i64,
+    rating_active_intent: Option<(i64, RatingIntentId)>,
+    favorite_active_intent: Option<(i64, OperationId)>,
+}
 pub(super) struct Integration {
     pub(super) http: Option<super::http::AsyncImmich>,
     pub(super) reason: Option<String>,
@@ -19,6 +28,17 @@ pub(super) struct Integration {
     rating_active_intent: Option<(i64, RatingIntentId)>,
 }
 impl Integration {
+    pub(super) fn progress(&self) -> IntegrationProgress {
+        IntegrationProgress {
+            rating_cursor: self.rating_cursor,
+            favorite_cursor: self.favorite_cursor,
+            rating_intent_cursor: self.rating_intent_cursor,
+            favorite_intent_cursor: self.favorite_intent_cursor,
+            rating_active_intent: self.rating_active_intent,
+            favorite_active_intent: self.favorite_active_intent,
+        }
+    }
+
     pub(super) fn new(config: &Config, local: &RootHandle, state: &RootHandle) -> Self {
         let (http, reason) = match super::http::AsyncImmich::new(config, local, state) {
             Ok(http) => (http, None),
