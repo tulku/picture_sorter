@@ -55,3 +55,22 @@ All code work remains `/home/tulku/Repos/picture_sorter/fast-card-import`, feat/
 
 - Final NAS independence tests reproduced premature local exit after1/8 files and retained600-second NAS retry stalling a fresh capacity probe. Server now keeps ingested waits alive while scan/local copy can progress and bypasses NAS retry for that local work/fresh capacity measurement only; real source/disk/JPEG comparison blockers remain visible. Default offline8-file import returns0 with8 local/8 pendingarchive; archived wait returns3. Service-flow41 tests pass with progress-aware bounded cleanup (5s no durable progress,30s overall); rigid5s total was disproven by steady3.8–4.5s copies under concurrent fixtures and Nix compilation. This is a test-scheduling fix, not relaxed ingestion semantics.
 - First Nix package full-check failed offline preview cached1 expectation: isolated builder has no /etc/machine-id, readable boot_id and valid directory birthtime. Source agent confirmed in actual Nix probe and is adding safe boot-scoped local-directory fallback; physical card UUID/CID path unaffected. Rebuild package after final local fallback/test changes; previous derivation91vqjkv27xhkr1h27bg5yhpz0g8s14jm failed, not deployable.
+
+## Ready for user activation
+
+- [x] Final native fmt and strict Clippy passed; all474 tests passed (root full log `/tmp/picture-sorter-fast-integrated-tests.log`).
+- [x] Checked Nix package passed its complete release test suite. Package `/nix/store/05lpmwdmi5fnvn7l9c04cdrbrxa1d9wv-photo-sorter-0.1.0`, retained `/home/tulku/.local/state/photo-sorter-builds/fast-card-import`.
+- [x] Merged/pushed source main `6ceca718311e4356d4f18a08b5989924d59d7fe1`.
+- [x] GitHub CI passed: https://github.com/tulku/picture_sorter/actions/runs/43583086764.
+- [x] Updated/committed Nix main `8810a87 Default photo sorter to fast local imports` (local commit, as prior configuration updates). Only flake.lock and home/tulku/photo-sorter.nix changed.
+- [x] Full clean-commit syl system build passed: `/nix/store/bppphb84760gibpl60y5an77g0bk5jh2-nixos-system-syl-26.05.20261108.ac588ef`, retained `/home/tulku/.local/state/photo-sorter-builds/fast-card-import-system`.
+- [x] Verified actual built wrapper (kzp5d64l1zvkzwv17yrdg0pprqrw2gn5) dispatch for bare invocation, --wait-for archived, --strict, --json status, and --help without starting imports.
+- [x] Exact release package real-card preview:1.094 seconds, selected/cached5396,exact4336,image942,new118,newbytes2065353069,ambiguous0,hash_bytes0,transfer_bytes0. Private report `fast-card-preview/release-result.json` retained. No temporary selection is used by normal workflow.
+- [x] Implementation worktree and feat/fast-card-import branch removed after integration. Source and Nix checkouts clean; planning worktree retained.
+- [ ] User activates with `nh os switch --flake /home/tulku/nixos#syl`; user explicitly owns activation. Then verify new service path/source cache and normal real import if requested.
+
+Normal user workflow after activation: `photo_sorter` imports from the configured SD root, waits for durable local ingestion, shows periodic progress, and lets NAS upload continue independently. `photo_sorter --wait-for archived` also waits for NAS publication. Unknown source/generation or changed file metadata needs hashing; --strict bypasses cached source/JPEG shortcuts.
+
+Ruling: Nix sandbox lacked machine-id, so safe local directories may use boot_id fallback only with birthtime/device/inode; source cache is then boot-scoped. Physical FAT/exFAT source keys remain unchanged. Non-FAT UUID directory without birthtime is also unreliable; removable CID without filesystem generation remains unreliable. Actual Nix sandbox repeat test and new identity-boundary regressions pass. This does not alter the validated current SD binding.
+
+The pre-existing transient StartupVerifier event/receipt readiness race noted above remains a diagnostic follow-up; immutable-copy/publication/cleanup still use independent fresh byte proofs. The concrete sticky physical-finding bug uncovered during validation was fixed, not waived.
