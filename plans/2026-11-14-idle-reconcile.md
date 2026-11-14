@@ -18,15 +18,21 @@ Preserve protection/diagnostics; user activates Nix; no production mutations exc
 - Large missing sidecar inventories do not drive thousands of full coordinator ticks.
 
 ### Task 1: Failed verification cache
-- [ ] Reproduce unchanged mismatch requeue in regression.
-- [ ] Carry stable observed stamps in integrity report; persist matching negative evidence while preserving failed readiness/diagnostics.
-- [ ] Verify restart, changed file, explicit audit and stale receipt cases.
+- [x] Reproduce unchanged mismatch requeue in regression.
+- [x] Carry stable observed stamps in integrity report; persist matching negative evidence while preserving failed readiness/diagnostics.
+- [x] Verify restart, changed file, explicit audit and stale receipt cases.
 
 ### Task 2: Known sidecar filtering
-- [ ] Reproduce large remote-only inventory queued for individual skipping.
-- [ ] Filter known query to previously observed sidecars, preserving working discovery and missing local sidecars.
-- [ ] Test meaningful cases and query cost.
+- [x] Reproduce large remote-only inventory queued for individual skipping.
+- [x] Filter known query to previously observed sidecars, preserving working discovery and missing local sidecars.
+- [x] Test meaningful cases and query cost.
 
 ### Task 3: Deliver
-- [ ] Full suite/lint; independent review; representative multi-cycle benchmark including known mismatches and remote-only sidecars.
-- [ ] Push main, update/build/commit Nix pin; remove worktree; hand off switch.
+- [x] Full suite/lint; independent review; representative multi-cycle benchmark including known mismatches and remote-only sidecars.
+- [x] Push main, update/build/commit Nix pin; remove worktree; hand off switch.
+
+### CI-discovered retry scheduling correction
+- [x] Confirm that due imports were deferred without dispatch while the NAS reader held the worker.
+- [x] Preserve genuine repeated-failure backoff using an explicit upload outcome.
+- [x] Test busy/pending workers and identical errors; strengthen reconnect fixture with short archive polling and observed offline state.
+- [x] Full validation and refreshed Nix handoff.
