@@ -2,6 +2,34 @@ use super::*;
 use crate::domain::*;
 use rusqlite::{OptionalExtension, params};
 impl Catalog {
+    pub(crate) fn settle_cancelled_local_transfers_after_restart(
+        &mut self,
+        _profile: &OwnershipLock,
+        _work: &OwnershipLock,
+    ) -> AppResult<usize> {
+        // Call only after acquiring both startup locks and before spawning any worker.
+        let tx = self.db.transaction()?;
+        let children = {
+            let mut query = tx.prepare(r#"SELECT child.id FROM jobs child JOIN jobs parent ON parent.id=json_extract(child.request,'$.kind.parent') WHERE json_extract(child.request,'$.kind.type')='local_transfer' AND parent.state='"Cancelled"' AND child.state NOT IN ('"Complete"','"Cancelled"')"#)?;
+            query
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for child in &children {
+            tx.execute(
+                "UPDATE attempts SET state=? WHERE job=?",
+                params![encode(&"quiescent")?, child],
+            )?;
+            tx.execute("DELETE FROM reservations WHERE job=?", [child])?;
+            tx.execute("DELETE FROM job_retry WHERE job=?", [child])?;
+            tx.execute(
+                "UPDATE jobs SET state=?,cancel_requested=1,reason=NULL WHERE id=?",
+                params![encode(&JobState::Cancelled)?, child],
+            )?;
+        }
+        tx.commit()?;
+        Ok(children.len())
+    }
     pub fn enqueue(&mut self, request: DurableRequest) -> AppResult<JobId> {
         let tx = self.db.transaction()?;
         let operation = request.operation_id.to_string();
@@ -159,6 +187,13 @@ impl Catalog {
         Ok(())
     }
 }
+fn jobs_page_sql(active_only: bool) -> &'static str {
+    if active_only {
+        r#"SELECT id FROM jobs WHERE id>?1 AND state NOT IN ('"Complete"','"Cancelled"','"Failed"') ORDER BY id LIMIT ?2"#
+    } else {
+        "SELECT id FROM jobs WHERE id>?1 ORDER BY id LIMIT ?2"
+    }
+}
 impl Catalog {
     pub fn jobs_page(
         &self,
@@ -169,14 +204,10 @@ impl Catalog {
         if limit == 0 || limit > 128 {
             return Err(AppError::invalid("job page must be 1..128"));
         }
-        let mut query=self.db.prepare("SELECT id FROM jobs WHERE id>? AND (?=0 OR json_extract(state,'$') NOT IN('Complete','Cancelled','Failed')) ORDER BY id LIMIT ?")?;
+        let mut query = self.db.prepare(jobs_page_sql(active_only))?;
         let ids = query
             .query_map(
-                params![
-                    after.map(|id| id.to_string()).unwrap_or_default(),
-                    active_only,
-                    limit
-                ],
+                params![after.map(|id| id.to_string()).unwrap_or_default(), limit],
                 |r| r.get::<_, String>(0),
             )?
             .collect::<Result<Vec<_>, _>>()?;
@@ -227,5 +258,135 @@ impl Catalog {
             .query_map([limit], |r| r.get::<_, String>(0))?
             .map(|row| Ok(serde_json::from_value(row?.into())?))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::{RootHandle, RootPolicy};
+    use crate::storage::FilesystemId;
+
+    #[test]
+    fn restart_settles_only_abandoned_children_of_cancelled_parents() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = RootHandle::open(temp.path(), RootPolicy::Local).unwrap();
+        let mut catalog = Catalog::open(&root).unwrap();
+        let profile = OwnershipLock::acquire(&root, "profile.lock").unwrap();
+        let work = OwnershipLock::acquire(&root, "working.lock").unwrap();
+        let inherited = work.inherit().unwrap();
+        drop(work);
+        assert!(OwnershipLock::acquire(&root, "working.lock").is_err());
+        let mut children = Vec::new();
+        for state in [
+            JobState::Cancelled,
+            JobState::CancelRequested,
+            JobState::Running,
+        ] {
+            let parent = catalog
+                .enqueue(DurableRequest {
+                    operation_id: OperationId::new(),
+                    kind: JobKind::Import {
+                        source: "/unused".into(),
+                        strict: false,
+                    },
+                })
+                .unwrap();
+            let child = catalog
+                .enqueue(DurableRequest {
+                    operation_id: OperationId::new(),
+                    kind: JobKind::LocalTransfer {
+                        parent,
+                        item: JobId::new(),
+                    },
+                })
+                .unwrap();
+            catalog.transition(child, 0, JobTransition::Start).unwrap();
+            catalog.reserve(child, FilesystemId(1), 100).unwrap();
+            catalog.defer_job(child, 1, "retry").unwrap();
+            if state != JobState::Running {
+                catalog
+                    .transition(parent, 0, JobTransition::RequestCancel)
+                    .unwrap();
+            }
+            if state == JobState::Cancelled {
+                catalog
+                    .transition(parent, 0, JobTransition::ConfirmCancelled)
+                    .unwrap();
+            }
+            children.push(child);
+        }
+        assert_eq!(catalog.total_remaining_reservations().unwrap(), 300);
+        drop(inherited);
+        let work = OwnershipLock::acquire(&root, "working.lock").unwrap();
+        assert_eq!(
+            catalog
+                .settle_cancelled_local_transfers_after_restart(&profile, &work)
+                .unwrap(),
+            1
+        );
+        assert_eq!(catalog.job(children[0]).unwrap().state, JobState::Cancelled);
+        assert_eq!(catalog.job(children[1]).unwrap().state, JobState::Running);
+        assert_eq!(catalog.total_remaining_reservations().unwrap(), 200);
+        let states: Vec<String> = children
+            .iter()
+            .map(|child| {
+                catalog
+                    .db
+                    .query_row(
+                        "SELECT state FROM attempts WHERE job=?",
+                        [child.to_string()],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(states, vec!["\"quiescent\"", "\"Running\"", "\"Running\""]);
+        assert!(catalog.job_is_due(children[0], 1).unwrap());
+        assert!(!catalog.job_is_due(children[1], 1).unwrap());
+        assert_eq!(
+            catalog
+                .settle_cancelled_local_transfers_after_restart(&profile, &work)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn pending_pages_do_not_scan_terminal_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = RootHandle::open(temp.path(), RootPolicy::Local).unwrap();
+        let mut catalog = Catalog::open(&root).unwrap();
+        catalog.db.execute_batch(r#"WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<20000)
+INSERT INTO jobs(id,operation,request,state) SELECT printf('00000000-0000-4000-8000-%012d',x),printf('00000000-0000-4000-8000-%012d',x),json_object('operation_id',printf('00000000-0000-4000-8000-%012d',x),'kind',json_object('type','clean')),CASE x%3 WHEN 0 THEN '"Complete"' WHEN 1 THEN '"Cancelled"' ELSE '"Failed"' END FROM n;"#).unwrap();
+        let job = catalog
+            .enqueue(DurableRequest {
+                operation_id: OperationId::new(),
+                kind: JobKind::Clean,
+            })
+            .unwrap();
+        catalog
+            .db
+            .execute("DROP INDEX pending_jobs_by_id", [])
+            .unwrap();
+        drop(catalog);
+        let catalog = Catalog::open(&root).unwrap();
+        assert_eq!(catalog.jobs_page(None, 128, false).unwrap().len(), 128);
+        let page = catalog.jobs_page(None, 128, true).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, job);
+        assert!(catalog.jobs_page(Some(job), 128, true).unwrap().is_empty());
+        let mut query = catalog.db.prepare(jobs_page_sql(true)).unwrap();
+        let rows = query
+            .query_map(params!["", 128], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![job.to_string()]);
+        let steps = query.get_status(rusqlite::StatementStatus::VmStep);
+        assert!(
+            steps < 100,
+            "pending page executed {steps} VM steps over terminal history"
+        );
     }
 }
