@@ -1,0 +1,9 @@
+# Resolve bootstrap sidecar associations
+
+User requests resolution of listed conflicts. All 8846 are bootstrap orphan-sidecar records. 8844 have a unique exact original path after stripping one sidecar suffix. Two exceptional RawTherapee output profiles were explicitly approved for deletion; byte-verified local copies and immutable archival history are retained. No HDR/burst layout changes or photograph group merges are part of these associations.
+
+Use existing native catalogue validation, semantic witnesses, durable publication plans, qualified archive writer, publication guard and native replay in a local maintenance utility. Batch at most64 choices per commit. Take native catalogue backup, simulate all choices on a disposable clone and compare unchanged heads/versions/groups/members/blobs; check final associations, receipts, counts and SQLite integrity. Independently review tool before real use.
+
+For real execution stop the full service group and prove every writer process quiescent; hold profile/working ownership locks. Add private indexing improvements before opening native Catalog, with no other SQLite connection open concurrently. Replay under the native NAS publication guard and require full readiness, revalidate current paths and memberships, then publish/apply each batch atomically. Keep locks after uncertain errors; never perform timeout takeover or unconditional service restart. Resume uses identical native request/plan receipts. Release NAS guard on complete success and restart the existing installed service. Verify warning counts and preserved original/metadata bytes. No package or Nix activation changes required.
+
+Operational paths: /home/tulku/.local/state/photo-sorter-maintenance/conflict-associations-20261114/ (tool, manifest, native backup, clone, output receipts). Actual photo paths and copied file contents remain local, outside Git.
