@@ -147,9 +147,25 @@ impl StartupVerifier {
 }
 
 impl Catalog {
+    pub(crate) fn queue_observed_original(
+        &mut self,
+        path: &crate::domain::ArchivePath,
+        present: bool,
+    ) -> AppResult<()> {
+        let tx = self.db.transaction()?;
+        if present {
+            tx.execute("INSERT INTO local_residency_expectations SELECT id FROM placements WHERE path=? ON CONFLICT DO NOTHING",[path.as_str()])?;
+        }
+        tx.execute("INSERT INTO startup_checks(placement,group_id,path,digest,size) SELECT p.id,p.group_id,p.path,p.digest,b.size FROM placements p JOIN blobs b ON b.digest=p.digest WHERE p.path=? AND EXISTS(SELECT 1 FROM local_residency_expectations e WHERE e.placement=p.id) ON CONFLICT DO NOTHING",[path.as_str()])?;
+        tx.execute("UPDATE placements SET local_ready=0 WHERE path=? AND id IN(SELECT placement FROM startup_checks)",[path.as_str()])?;
+        tx.execute("UPDATE residency SET ready_revision=NULL,protected=1 WHERE group_id IN(SELECT group_id FROM startup_checks WHERE path=?)",[path.as_str()])?;
+        tx.commit()?;
+        Ok(())
+    }
     pub fn queue_physical_checks(&mut self) -> AppResult<()> {
         let tx = self.db.transaction()?;
-        tx.execute("INSERT INTO startup_checks(placement,group_id,path,digest,size) SELECT p.id,p.group_id,p.path,p.digest,b.size FROM placements p JOIN blobs b ON b.digest=p.digest WHERE p.local_ready=1 OR p.archived=1 ON CONFLICT DO NOTHING",[])?;
+        tx.execute("DELETE FROM startup_checks WHERE placement IN(SELECT p.id FROM placements p WHERE p.archived=1 AND p.local_ready=0 AND NOT EXISTS(SELECT 1 FROM local_residency_expectations e WHERE e.placement=p.id))",[])?;
+        tx.execute("INSERT INTO startup_checks(placement,group_id,path,digest,size) SELECT p.id,p.group_id,p.path,p.digest,b.size FROM placements p JOIN blobs b ON b.digest=p.digest WHERE p.local_ready=1 OR EXISTS(SELECT 1 FROM local_residency_expectations e WHERE e.placement=p.id) ON CONFLICT DO NOTHING",[])?;
         tx.execute(
             "UPDATE placements SET local_ready=0 WHERE id IN(SELECT placement FROM startup_checks)",
             [],
@@ -187,5 +203,31 @@ impl Catalog {
         }
         tx.commit()?;
         Ok(cleared > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::{RootHandle, RootPolicy};
+    #[test]
+    fn startup_checks_preserve_local_expectations_and_skip_remote_only_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = RootHandle::open(temp.path(), RootPolicy::Local).unwrap();
+        let mut catalog = Catalog::open(&root).unwrap();
+        catalog.db.execute_batch("INSERT INTO blobs(digest,size) VALUES('test',7);
+INSERT INTO placements(id,group_id,path,digest,local_ready,archived) VALUES('remote','g','remote.ORF','test',0,1),('expected','g','expected.ORF','test',0,1),('resident','g','resident.ORF','test',1,0);
+INSERT INTO local_residency_expectations VALUES('expected');
+INSERT INTO startup_checks(placement,group_id,path,digest,size) VALUES('remote','g','remote.ORF','test',7);").unwrap();
+        catalog.queue_physical_checks().unwrap();
+        let paths = catalog
+            .db
+            .prepare("SELECT path FROM startup_checks ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(paths, vec!["expected.ORF", "resident.ORF"]);
     }
 }

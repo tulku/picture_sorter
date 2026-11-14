@@ -32,11 +32,15 @@ photo_sorter --config /absolute/profile.toml jobs cancel JOB_UUID
 
 On a qualified single-writer mount without atomic exchange, imports and immutable metadata history can publish while replacement or reset of existing live NAS metadata remains disabled. Check `status --json`: `capabilities.nas_publication` permits imports; `capabilities.nas_metadata_replacement` reports whether existing content can be replaced. Unsupported replacement retains the old live file and immutable incoming history rather than overwriting either.
 
+On the configured syl/eskarina wrapper, insert the SD card and run `photo_sorter`. It imports from `/run/media/tulku/OM SYSTEM` and returns once new photos are durable locally; NAS publication continues in the service. `photo_sorter --wait-for archived` also waits for archive completion. Explicit subcommands remain available. Human imports and `jobs wait` print progress to stderr every two seconds; JSON emits only its final response.
+
+An identified card or source directory has a persistent per-file cache. Normal imports enumerate filenames and metadata, reuse unchanged original digests and JPEG fingerprints, and read only new or changed originals. Card identity changes, unknown identities, and changed file metadata prevent shortcuts; source companions are always checked independently. Fast mode trusts stable source identity, path, size and modification time. `--strict` reads every source file and performs guarded JPEG comparisons instead of trusting cached image matches. Copied bytes always retain whole-file verification.
+
 Default import completion is **ingested**: every selected non-conflicting original has a verified durable local copy, committed archive copy, or a recorded JPEG image match to an existing archived original. Output distinguishes pending archive publication. `--wait-for archived` requires committed archive evidence; unavailable dependencies return waiting with job ID. `--no-wait` acknowledges a durable job only. Disconnect/Ctrl-C stops waiting, not the job. Use explicit cancellation; uncertain writing workers retain their reservations/session until positively completed or recovered. Conflicting groups make aggregate completion nonzero even when independent files succeed.
 
-JPEG imports use a separate image-content fingerprint when an existing archived photo at the expected or recorded prior destination has different file bytes. Matching baseline JPEGs retain the NAS version and its metadata; the card variant is recognised without copying it into Working or the archive. GPS, descriptive EXIF/XMP/IPTC and comments do not create a new image. Orientation, colour interpretation/profiles, JPEG coding tables and image data remain part of the comparison. Ambiguous, malformed and unsupported JPEGs use the existing exact-file/conflict behaviour.
+Catalogue matches reuse the existing archived path even if current burst detection would choose a different directory. JPEG imports use a separate image-content fingerprint when an archived photo has different file bytes. Matching baseline JPEGs retain the NAS version and its metadata; the card variant is recognised without copying it into Working or the archive. GPS, descriptive EXIF/XMP/IPTC and comments do not create a new image. Orientation, colour interpretation/profiles, JPEG coding tables and image data remain part of the comparison. Ambiguous, malformed and unsupported JPEGs use the existing exact-file/conflict behaviour.
 
-Import reports count these matches as `image_duplicates`; `archive_committed` continues to count exact byte archival. Both can satisfy the archived milestone, with a separate receipt identifying the retained NAS version. Whole-file hashes still verify all transfers and archive integrity, including metadata. Fingerprints are cached by verified file digest on demand, so an existing catalogue needs no second full archive scan. RAW and sidecar bytes retain their existing exact identity rules, and earlier alternate copies stay in place.
+Import reports count these matches as `image_duplicates`; `archive_committed` continues to count exact byte archival. Both can satisfy the archived milestone, with a separate receipt identifying the retained NAS version. Whole-file hashes still verify all transfers and archive integrity, including metadata. Fingerprints are cached by verified file digest and retained during bootstrap’s original read. Normal recognition trusts this recorded archive evidence; use strict comparison or archive verification to check for later external changes. RAW and sidecar bytes retain their existing exact identity rules, and earlier alternate copies stay in place.
 
 Offline edits are observed through local events plus periodic reconciliation. The service preserves each coherently captured saved state; it cannot capture unsaved editor memory or intermediate saves overwritten before observation. Stable malformed, rejected or oversized metadata remains preserved/protected rather than transformed. Deleting a sidecar is an explicit Reset version only after readable, debounced absence, never inferred from an unavailable root. Saved source companions are imported independently of unchanged originals.
 
@@ -100,3 +104,16 @@ inputs.picture-sorter.url = "git+ssh://git@github.com/tulku/picture_sorter.git?r
 ```
 
 Select `inputs.picture-sorter.packages.${pkgs.stdenv.hostPlatform.system}.default` in the consuming configuration. Updating that input advances the source revision; ordinary rebuilds retain the locked revision. Service/profile installation and archive qualification remain separate from building the package.
+
+
+## Updating an existing private cache
+
+New cards need no selection directory or manual cache setup. A source without prior fingerprints is read once. For an already completed scan made by an older version, stop the complete service/worker group and back up the catalogue before explicitly confirming that the same card is present:
+
+```sh
+photo_sorter catalog adopt-source COMPLETED_IMPORT_JOB '/mounted/Camera card' --offline
+photo_sorter catalog index-jpegs --scan COMPLETED_IMPORT_JOB --offline
+photo_sorter catalog preview-source COMPLETED_IMPORT_JOB '/mounted/Camera card' --offline
+```
+
+Adoption checks the original source root and every historical file’s metadata before binding its previously computed digests to the current physical source. This explicit operation confirms the card is the same one; it is never inferred for a new unidentified card. JPEG indexing reads only missing archived image fingerprints in that import’s comparison set, verifies the recorded whole-file identities, and leaves NAS bytes unchanged. Without `--scan`, it fills all missing archive JPEG fingerprints. Both indexing and source binding are repeatable; preview reads metadata and catalogue evidence without hashing payloads, creating import jobs or transferring files. Restart the service afterward.

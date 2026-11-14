@@ -34,6 +34,10 @@ pub struct ImportReport {
     pub exif_invocations: u64,
     pub transfer_bytes: u64,
     pub hash_bytes: u64,
+    #[serde(default)]
+    pub scan_complete: bool,
+    #[serde(default)]
+    pub pending_jpeg_checks: u64,
 }
 pub type JobProgress = ImportReport;
 pub struct ImportCoordinator {
@@ -93,7 +97,7 @@ impl ImportCoordinator {
         let job = self.catalog.enqueue(DurableRequest {
             operation_id: request.operation_id,
             kind: JobKind::Import {
-                source,
+                source: source.clone(),
                 strict: request.strict,
             },
         })?;
@@ -107,6 +111,7 @@ impl ImportCoordinator {
             [job.to_string()],
         )?;
         tx.commit()?;
+        self.catalog.ensure_import_source(job, &source)?;
         Ok(job)
     }
     pub fn scan_complete(&self, job: JobId) -> AppResult<bool> {
@@ -168,11 +173,7 @@ impl ImportCoordinator {
         entries: &[SourceEntry],
         metadata: Option<Vec<MetadataResult>>,
     ) -> AppResult<ImportReport> {
-        let digests = entries
-            .iter()
-            .map(hash_source)
-            .collect::<AppResult<Vec<_>>>()?;
-        self.accept_hashed_batch(job, entries, &digests, metadata)
+        self.accept_source_batch(job, entries, metadata)
     }
     pub fn accept_hashed_batch(
         &mut self,
@@ -184,13 +185,14 @@ impl ImportCoordinator {
         if entries.len() > 128 || entries.len() != digests.len() || self.scan_complete(job)? {
             return Err(AppError::invalid("invalid or already completed scan batch"));
         }
-        let request = self.catalog.job(job)?.request;
-        let identity = SourceIdentity {
-            incarnation: request.operation_id.to_string(),
-            reliable: false,
-        };
+        let identity = self.catalog.import_source_identity(job)?;
+        let strict = matches!(
+            self.catalog.job(job)?.request.kind,
+            JobKind::Import { strict: true, .. }
+        );
         let mut recognized = vec![];
         let mut new = vec![];
+        let mut accounted = std::collections::BTreeSet::new();
         for (entry, digest) in entries.iter().zip(digests) {
             entry.validate()?;
             self.catalog.remember_source(entry, &identity, digest)?;
@@ -206,8 +208,20 @@ impl ImportCoordinator {
                 }
                 self.catalog.cache_jpeg_inspection(&inspection)?;
             }
+            let exists:bool=self.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM import_items WHERE parent=? AND source_path=? AND digest=?)",params![job.to_string(),entry.path.as_str(),digest.as_str()],|row|row.get(0))?;
+            if exists {
+                accounted.insert(entry.path.clone());
+            } else if matches!(entry.role, SourceRole::Original(_)) {
+                let selection = self.canonical_archived_original(entry, digest, strict)?;
+                if self.account_canonical_original(job, entry, digest, selection)? {
+                    accounted.insert(entry.path.clone());
+                }
+            }
             let cached = self.catalog.metadata(digest)?;
-            if cached.is_none() && matches!(entry.role, SourceRole::Original(_)) {
+            if !accounted.contains(&entry.path)
+                && cached.is_none()
+                && matches!(entry.role, SourceRole::Original(_))
+            {
                 new.push(entry.clone());
             }
             recognized.push(Recognition {
@@ -220,7 +234,17 @@ impl ImportCoordinator {
         let results = if let Some(metadata) = metadata {
             metadata
         } else if !new.is_empty() {
-            match self.extractor.extract(&new) {
+            let new_digests = new
+                .iter()
+                .map(|entry| {
+                    let index = entries
+                        .iter()
+                        .position(|candidate| candidate.path == entry.path)
+                        .unwrap();
+                    digests[index].clone()
+                })
+                .collect::<Vec<_>>();
+            match self.extractor.extract_hashed(&new, &new_digests) {
                 Ok(results) => results,
                 Err(error) => new
                     .iter()
@@ -271,6 +295,9 @@ impl ImportCoordinator {
         )?;
         let mut captures = Vec::new();
         for (entry, recognition) in entries.iter().zip(&recognized) {
+            if accounted.contains(&entry.path) {
+                continue;
+            }
             if let SourceRole::Original(role) = entry.role {
                 let meta = self
                     .catalog
@@ -294,7 +321,11 @@ impl ImportCoordinator {
                 captures.push(capture);
             }
         }
-        let sequences = self.catalog.classify_import_sequences(&captures)?;
+        let sequences = if captures.is_empty() {
+            vec![]
+        } else {
+            self.catalog.classify_import_sequences(&captures)?
+        };
         let mut ambiguous = std::collections::BTreeMap::new();
         for capture in &captures {
             let facts = capture.facts();
@@ -317,6 +348,9 @@ impl ImportCoordinator {
             }
         }
         for (entry, recognition) in entries.iter().zip(recognized) {
+            if accounted.contains(&entry.path) {
+                continue;
+            }
             let exists:bool=self.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM import_items WHERE parent=? AND source_path=? AND digest=?)",params![job.to_string(),entry.path.as_str(),recognition.digest.as_str()],|r|r.get(0))?;
             if exists {
                 continue;
@@ -540,6 +574,12 @@ impl ImportCoordinator {
             .optional()?
             .unwrap_or(0);
         Ok(ImportReport {
+            scan_complete: self.scan_complete(job)?,
+            pending_jpeg_checks: self.catalog.db.query_row(
+                "SELECT count(*) FROM import_items WHERE parent=? AND state='jpeg_pending'",
+                [job.to_string()],
+                |row| row.get(0),
+            )?,
             skipped,
             job: Some(job),
             selected,

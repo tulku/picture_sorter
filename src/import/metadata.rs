@@ -170,6 +170,13 @@ impl Catalog {
 }
 pub trait MetadataExtractor {
     fn extract(&self, entries: &[SourceEntry]) -> AppResult<Vec<MetadataResult>>;
+    fn extract_hashed(
+        &self,
+        entries: &[SourceEntry],
+        _digests: &[Digest],
+    ) -> AppResult<Vec<MetadataResult>> {
+        self.extract(entries)
+    }
 }
 pub struct ExifToolExtractor {
     pub executable: OsString,
@@ -213,6 +220,32 @@ impl ExifToolExtractor {
 }
 impl MetadataExtractor for ExifToolExtractor {
     fn extract(&self, entries: &[SourceEntry]) -> AppResult<Vec<MetadataResult>> {
+        self.extract_impl(entries, None)
+    }
+    fn extract_hashed(
+        &self,
+        entries: &[SourceEntry],
+        digests: &[Digest],
+    ) -> AppResult<Vec<MetadataResult>> {
+        ExifToolExtractor::extract_hashed(self, entries, digests)
+    }
+}
+impl ExifToolExtractor {
+    pub(crate) fn extract_hashed(
+        &self,
+        entries: &[SourceEntry],
+        digests: &[Digest],
+    ) -> AppResult<Vec<MetadataResult>> {
+        if entries.len() != digests.len() {
+            return Err(AppError::invalid("metadata digest batch length differs"));
+        }
+        self.extract_impl(entries, Some(digests))
+    }
+    fn extract_impl(
+        &self,
+        entries: &[SourceEntry],
+        digests: Option<&[Digest]>,
+    ) -> AppResult<Vec<MetadataResult>> {
         if entries.is_empty() {
             return Ok(vec![]);
         }
@@ -255,13 +288,16 @@ impl MetadataExtractor for ExifToolExtractor {
         let status = child.wait()?;
         let values: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap_or_default();
         let mut result = Vec::new();
-        for (entry, path) in entries.iter().zip(paths.iter()) {
+        for (index, (entry, path)) in entries.iter().zip(paths.iter()).enumerate() {
             entry.validate()?;
             let matched = values
                 .iter()
                 .filter(|v| v.get("SourceFile").and_then(|v| v.as_str()) == Some(path.as_str()))
                 .collect::<Vec<_>>();
-            let digest = hash_source(entry)?;
+            let digest = match digests {
+                Some(values) => values[index].clone(),
+                None => hash_source(entry)?,
+            };
             let mut metadata = MetadataResult::from_json(
                 digest,
                 matched

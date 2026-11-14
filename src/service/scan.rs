@@ -8,21 +8,25 @@ use crate::{
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 enum ScanCommand {
     Start {
-        job: JobId,
         source: std::path::PathBuf,
         limit: usize,
     },
     Next,
+    Fingerprint {
+        cached: Vec<Option<Digest>>,
+    },
     Metadata {
         paths: Vec<ArchivePath>,
     },
 }
 enum ScanReply {
-    Batch {
+    Inventory {
         entries: Vec<SourceEntry>,
+        skipped: u64,
+    },
+    Fingerprints {
         digests: Vec<Digest>,
         jpegs: Vec<JpegInspection>,
-        skipped: u64,
     },
     Metadata(Vec<MetadataResult>),
 }
@@ -42,19 +46,47 @@ impl Worker {
             while let Ok(command) = commands.recv() {
                 let reply = (|| match command {
                     ScanCommand::Start {
-                        job,
                         source,
                         limit: batch_limit,
                     } => {
-                        let _ = job;
                         limit = batch_limit;
                         inventory = Some(Inventory::open(RootHandle::open(
                             &source,
                             RootPolicy::Local,
                         )?)?);
-                        next(&mut inventory, &mut entries, &mut digests, limit)
+                        next(&mut inventory, &mut entries, limit)
                     }
-                    ScanCommand::Next => next(&mut inventory, &mut entries, &mut digests, limit),
+                    ScanCommand::Next => next(&mut inventory, &mut entries, limit),
+                    ScanCommand::Fingerprint { cached } => {
+                        if cached.len() != entries.len() {
+                            return Err(AppError::integrity("fingerprint selector left its batch"));
+                        }
+                        let mut jpegs = vec![];
+                        digests = entries
+                            .iter()
+                            .zip(cached)
+                            .map(|(entry, cached)| {
+                                if let Some(digest) = cached {
+                                    entry.validate()?;
+                                    Ok(digest)
+                                } else if matches!(
+                                    entry.role,
+                                    SourceRole::Original(MediaRole::Jpeg)
+                                ) {
+                                    let inspection = inspect_jpeg_source(entry)?;
+                                    let digest = inspection.digest.clone();
+                                    jpegs.push(inspection);
+                                    Ok(digest)
+                                } else {
+                                    hash_source(entry)
+                                }
+                            })
+                            .collect::<AppResult<Vec<_>>>()?;
+                        Ok(ScanReply::Fingerprints {
+                            digests: digests.clone(),
+                            jpegs,
+                        })
+                    }
                     ScanCommand::Metadata { paths } => {
                         let selected = paths
                             .iter()
@@ -68,17 +100,22 @@ impl Worker {
                                     })
                             })
                             .collect::<AppResult<Vec<_>>>()?;
-                        let metadata = match ExifToolExtractor::default().extract(&selected) {
+                        let selected_digests = selected
+                            .iter()
+                            .map(|entry| {
+                                digests[entries.iter().position(|e| e.path == entry.path).unwrap()]
+                                    .clone()
+                            })
+                            .collect::<Vec<_>>();
+                        let metadata = match ExifToolExtractor::default()
+                            .extract_hashed(&selected, &selected_digests)
+                        {
                             Ok(results) => results,
-                            Err(error) => selected
-                                .iter()
-                                .map(|entry| {
-                                    let index =
-                                        entries.iter().position(|e| e.path == entry.path).unwrap();
-                                    let mut result = MetadataResult::from_json(
-                                        digests[index].clone(),
-                                        serde_json::Value::Null,
-                                    );
+                            Err(error) => selected_digests
+                                .into_iter()
+                                .map(|digest| {
+                                    let mut result =
+                                        MetadataResult::from_json(digest, serde_json::Value::Null);
                                     result.error = Some(error.to_string());
                                     result
                                 })
@@ -106,31 +143,14 @@ impl Worker {
 fn next(
     inventory: &mut Option<Inventory>,
     entries: &mut Vec<SourceEntry>,
-    digests: &mut Vec<Digest>,
     limit: usize,
 ) -> AppResult<ScanReply> {
     let inventory = inventory
         .as_mut()
         .ok_or_else(|| AppError::integrity("scan not started"))?;
     *entries = inventory.next_batch(limit)?;
-    let mut jpegs = Vec::new();
-    *digests = entries
-        .iter()
-        .map(|entry| {
-            if matches!(entry.role, SourceRole::Original(MediaRole::Jpeg)) {
-                let inspection = inspect_jpeg_source(entry)?;
-                let digest = inspection.digest.clone();
-                jpegs.push(inspection);
-                Ok(digest)
-            } else {
-                hash_source(entry)
-            }
-        })
-        .collect::<AppResult<Vec<_>>>()?;
-    Ok(ScanReply::Batch {
+    Ok(ScanReply::Inventory {
         entries: entries.clone(),
-        digests: digests.clone(),
-        jpegs,
         skipped: inventory.skipped,
     })
 }
@@ -138,6 +158,7 @@ struct Pending {
     job: JobId,
     entries: Vec<SourceEntry>,
     digests: Vec<Digest>,
+    cached_bytes: u64,
 }
 pub(crate) struct ScanDriver {
     worker: Worker,
@@ -170,7 +191,6 @@ impl ScanDriver {
     pub fn active_job(&self) -> Option<JobId> {
         self.active
     }
-
     pub fn advance(&mut self, engine: &mut ImportCoordinator, job: JobId) -> AppResult<()> {
         if engine.scan_complete(job)? {
             return Ok(());
@@ -191,7 +211,6 @@ impl ScanDriver {
                 operation_id: record.request.operation_id,
             })?;
             self.worker.submit(ScanCommand::Start {
-                job,
                 source,
                 limit: engine.config.metadata_batch,
             })?;
@@ -214,21 +233,52 @@ impl ScanDriver {
             }
         };
         match reply {
-            ScanReply::Batch {
-                entries,
-                digests,
-                jpegs,
-                skipped,
-            } => {
+            ScanReply::Inventory { entries, skipped } => {
                 if entries.is_empty() {
                     engine.finish_scan(job, skipped)?;
                     self.active = None;
                     return Ok(());
                 }
+                let identity = engine
+                    .catalog
+                    .ensure_import_source(job, entries[0].root.path())?;
+                let strict = matches!(
+                    engine.catalog.job(job)?.request.kind,
+                    JobKind::Import { strict: true, .. }
+                );
+                let cached = entries
+                    .iter()
+                    .map(|entry| {
+                        engine
+                            .catalog
+                            .cached_source_digest(entry, &identity, strict)
+                    })
+                    .collect::<AppResult<Vec<_>>>()?;
+                let cached_bytes = entries
+                    .iter()
+                    .zip(&cached)
+                    .filter(|(_, digest)| digest.is_some())
+                    .map(|(entry, _)| entry.size)
+                    .sum();
+                self.pending = Some(Pending {
+                    job,
+                    entries,
+                    digests: vec![],
+                    cached_bytes,
+                });
+                self.worker.submit(ScanCommand::Fingerprint { cached })?;
+            }
+            ScanReply::Fingerprints { digests, jpegs } => {
+                let pending = self
+                    .pending
+                    .as_mut()
+                    .ok_or_else(|| AppError::integrity("fingerprint reply has no batch"))?;
+                pending.digests = digests;
                 for inspection in jpegs {
-                    let entry = entries
+                    let entry = pending
+                        .entries
                         .iter()
-                        .zip(&digests)
+                        .zip(&pending.digests)
                         .find(|(entry, digest)| {
                             matches!(entry.role, SourceRole::Original(MediaRole::Jpeg))
                                 && **digest == inspection.digest
@@ -242,7 +292,7 @@ impl ScanDriver {
                     engine.catalog.cache_jpeg_inspection(&inspection)?;
                 }
                 let mut paths = vec![];
-                for (entry, digest) in entries.iter().zip(&digests) {
+                for (entry, digest) in pending.entries.iter().zip(&pending.digests) {
                     if matches!(entry.role, SourceRole::Original(_))
                         && engine.catalog.metadata(digest)?.is_none()
                     {
@@ -250,34 +300,35 @@ impl ScanDriver {
                     }
                 }
                 if paths.is_empty() {
-                    engine.accept_hashed_batch(job, &entries, &digests, Some(vec![]))?;
-                    self.worker.submit(ScanCommand::Next)?;
+                    self.accept(engine, job, vec![])?;
                 } else {
-                    self.pending = Some(Pending {
-                        job,
-                        entries,
-                        digests,
-                    });
                     self.worker.submit(ScanCommand::Metadata { paths })?;
                 }
             }
-            ScanReply::Metadata(metadata) => {
-                let pending = self
-                    .pending
-                    .take()
-                    .ok_or_else(|| AppError::integrity("metadata reply has no batch"))?;
-                if pending.job != job {
-                    return Err(AppError::integrity("metadata reply has obsolete job"));
-                }
-                engine.accept_hashed_batch(
-                    job,
-                    &pending.entries,
-                    &pending.digests,
-                    Some(metadata),
-                )?;
-                self.worker.submit(ScanCommand::Next)?;
-            }
+            ScanReply::Metadata(metadata) => self.accept(engine, job, metadata)?,
         }
         Ok(())
+    }
+    fn accept(
+        &mut self,
+        engine: &mut ImportCoordinator,
+        job: JobId,
+        metadata: Vec<MetadataResult>,
+    ) -> AppResult<()> {
+        let pending = self
+            .pending
+            .take()
+            .ok_or_else(|| AppError::integrity("scan reply has no batch"))?;
+        if pending.job != job {
+            return Err(AppError::integrity("scan reply has wrong job"));
+        }
+        engine.accept_cached_hashed_batch(
+            job,
+            &pending.entries,
+            &pending.digests,
+            Some(metadata),
+            pending.cached_bytes,
+        )?;
+        self.worker.submit(ScanCommand::Next)
     }
 }

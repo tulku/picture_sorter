@@ -16,6 +16,7 @@ struct Active {
     cursor: String,
     ticket: Option<WorkerTicket>,
     report: IntegrityReport,
+    targets: Vec<VerificationTarget>,
 }
 impl LocalAudit {
     pub fn active_job(&self) -> Option<JobId> {
@@ -55,6 +56,7 @@ impl LocalAudit {
             cursor: String::new(),
             ticket: None,
             report: IntegrityReport::default(),
+            targets: Vec::new(),
         });
         if active.job != job {
             self.active = Some(active);
@@ -67,14 +69,62 @@ impl LocalAudit {
                     self.active = Some(active);
                     return Ok(());
                 }
-                WorkerState::Completed(NasReply::Integrity(report)) => {
+                WorkerState::Completed(NasReply::Integrity(mut report)) => {
+                    if active.phase == 0 {
+                        let root = crate::fs::RootHandle::open(
+                            &config.working_root,
+                            crate::fs::RootPolicy::Local,
+                        )?;
+                        let mut verified = Vec::new();
+                        for (path, stamp) in std::mem::take(&mut report.verified) {
+                            let current = root
+                                .open_relative(&path, libc::O_RDONLY | libc::O_NONBLOCK, 0)
+                                .and_then(|file| {
+                                    Ok(crate::edit::SnapshotStamp::of(&file.metadata()?))
+                                });
+                            if current.is_ok_and(|current| current == stamp) {
+                                verified.push((path, stamp));
+                            } else {
+                                report.findings.push(IntegrityFinding {
+                                    path,
+                                    status: IntegrityStatus::Unknown,
+                                    reason: "original changed after verification".into(),
+                                });
+                            }
+                        }
+                        report.verified = verified;
+                    }
                     catalog.protect_integrity_scoped(
                         if active.phase == 1 { "state" } else { "local" },
                         &report,
                     )?;
                     if active.phase == 0 {
                         for (path, _) in &report.verified {
-                            catalog.db.execute("UPDATE placements SET local_ready=1 WHERE path=? AND EXISTS(SELECT 1 FROM local_residency_expectations e WHERE e.placement=placements.id)",[path.as_str()])?;
+                            let target = active
+                                .targets
+                                .iter()
+                                .find(|target| target.path == *path)
+                                .ok_or_else(|| {
+                                    AppError::integrity("verified original left its audit batch")
+                                })?;
+                            let VersionBody::Content { digest, size } = &target.body else {
+                                return Err(AppError::integrity(
+                                    "verified original has no content identity",
+                                ));
+                            };
+                            catalog.db.execute("UPDATE placements SET local_ready=1 WHERE path=? AND digest=? AND EXISTS(SELECT 1 FROM local_residency_expectations e WHERE e.placement=placements.id)",params![path.as_str(),digest.as_str()])?;
+                            catalog.db.execute("DELETE FROM physical_findings WHERE path=? AND digest=? AND size=?",params![path.as_str(),digest.as_str(),size])?;
+                            catalog.db.execute(
+                                "DELETE FROM startup_checks WHERE path=? AND digest=? AND size=?",
+                                params![path.as_str(), digest.as_str(), size],
+                            )?;
+                            let groups = catalog.db.prepare("SELECT DISTINCT group_id FROM placements WHERE path=? AND digest=?")?
+                                .query_map(params![path.as_str(),digest.as_str()],|row|row.get::<_,String>(0))?
+                                .collect::<Result<Vec<_>,_>>()?;
+                            for group in groups {
+                                catalog
+                                    .refresh_protection(serde_json::from_value(group.into())?)?;
+                            }
                         }
                     }
                     active.report.checked += report.checked;
@@ -98,6 +148,7 @@ impl LocalAudit {
             }
             if worker.available()? {
                 active.cursor = batch.last().unwrap().0.clone();
+                active.targets = batch.into_iter().map(|(_, target)| target).collect();
                 active.ticket = Some(worker.submit(NasCommand::AuditTargets {
                     root: if active.phase == 1 {
                         config.state_root.clone()
@@ -106,7 +157,7 @@ impl LocalAudit {
                     },
                     archive: None,
                     writer: config.writer_id,
-                    targets: batch.into_iter().map(|(_, target)| target).collect(),
+                    targets: active.targets.clone(),
                 })?);
             }
             self.active = Some(active);

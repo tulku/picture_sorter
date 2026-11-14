@@ -155,6 +155,7 @@ fn nas_bytes_changed_after_cataloguing_are_not_acknowledged_as_duplicates() {
     let output = service.cli(&[
         "import",
         service.r.source.to_str().unwrap(),
+        "--strict",
         "--wait-for",
         "archived",
     ]);
@@ -180,7 +181,12 @@ fn wait_until(mut predicate: impl FnMut() -> bool) {
     }
 }
 fn pending_import(service: &ServiceFixture) -> String {
-    let output = service.cli(&["import", service.r.source.to_str().unwrap(), "--no-wait"]);
+    let output = service.cli(&[
+        "import",
+        service.r.source.to_str().unwrap(),
+        "--strict",
+        "--no-wait",
+    ]);
     assert!(output.status.success());
     let job = parsed(&output)["outcome"]["job"]
         .as_str()

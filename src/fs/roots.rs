@@ -457,55 +457,72 @@ fn physical_mount_path(info: &str, id: u64, path: &Path) -> AppResult<PathBuf> {
     Ok(filesystem_root.join(relative))
 }
 fn reject_network_root(path: &Path) -> AppResult<()> {
-    use std::os::unix::ffi::OsStringExt;
     let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
-    let mut best: Option<(usize, &str)> = None;
-    for line in mounts.lines() {
-        let Some((fields, filesystem)) = line.split_once(" - ") else {
-            continue;
-        };
-        let Some(mount) = fields.split_whitespace().nth(4) else {
-            continue;
-        };
-        let kind = filesystem.split_whitespace().next().unwrap_or("");
-        let input = mount.as_bytes();
-        let mut decoded = Vec::new();
-        let mut i = 0;
-        while i < input.len() {
-            if input[i] == b'\\'
-                && i + 3 < input.len()
-                && input[i + 1..i + 4]
-                    .iter()
-                    .all(|n| (b'0'..=b'7').contains(n))
-            {
-                let n =
-                    (input[i + 1] - b'0') * 64 + (input[i + 2] - b'0') * 8 + (input[i + 3] - b'0');
-                decoded.push(n);
-                i += 4;
-            } else {
-                decoded.push(input[i]);
-                i += 1;
+    NETWORK_ROOT_CACHE.with_borrow_mut(|cache| cache.check(&mounts, path))
+}
+thread_local! {
+    static NETWORK_ROOT_CACHE: std::cell::RefCell<NetworkRootCache> = std::cell::RefCell::new(NetworkRootCache::default());
+}
+#[derive(Default)]
+struct NetworkRootCache {
+    snapshot: String,
+    mounts: Vec<(PathBuf, bool)>,
+    decisions: std::collections::HashMap<PathBuf, bool>,
+}
+impl NetworkRootCache {
+    fn check(&mut self, snapshot: &str, path: &Path) -> AppResult<()> {
+        if self.snapshot != snapshot {
+            self.snapshot.clear();
+            self.mounts.clear();
+            self.decisions.clear();
+            for line in snapshot.lines() {
+                let Some((fields, filesystem)) = line.split_once(" - ") else {
+                    continue;
+                };
+                let Some(mount) = fields.split_whitespace().nth(4) else {
+                    continue;
+                };
+                let kind = filesystem.split_whitespace().next().unwrap_or("");
+                let network = matches!(
+                    kind,
+                    "cifs" | "smb3" | "nfs" | "nfs4" | "9p" | "ceph" | "afs"
+                ) || kind.starts_with("fuse.sshfs")
+                    || kind.starts_with("fuse.rclone");
+                self.mounts.push((decode_mount_path(mount)?, network));
             }
+            self.snapshot.push_str(snapshot);
         }
-        let mount = PathBuf::from(std::ffi::OsString::from_vec(decoded));
-        if path.starts_with(&mount)
-            && best.is_none_or(|(length, _)| mount.as_os_str().len() > length)
-        {
-            best = Some((mount.as_os_str().len(), kind));
+        let network = if let Some(network) = self.decisions.get(path) {
+            *network
+        } else {
+            let mut best = None;
+            for (mount, network) in &self.mounts {
+                if !path.starts_with(mount) {
+                    continue;
+                }
+                let length = mount.as_os_str().len();
+                match best {
+                    Some((previous, _)) if previous > length => {}
+                    Some((previous, was_network)) if previous == length => {
+                        best = Some((length, was_network || *network))
+                    }
+                    _ => best = Some((length, *network)),
+                }
+            }
+            let network = best.is_some_and(|(_, network)| network);
+            if self.decisions.len() >= 64 {
+                self.decisions.clear();
+            }
+            self.decisions.insert(path.to_owned(), network);
+            network
+        };
+        if network {
+            return Err(AppError::invalid(
+                "working/state/test roots must be local; network roots are worker-only",
+            ));
         }
+        Ok(())
     }
-    if best.is_some_and(|(_, kind)| {
-        matches!(
-            kind,
-            "cifs" | "smb3" | "nfs" | "nfs4" | "9p" | "ceph" | "afs"
-        ) || kind.starts_with("fuse.sshfs")
-            || kind.starts_with("fuse.rclone")
-    }) {
-        return Err(AppError::invalid(
-            "working/state/test roots must be local; network roots are worker-only",
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -525,5 +542,40 @@ mod physical_root_tests {
                 .starts_with(cache)
         );
         assert_eq!(decode_mount_path("/a\\040b").unwrap(), Path::new("/a b"));
+    }
+}
+
+#[cfg(test)]
+mod network_cache_tests {
+    use super::*;
+    const LOCAL: &str = "20 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n21 20 8:2 / /media rw,relatime - ext4 /dev/sdb1 rw\n";
+    #[test]
+    fn changed_mount_snapshot_rejects_cached_root_and_ancestor_overmounts() {
+        let mut cache = NetworkRootCache::default();
+        for path in ["/media/card", "/media/card/DCIM"] {
+            cache.check(LOCAL, Path::new(path)).unwrap();
+        }
+        let network = "20 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n22 20 0:44 / /media rw,relatime - nfs4 server:/export rw,vers=4.2\n";
+        for path in ["/media/card", "/media/card/DCIM"] {
+            assert!(cache.check(network, Path::new(path)).is_err());
+        }
+        for path in ["/media/card", "/media/card/DCIM"] {
+            cache.check(LOCAL, Path::new(path)).unwrap();
+        }
+    }
+    #[test]
+    fn new_network_overmount_cannot_reuse_same_path_local_classification() {
+        let mut cache = NetworkRootCache::default();
+        let local = format!("{LOCAL}23 21 8:3 / /media/card rw,relatime - exfat /dev/sdc1 rw\n");
+        cache.check(&local, Path::new("/media/card/DCIM")).unwrap();
+        let network = format!(
+            "{local}24 21 0:44 / /media/card rw,relatime - nfs4 server:/export rw,vers=4.2\n"
+        );
+        assert!(
+            cache
+                .check(&network, Path::new("/media/card/DCIM"))
+                .is_err()
+        );
+        cache.check(&local, Path::new("/media/card/DCIM")).unwrap();
     }
 }

@@ -345,6 +345,18 @@ impl<'a> BootstrapCoordinator<'a> {
                 }
             }
             (Phase::InventoryNext, NasReply::Inventory(batch)) => {
+                for inspection in &batch.jpeg_inspections {
+                    if !batch.entries.iter().any(|entry| {
+                        matches!(entry.role, SourceRole::Original(MediaRole::Jpeg))
+                            && entry.digest == inspection.digest
+                            && entry.size == inspection.size
+                    }) {
+                        return Err(AppError::integrity(
+                            "JPEG fingerprint left its archive inventory batch",
+                        ));
+                    }
+                    self.catalog.cache_jpeg_inspection(inspection)?;
+                }
                 report.skipped = batch.skipped;
                 if batch.end {
                     active.phase = Phase::End;

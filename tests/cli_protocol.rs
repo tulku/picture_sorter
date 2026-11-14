@@ -296,3 +296,166 @@ fn cli_reports_integrity_and_operation_failures_without_changing_bytes() {
     );
     assert_eq!(std::fs::read(&dest).unwrap(), b"preserved");
 }
+
+#[test]
+fn human_import_reports_progress_before_a_paused_copy_finishes() {
+    use std::io::{BufRead, BufReader};
+    let service = support::service::ServiceFixture::new();
+    std::fs::write(service.r.source.join("A.ORF"), b"generated raw").unwrap();
+    let pid = service.status()["worker"]["local_pid"].as_u64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_photo_sorter"))
+        .arg("--config")
+        .arg(&service.profile)
+        .arg("import")
+        .arg(&service.r.source)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            if tx.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let early = rx.recv_timeout(Duration::from_secs(1));
+    let heartbeat_deadline = Instant::now() + Duration::from_secs(3);
+    let heartbeat = loop {
+        match rx.recv_timeout(heartbeat_deadline.saturating_duration_since(Instant::now())) {
+            Ok(line) if !line.contains("checked ") => continue,
+            result => break result,
+        }
+    };
+    let running = child.try_wait().unwrap().is_none();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    let output = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(early.is_ok(), "missing early progress: {early:?}");
+    assert!(heartbeat.is_ok(), "missing heartbeat: {heartbeat:?}");
+    assert!(running, "import finished while copy worker was paused");
+    assert!(early.unwrap().contains(service.r.source.to_str().unwrap()));
+    let heartbeat = heartbeat.unwrap();
+    assert!(heartbeat.contains("checked "), "{heartbeat}");
+    assert!(heartbeat.contains("pending upload "), "{heartbeat}");
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn import_progress_keeps_json_and_no_wait_output_clean() {
+    let service = support::service::ServiceFixture::new();
+    for args in [
+        vec!["import", service.r.source.to_str().unwrap(), "--json"],
+        vec!["import", service.r.source.to_str().unwrap(), "--no-wait"],
+        vec!["import", service.r.source.to_str().unwrap(), "--dry-run"],
+    ] {
+        let output = cli(&service.profile, &args);
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        if args.contains(&"--json") {
+            let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(response["outcome"]["type"], "job");
+        } else if args.contains(&"--no-wait") {
+            assert!(String::from_utf8_lossy(&output.stdout).starts_with("Accepted job "));
+        }
+    }
+}
+
+#[test]
+fn human_archive_wait_preserves_ingested_milestone_and_final_request_identity() {
+    let service = support::service::ServiceFixture::new();
+    assert!(service.cli(&["archive", "init"]).status.success());
+    let pid = service.status()["worker"]["pid"].as_u64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    std::fs::write(service.r.source.join("A.ORF"), b"generated raw").unwrap();
+    let request = OperationId::new().to_string();
+    let output = cli(
+        &service.profile,
+        &[
+            "import",
+            service.r.source.to_str().unwrap(),
+            "--request-id",
+            &request,
+        ],
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let detail = text.split_once('\n').unwrap().1;
+    let detail: serde_json::Value = serde_json::from_str(detail).unwrap();
+    let job = detail["job"].as_str().unwrap();
+    let mut waiter = Command::new(env!("CARGO_BIN_EXE_photo_sorter"))
+        .arg("--config")
+        .arg(&service.profile)
+        .args(["jobs", "wait", job, "--wait-for", "archived"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let waiting = waiter.try_wait().unwrap().is_none();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    let final_output = waiter.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(waiting, "archive wait returned before publication");
+    assert!(final_output.status.success(), "{final_output:?}");
+    assert!(String::from_utf8_lossy(&final_output.stderr).contains(job));
+    let result = service.cli(&["jobs", "wait", job, "--request-id", &request]);
+    let response: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(response["request_id"], request);
+}
+
+#[test]
+fn human_import_preserves_final_error_exit() {
+    let service = support::service::ServiceFixture::new();
+    let source = service.r.source.join("missing");
+    let human = cli(&service.profile, &["import", source.to_str().unwrap()]);
+    let json = service.cli(&["import", source.to_str().unwrap()]);
+    assert!(!human.status.success());
+    assert_eq!(human.status.code(), json.status.code());
+}
+
+#[test]
+fn human_import_reports_source_while_service_acceptance_is_withheld() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+    let r = TestRig::new();
+    let profile = config(&r);
+    let socket = r.state.join("service.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_photo_sorter"))
+        .arg("--config")
+        .arg(&profile)
+        .arg("import")
+        .arg(&r.source)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        BufReader::new(stderr).read_line(&mut line).unwrap();
+        tx.send(line).unwrap();
+    });
+    let (stream, _) = listener.accept().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut request = String::new();
+    BufReader::new(&stream).read_line(&mut request).unwrap();
+    let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+    let early = rx.recv_timeout(Duration::from_secs(1));
+    let running = child.try_wait().unwrap().is_none();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    reader.join().unwrap();
+    assert_eq!(request["command"]["type"], "import");
+    assert!(running, "CLI must still await the withheld acceptance");
+    let early = early.expect("missing source progress before service acceptance");
+    assert!(early.contains(r.source.to_str().unwrap()), "{early}");
+    assert!(early.contains("Checking card"), "{early}");
+}

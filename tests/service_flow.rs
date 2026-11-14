@@ -1888,6 +1888,56 @@ fn corrected_local_integrity_finding_recovers_without_archive_audit_clearing_it(
 }
 
 #[test]
+fn local_verify_clears_matching_physical_finding_before_next_periodic_check() {
+    let service = ServiceFixture::with_config(|c, _| {
+        c.activity_hold_seconds = 0;
+        c.poll_seconds = 3600;
+    });
+    assert!(service.cli(&["archive", "init"]).status.success());
+    std::fs::write(service.r.source.join("A.ORF"), b"generated raw").unwrap();
+    assert!(
+        service
+            .cli(&[
+                "import",
+                service.r.source.to_str().unwrap(),
+                "--wait-for",
+                "archived"
+            ])
+            .status
+            .success()
+    );
+    let db = rusqlite::Connection::open(service.r.state.join("catalog.sqlite")).unwrap();
+    let path: String = db
+        .query_row("SELECT path FROM placements LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    std::fs::write(service.r.local.join(&path), b"foreign changed raw").unwrap();
+    db.execute("INSERT INTO physical_findings(path,group_id,digest,size,status,reason) SELECT path,group_id,digest,13,'Corrupt','previous local audit' FROM placements WHERE path=? ON CONFLICT(path) DO UPDATE SET status=excluded.status,reason=excluded.reason", [&path]).unwrap();
+    db.execute("UPDATE residency SET protected=1", []).unwrap();
+    assert!(service.cli(&["verify", "--archive"]).status.success());
+    let findings: u64 = db
+        .query_row("SELECT count(*) FROM physical_findings", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        findings, 1,
+        "archive audit cleared a local physical finding"
+    );
+    std::fs::write(service.r.local.join(&path), b"generated raw").unwrap();
+    let audit = service.cli(&["verify"]);
+    assert!(
+        audit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&audit.stdout)
+    );
+    let findings: u64 = db
+        .query_row("SELECT count(*) FROM physical_findings", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        findings, 0,
+        "verified correction retained a physical finding"
+    );
+}
+
+#[test]
 fn cancelled_worker_audit_drains_before_releasing_its_lease() {
     let service = ServiceFixture::new();
     std::fs::write(service.r.source.join("A.ORF"), b"generated raw").unwrap();
@@ -2085,4 +2135,250 @@ fn refresh_application_results_have_durable_bounded_cli_pages() {
             .iter()
             .all(|id| !detail["applied"].as_array().unwrap().contains(id))
     );
+}
+
+#[test]
+fn nas_failure_during_multi_file_import_does_not_end_local_ingestion() {
+    let service = ServiceFixture::new();
+    assert!(service.cli(&["archive", "init"]).status.success());
+    for index in 0..8 {
+        std::fs::write(
+            service.r.source.join(format!("photo-{index}.ORF")),
+            format!("new original {index}"),
+        )
+        .unwrap();
+    }
+    let pid = service.status()["worker"]["local_pid"].as_u64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let operation = OperationId::new().to_string();
+    let mut importer = std::process::Command::new(env!("CARGO_BIN_EXE_photo_sorter"))
+        .arg("--config")
+        .arg(&service.profile)
+        .arg("import")
+        .arg(&service.r.source)
+        .args(["--json", "--request-id", &operation])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    let job = loop {
+        let status = service.status();
+        let record = status["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|job| job["request"]["operation_id"] == operation);
+        if let Some(record) = record {
+            let job = record["id"].as_str().unwrap();
+            let output = service.cli(&["jobs", "show", job]);
+            let shown: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if shown["outcome"]["detail"]["scan_complete"] == true {
+                assert_eq!(shown["outcome"]["detail"]["selected"], 8);
+                assert_eq!(shown["outcome"]["detail"]["local_ready"], 0);
+                break job.to_string();
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "scan did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    std::fs::rename(
+        &service.r.archive,
+        service.r._temp.path().join("offline-archive"),
+    )
+    .unwrap();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    let started = Instant::now();
+    let mut snapshots = vec![];
+    let mut next_snapshot = Duration::ZERO;
+    let mut local_ready = 0;
+    let mut last_local_progress = Instant::now();
+    while importer.try_wait().unwrap().is_none()
+        && started.elapsed() < Duration::from_secs(30)
+        && last_local_progress.elapsed() < Duration::from_secs(5)
+    {
+        if started.elapsed() >= next_snapshot {
+            let shown = service.cli(&["jobs", "show", &job]);
+            let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+            let completed = shown["outcome"]["detail"]["local_ready"].as_u64().unwrap();
+            if completed > local_ready {
+                local_ready = completed;
+                last_local_progress = Instant::now();
+            }
+            snapshots.push((
+                started.elapsed(),
+                serde_json::json!({
+                    "state": shown["outcome"]["job"]["state"],
+                    "reason": shown["outcome"]["job"]["reason"],
+                    "local_ready": shown["outcome"]["detail"]["local_ready"],
+                    "waiting": shown["outcome"]["detail"]["waiting"],
+                })
+                .to_string(),
+            ));
+            next_snapshot += Duration::from_secs(1);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if importer.try_wait().unwrap().is_none() {
+        let status = service.status();
+        snapshots.push((started.elapsed(), status.to_string()));
+        importer.kill().unwrap();
+    }
+    let output = importer.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "NAS failure ended local wait: {output:?}; progress: {snapshots:?}"
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let detail = &response["outcome"]["detail"];
+    assert_eq!(detail["local_ready"], 8, "{response}");
+    assert_eq!(detail["pending_archive"], 8, "{response}");
+    assert_eq!(detail["archive_committed"], 0, "{response}");
+    let db = rusqlite::Connection::open(service.r.state.join("catalog.sqlite")).unwrap();
+    let paths = db
+        .prepare("SELECT destination FROM import_items WHERE parent=? ORDER BY source_path")
+        .unwrap()
+        .query_map([&job], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for (index, path) in paths.iter().enumerate() {
+        assert_eq!(
+            std::fs::read(service.r.local.join(path)).unwrap(),
+            format!("new original {index}").as_bytes()
+        );
+    }
+    let archived = service.cli(&["jobs", "wait", &job, "--wait-for", "archived"]);
+    assert_eq!(archived.status.code(), Some(3), "{archived:?}");
+    let response: serde_json::Value = serde_json::from_slice(&archived.stdout).unwrap();
+    assert_eq!(response["outcome"]["job"]["state"], "WaitingNas");
+}
+
+#[test]
+fn unavailable_nas_still_blocks_an_unresolved_jpeg_comparison() {
+    let service = ServiceFixture::new();
+    assert!(service.cli(&["archive", "init"]).status.success());
+    let original = include_bytes!("fixtures/jpeg/red.jpg");
+    std::fs::write(service.r.source.join("IMG0001.JPG"), original).unwrap();
+    let initial = service.cli(&[
+        "import",
+        service.r.source.to_str().unwrap(),
+        "--wait-for",
+        "archived",
+    ]);
+    assert!(initial.status.success(), "{initial:?}");
+    let db = rusqlite::Connection::open(service.r.state.join("catalog.sqlite")).unwrap();
+    db.execute("DELETE FROM jpeg_fingerprints", []).unwrap();
+    let mut variant = original[..2].to_vec();
+    variant.extend_from_slice(b"\xff\xfe\x00\x06note");
+    variant.extend_from_slice(&original[2..]);
+    std::fs::write(service.r.source.join("IMG0001.JPG"), variant).unwrap();
+    std::fs::rename(
+        &service.r.archive,
+        service.r._temp.path().join("offline-archive"),
+    )
+    .unwrap();
+    let mut importer = std::process::Command::new(env!("CARGO_BIN_EXE_photo_sorter"))
+        .arg("--config")
+        .arg(&service.profile)
+        .arg("import")
+        .arg(&service.r.source)
+        .arg("--json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while importer.try_wait().unwrap().is_none() && started.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if importer.try_wait().unwrap().is_none() {
+        importer.kill().unwrap();
+    }
+    let output = importer.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["outcome"]["job"]["state"], "WaitingNas");
+    assert_eq!(response["outcome"]["detail"]["pending_jpeg_checks"], 1);
+    assert_eq!(response["outcome"]["detail"]["local_ready"], 0);
+}
+
+#[test]
+fn fresh_capacity_measurement_does_not_wait_for_retained_nas_retry() {
+    use photo_sorter::{catalog::*, fs::*, import::*};
+    let operation = OperationId::new();
+    let service = ServiceFixture::with_config(|config, r| {
+        for index in 0..3 {
+            std::fs::write(
+                r.source.join(format!("new-{index}.ORF")),
+                format!("raw {index}"),
+            )
+            .unwrap();
+        }
+        let state = RootHandle::open(&r.state, RootPolicy::Local).unwrap();
+        let mut engine = ImportCoordinator::new(config.clone(), Catalog::open(&state).unwrap());
+        let report = engine
+            .prepare(ImportRequest {
+                source_path: r.source.clone(),
+                strict: false,
+                dry_run: false,
+                operation_id: operation,
+            })
+            .unwrap();
+        let job = report.job.unwrap();
+        let record = engine.catalog.job(job).unwrap();
+        engine
+            .catalog
+            .transition(
+                job,
+                record.generation,
+                JobTransition::Wait(
+                    JobState::WaitingCapacity,
+                    "fresh worker capacity measurement pending; bytes retained".into(),
+                ),
+            )
+            .unwrap();
+        engine
+            .catalog
+            .defer_job(
+                job,
+                SystemClock::default().now().saturating_add(600),
+                "archive unavailable",
+            )
+            .unwrap();
+    });
+    let status = service.status();
+    let job = status["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|job| job["request"]["operation_id"] == operation.to_string())
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let mut waiter = std::process::Command::new(env!("CARGO_BIN_EXE_photo_sorter"))
+        .arg("--config")
+        .arg(&service.profile)
+        .args(["jobs", "wait", job, "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while waiter.try_wait().unwrap().is_none() && started.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if waiter.try_wait().unwrap().is_none() {
+        waiter.kill().unwrap();
+    }
+    let output = waiter.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "local work inherited the NAS retry: {output:?}"
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["outcome"]["detail"]["local_ready"], 3);
 }

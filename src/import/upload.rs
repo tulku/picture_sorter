@@ -197,7 +197,13 @@ impl UploadDriver {
                 return engine.report(job);
             };
             if let Some(check) = engine.pending_jpeg_check(item.id)? {
-                if let Some(image) = engine.catalog.jpeg_fingerprint(&check.candidate.digest)? {
+                let strict = matches!(
+                    engine.catalog.job(job)?.request.kind,
+                    JobKind::Import { strict: true, .. }
+                );
+                if !strict
+                    && let Some(image) = engine.catalog.jpeg_fingerprint(&check.candidate.digest)?
+                {
                     engine.finish_jpeg_check(
                         &item,
                         &JpegInspection {

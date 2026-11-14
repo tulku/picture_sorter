@@ -19,6 +19,8 @@ pub struct ArchiveObservation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveInventoryBatch {
     pub entries: Vec<ArchiveObservation>,
+    #[serde(default)]
+    pub jpeg_inspections: Vec<JpegInspection>,
     pub end: bool,
     pub skipped: u64,
 }
@@ -37,8 +39,16 @@ impl ArchiveInventory {
     pub fn next(&mut self, store: &ArchiveStore, limit: usize) -> AppResult<ArchiveInventoryBatch> {
         self.entries = self.cursor.next_batch(limit)?;
         let mut entries = vec![];
+        let mut jpeg_inspections = vec![];
         for entry in &self.entries {
-            let digest = hash_source(entry)?;
+            let digest = if matches!(entry.role, SourceRole::Original(MediaRole::Jpeg)) {
+                let inspection = inspect_jpeg_source(entry)?;
+                let digest = inspection.digest.clone();
+                jpeg_inspections.push(inspection);
+                digest
+            } else {
+                hash_source(entry)?
+            };
             if matches!(entry.role, SourceRole::Companion(_)) {
                 let staged = ArchivePath::parse(&format!(
                     ".photo-sorter/staging/adopt-{}",
@@ -72,6 +82,7 @@ impl ArchiveInventory {
         Ok(ArchiveInventoryBatch {
             end: entries.is_empty(),
             entries,
+            jpeg_inspections,
             skipped: self.cursor.skipped,
         })
     }

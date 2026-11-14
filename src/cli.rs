@@ -6,6 +6,8 @@ use crate::{
     fs::*,
     service::{self, protocol::*},
 };
+mod progress;
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 #[derive(Parser)]
@@ -142,6 +144,24 @@ pub enum ConflictsCommand {
 }
 #[derive(Subcommand)]
 pub enum CatalogCommand {
+    PreviewSource {
+        job: JobId,
+        source: PathBuf,
+        #[arg(long)]
+        offline: bool,
+    },
+    AdoptSource {
+        job: JobId,
+        source: PathBuf,
+        #[arg(long)]
+        offline: bool,
+    },
+    IndexJpegs {
+        #[arg(long)]
+        scan: Option<JobId>,
+        #[arg(long)]
+        offline: bool,
+    },
     Backup {
         destination: PathBuf,
         #[arg(long)]
@@ -206,6 +226,75 @@ pub fn run(cli: Cli) -> AppResult<i32> {
         return Ok(0);
     }
     match &cli.command {
+        CliCommand::Catalog {
+            command:
+                CatalogCommand::PreviewSource {
+                    job,
+                    source,
+                    offline,
+                },
+        } => {
+            if !offline {
+                return Err(AppError::invalid(
+                    "cache preview requires --offline and a stopped service",
+                ));
+            }
+            if cli.dry_run {
+                return Ok(0);
+            }
+            let report = service::offline_preview_source(&config, *job, source)?;
+            println!("{}", serde_json::to_string(&report)?);
+            return Ok(0);
+        }
+        CliCommand::Catalog {
+            command:
+                CatalogCommand::AdoptSource {
+                    job,
+                    source,
+                    offline,
+                },
+        } => {
+            if !offline {
+                return Err(AppError::invalid(
+                    "source-history adoption requires --offline and a stopped service",
+                ));
+            }
+            if cli.dry_run {
+                return Ok(0);
+            }
+            let count = service::offline_adopt_source(&config, *job, source)?;
+            println!("{}", serde_json::json!({"adopted":count,"job":job}));
+            return Ok(0);
+        }
+        CliCommand::Catalog {
+            command: CatalogCommand::IndexJpegs { scan, offline },
+        } => {
+            if !offline {
+                return Err(AppError::invalid(
+                    "JPEG indexing requires --offline and a stopped service",
+                ));
+            }
+            if cli.dry_run {
+                return Ok(0);
+            }
+            let report = service::offline_index_jpegs(&config, *scan, |report| {
+                if !cli.json {
+                    eprintln!(
+                        "Indexing JPEG images: {}/{}; {} bytes; {}",
+                        report.indexed,
+                        report.selected,
+                        report.bytes,
+                        report
+                            .path
+                            .as_ref()
+                            .map(|path| path.as_str())
+                            .unwrap_or("complete")
+                    );
+                }
+            })?;
+            println!("{}", serde_json::to_string(&report)?);
+            return Ok(0);
+        }
         CliCommand::Service {
             command: ServiceCommand::Run,
         } => {
@@ -349,14 +438,25 @@ pub fn run(cli: Cli) -> AppResult<i32> {
         },
         _ => return Err(AppError::invalid("invalid command combination")),
     };
-    let response = service::Client::connect(&config)?.send(Request {
+    let request = Request {
         protocol_version: PROTOCOL_VERSION,
         request_id: cli.request_id.unwrap_or_default(),
         command,
         dry_run: cli.dry_run,
         no_wait: cli.no_wait,
         wait_for: cli.wait_for,
-    })?;
+    };
+    let response = if !cli.json
+        && !request.no_wait
+        && !request.dry_run
+        && matches!(
+            request.command,
+            Command::Import { .. } | Command::JobWait { .. }
+        ) {
+        progress::send(&config, request)?
+    } else {
+        service::Client::connect(&config)?.send(request)?
+    };
     let code = response.exit_code();
     if cli.json {
         println!("{}", serde_json::to_string(&response)?);

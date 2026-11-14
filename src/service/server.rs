@@ -834,6 +834,16 @@ impl Runtime {
             },
         })
     }
+    fn import_has_local_work(&self, job: JobId) -> AppResult<bool> {
+        if !self.engine.scan_complete(job)? {
+            return Ok(true);
+        }
+        Ok(self.engine.catalog.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM import_items WHERE parent=? AND local_ready=0 AND archived=0 AND state NOT IN('conflict','jpeg_pending','image_duplicate'))",
+            [job.to_string()],
+            |row| row.get(0),
+        )?)
+    }
     fn wait_response(&self, request: &Request, job: JobId) -> AppResult<Option<Response>> {
         let record = self.engine.catalog.job(job)?;
         let conflict = matches!(
@@ -862,6 +872,15 @@ impl Runtime {
                 .reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("fresh worker capacity measurement pending"))
+        {
+            return Ok(None);
+        }
+        if record.state == JobState::WaitingNas
+            && matches!(record.request.kind, JobKind::Import { .. })
+            && matches!(request.wait_for, Milestone::Ingested)
+            && !milestone
+            && !record.cancel_requested
+            && self.import_has_local_work(job)?
         {
             return Ok(None);
         }
@@ -1720,10 +1739,16 @@ impl Runtime {
                     .engine
                     .catalog
                     .job_is_due(job, SystemClock::default().now())?;
-                if due || self.scan.active_job() == Some(job) {
+                let local_can_progress = (record.state == JobState::WaitingNas
+                    || (record.state == JobState::WaitingCapacity
+                        && record.reason.as_deref().is_some_and(|reason| {
+                            reason.contains("fresh worker capacity measurement pending")
+                        })))
+                    && self.import_has_local_work(job)?;
+                if due || local_can_progress || self.scan.active_job() == Some(job) {
                     self.scan.advance(&mut self.engine, job)?;
                 }
-                if due || self.local_transfer.active_parent() == Some(job) {
+                if due || local_can_progress || self.local_transfer.active_parent() == Some(job) {
                     self.local_transfer.advance(&mut self.engine, job)?;
                 }
                 let report = self.engine.report(job)?;

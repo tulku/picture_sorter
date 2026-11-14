@@ -83,13 +83,19 @@ CREATE TABLE IF NOT EXISTS favorite_receipts(id TEXT PRIMARY KEY,intent TEXT NOT
 CREATE TABLE IF NOT EXISTS merged_favorite_evidence(group_id TEXT NOT NULL,original_group TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(group_id,original_group));")?;
         let tx = db.transaction()?;
         tx.execute_batch(schema::JPEG_SCHEMA)?;
+        tx.execute_batch(schema::SOURCE_CACHE_SCHEMA)?;
         if version < schema::VERSION {
             tx.pragma_update(None, "user_version", schema::VERSION)?;
         }
         tx.commit()?;
         db.execute_batch(
             "CREATE INDEX IF NOT EXISTS members_by_group_path ON members(group_id,path);
-CREATE INDEX IF NOT EXISTS placements_by_group_readiness ON placements(group_id,local_ready);",
+CREATE INDEX IF NOT EXISTS placements_by_group_readiness ON placements(group_id,local_ready);
+CREATE INDEX IF NOT EXISTS members_by_archive_digest_role ON members(archive,digest,role);
+CREATE INDEX IF NOT EXISTS placements_by_archived_member ON placements(group_id,path,digest,archived);
+CREATE INDEX IF NOT EXISTS jpeg_by_image ON jpeg_fingerprints(algorithm,fingerprint,digest);
+CREATE INDEX IF NOT EXISTS retired_import_by_digest ON retired_import_plans(json_extract(previous,'$.digest'));
+CREATE INDEX IF NOT EXISTS sidecars_by_group ON sidecars(group_id);",
         )?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;

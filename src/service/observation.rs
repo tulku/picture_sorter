@@ -128,6 +128,8 @@ impl ObservationDriver {
                         if matches!(entry.role, SourceRole::Companion(_)) {
                             let owner = discover(&mut engine.catalog, &entry.path)?;
                             self.queue.push_back(owner);
+                        } else if matches!(entry.role, SourceRole::Original(_)) {
+                            engine.catalog.queue_observed_original(&entry.path, true)?;
                         }
                     }
                     if end {
@@ -164,6 +166,17 @@ impl ObservationDriver {
                                 self.after.clear();
                             }
                             LocalEvent::Changed(path) => {
+                                if matches!(
+                                    crate::import::source_role(path.as_str()),
+                                    Some(SourceRole::Original(_))
+                                ) {
+                                    let present = match local.metadata_relative(&path) {
+                                        Ok(_) => true,
+                                        Err(error) if error.errno == Some(libc::ENOENT) => false,
+                                        Err(error) => return Err(error),
+                                    };
+                                    engine.catalog.queue_observed_original(&path, present)?;
+                                }
                                 if matches!(
                                     crate::import::source_role(path.as_str()),
                                     Some(SourceRole::Companion(_))
@@ -230,7 +243,13 @@ impl ObservationDriver {
             }
             let size = match local.metadata_relative(&owner.path) {
                 Ok(metadata) => metadata.stx_size,
-                Err(e) if e.errno == Some(libc::ENOENT) => 0,
+                Err(e) if e.errno == Some(libc::ENOENT) => {
+                    let observed: bool = engine.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM local_heads WHERE sidecar=?) OR EXISTS(SELECT 1 FROM observations WHERE path=? AND (digest IS NOT NULL OR size IS NOT NULL OR absent_since IS NOT NULL))",params![owner.id.to_string(),owner.path.as_str()],|row|row.get(0))?;
+                    if !observed {
+                        return Ok(());
+                    }
+                    0
+                }
                 Err(e) => {
                     self.unreadable(&mut engine.catalog, &owner, &e.to_string())?;
                     return Ok(());
@@ -827,5 +846,96 @@ mod application_serialization_tests {
                 .group,
             Some(groups[0])
         );
+    }
+}
+
+#[cfg(test)]
+mod fast_startup_tests {
+    use super::*;
+    use crate::{config::Config, fs::RootPolicy};
+    fn missing_sidecar_allocations(observed: bool) -> (u64, u64) {
+        let temp = tempfile::tempdir().unwrap();
+        let local_path = temp.path().join("local");
+        let state_path = temp.path().join("state");
+        let archive_path = temp.path().join("archive");
+        for path in [&local_path, &state_path, &archive_path] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let local = RootHandle::open(&local_path, RootPolicy::Local).unwrap();
+        let state = RootHandle::open(&state_path, RootPolicy::Local).unwrap();
+        let catalog = Catalog::open(&state).unwrap();
+        let id = SidecarId::new();
+        catalog
+            .db
+            .execute(
+                "INSERT INTO sidecars(id,path,owner) VALUES(?,'remote.ORF.rrdata','rapidraw-base')",
+                [id.to_string()],
+            )
+            .unwrap();
+        let owner = SidecarOwner {
+            id,
+            group: None,
+            path: ArchivePath::parse("remote.ORF.rrdata").unwrap(),
+            kind: SidecarKind::RapidRaw,
+            virtual_copy: None,
+        };
+        if observed {
+            catalog
+                .db
+                .execute(
+                    "INSERT INTO observations(path,digest,size) VALUES(?,'previous',7)",
+                    [owner.path.as_str()],
+                )
+                .unwrap();
+        }
+        let config = Config::new(local_path, state_path, archive_path);
+        let mut engine = ImportCoordinator::new(config, catalog);
+        let shell = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|path| path.join("bash"))
+            .find(|path| path.is_file())
+            .unwrap();
+        let worker_path = temp.path().join("idle-worker");
+        std::fs::write(
+            &worker_path,
+            format!("#!{}\nwhile read -r line; do :; done\n", shell.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&worker_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let worker = WorkerSupervisor::new_local(worker_path, vec![]).unwrap();
+        let mut driver = ObservationDriver::new(worker);
+        driver.watch_ready = true;
+        driver.discover = false;
+        driver.known = false;
+        driver.queue.push_back(owner);
+        driver
+            .advance(
+                &mut engine,
+                &local,
+                &state,
+                &ManualClock::default(),
+                false,
+                false,
+            )
+            .unwrap();
+        let captures: u64 = engine
+            .catalog
+            .db
+            .query_row("SELECT count(*) FROM capture_requests", [], |r| r.get(0))
+            .unwrap();
+        let reservations: u64 = engine
+            .catalog
+            .db
+            .query_row("SELECT count(*) FROM reservations", [], |r| r.get(0))
+            .unwrap();
+        (captures, reservations)
+    }
+    #[test]
+    fn remote_only_missing_sidecar_does_not_allocate_capture_or_reservation() {
+        assert_eq!(missing_sidecar_allocations(false), (0, 0));
+    }
+    #[test]
+    fn previously_observed_missing_sidecar_retains_deletion_capture() {
+        assert_eq!(missing_sidecar_allocations(true), (1, 1));
     }
 }

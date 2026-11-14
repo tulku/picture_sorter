@@ -26,3 +26,5 @@ mod jpeg_duplicates;
 pub(crate) use jpeg_duplicates::*;
 
 mod jpeg_xmp;
+
+mod source_cache;

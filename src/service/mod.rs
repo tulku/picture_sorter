@@ -72,3 +72,9 @@ mod verify;
 mod rating_queue;
 
 mod refresh;
+
+mod catalog_maintenance;
+pub use catalog_maintenance::{
+    JpegIndexReport, SourcePreview, offline_adopt_source, offline_index_jpegs,
+    offline_preview_source,
+};
