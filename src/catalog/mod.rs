@@ -106,6 +106,7 @@ CREATE INDEX IF NOT EXISTS retired_import_by_digest ON retired_import_plans(json
 CREATE INDEX IF NOT EXISTS sidecars_by_group ON sidecars(group_id);
 CREATE INDEX IF NOT EXISTS members_path_nocase ON members(path COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS placements_path_nocase ON placements(path COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS pending_jobs_by_id ON jobs(id) WHERE state NOT IN ('\"Complete\"','\"Cancelled\"','\"Failed\"');
 CREATE INDEX IF NOT EXISTS import_destination_nocase ON import_items(destination COLLATE NOCASE);",
         )?;
         db.pragma_update(None, "journal_mode", "WAL")?;
@@ -114,6 +115,7 @@ CREATE INDEX IF NOT EXISTS import_destination_nocase ON import_items(destination
         db.execute_batch("CREATE TABLE IF NOT EXISTS admission_epoch(value INTEGER NOT NULL); INSERT INTO admission_epoch SELECT 0 WHERE NOT EXISTS(SELECT 1 FROM admission_epoch);
 CREATE TABLE IF NOT EXISTS refresh_application_receipts(job TEXT NOT NULL REFERENCES jobs(id),sidecar TEXT NOT NULL,version TEXT NOT NULL,UNIQUE(job,sidecar,version));
 CREATE TABLE IF NOT EXISTS local_residency_expectations(placement TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS local_verifications(path TEXT PRIMARY KEY,digest TEXT NOT NULL,size INTEGER NOT NULL,stamp TEXT NOT NULL);
 INSERT OR IGNORE INTO local_residency_expectations SELECT id FROM placements WHERE local_ready=1;
 DROP TRIGGER IF EXISTS residency_expected_insert;
 DROP TRIGGER IF EXISTS residency_expected_update;

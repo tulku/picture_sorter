@@ -12,6 +12,8 @@ use std::{
 };
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotStamp {
+    #[serde(default)]
+    pub device: u64,
     pub inode: u64,
     pub size: u64,
     pub ctime: i64,
@@ -22,6 +24,7 @@ pub struct SnapshotStamp {
 impl SnapshotStamp {
     pub(crate) fn of(metadata: &std::fs::Metadata) -> Self {
         Self {
+            device: metadata.dev(),
             inode: metadata.ino(),
             size: metadata.len(),
             ctime: metadata.ctime(),

@@ -21,13 +21,13 @@ pub(crate) struct ObservationStatus {
 pub(crate) struct ObservationDriver {
     pub worker: WorkerSupervisor,
     active: Option<(WorkerTicket, Phase)>,
-    watch_ready: bool,
+    watcher: Option<LocalWatcher>,
     discover: bool,
     discover_started: bool,
+    rescan_requested: bool,
     known: bool,
     after: String,
     queue: VecDeque<SidecarOwner>,
-    events_due: bool,
     pub status: ObservationStatus,
     pub blocked_group: Option<GroupId>,
 }
@@ -38,30 +38,40 @@ struct CaptureResult {
     receipt: SnapshotReceipt,
 }
 enum Phase {
-    Watch,
     Start,
     List,
     Capture {
         context: CaptureContext,
         recovering: bool,
     },
-    Events,
 }
 impl ObservationDriver {
     pub fn new(worker: WorkerSupervisor) -> Self {
         Self {
             worker,
             active: None,
-            watch_ready: false,
+            watcher: None,
             discover: true,
             discover_started: false,
+            rescan_requested: false,
             known: true,
             after: String::new(),
             queue: VecDeque::new(),
-            events_due: false,
             status: ObservationStatus::default(),
             blocked_group: None,
         }
+    }
+    pub fn notification_fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        self.watcher.as_ref().map(AsRawFd::as_raw_fd)
+    }
+    pub(crate) fn progress(&self) -> (String, usize, bool, bool) {
+        (
+            self.after.clone(),
+            self.queue.len(),
+            self.discover,
+            self.known,
+        )
     }
     pub fn advance(
         &mut self,
@@ -72,13 +82,29 @@ impl ObservationDriver {
         observe: bool,
         reconcile: bool,
     ) -> AppResult<()> {
+        if self.watcher.is_none() {
+            self.watcher = Some(LocalWatcher::open(local)?);
+            engine.catalog.queue_physical_checks(local)?;
+            self.rescan_requested = true;
+            self.discover = true;
+            self.known = true;
+            self.after.clear();
+        }
+        let events = match self.watcher.as_mut().unwrap().poll() {
+            Ok(events) => events,
+            Err(error) => {
+                self.watcher = None;
+                return Err(error);
+            }
+        };
+        self.observe_events(engine, local, clock, events)?;
         if reconcile {
+            self.rescan_requested = true;
             self.discover = true;
             self.known = true;
             self.after.clear();
         }
         if observe {
-            self.events_due = true;
             self.enqueue_absences(&engine.catalog)?;
             self.enqueue_generated(engine, local, clock)?;
             associate_generated_companions(&mut engine.catalog)?;
@@ -144,7 +170,6 @@ impl ObservationDriver {
                 WorkerState::Completed(reply) => reply,
             };
             match (phase, reply) {
-                (Phase::Watch, NasReply::Done) => self.watch_ready = true,
                 (Phase::Start, NasReply::Done) => self.discover_started = true,
                 (Phase::List, NasReply::LocalFiles { entries, end, .. }) => {
                     for entry in &entries {
@@ -184,48 +209,14 @@ impl ObservationDriver {
                     finish_capture(&mut engine.catalog, &context)?;
                     context.cleanup(state)?;
                 }
-                (Phase::Events, NasReply::LocalEvents(events)) => {
-                    for event in events {
-                        match event {
-                            LocalEvent::RescanRequired => {
-                                self.discover = true;
-                                self.known = true;
-                                self.after.clear();
-                            }
-                            LocalEvent::Changed(path) => {
-                                if is_generated_output_path(&path)
-                                    || matches!(
-                                        crate::import::source_role(path.as_str()),
-                                        Some(SourceRole::Original(_))
-                                    )
-                                {
-                                    self.observe_media(engine, local, clock, &path)?;
-                                }
-                                if matches!(
-                                    crate::import::source_role(path.as_str()),
-                                    Some(SourceRole::Companion(_))
-                                ) {
-                                    ensure_generated_base(engine, local, &path)?;
-                                    let owner = discover(&mut engine.catalog, &path)?;
-                                    if !self.queue.iter().any(|queued| queued.id == owner.id) {
-                                        if let Some(group) = owner.group {
-                                            engine.catalog.db.execute("UPDATE residency SET last_activity=? WHERE group_id=?",params![clock.now(),group.to_string()])?;
-                                        }
-                                        if self.queue.len() < 128 {
-                                            self.queue.push_back(owner);
-                                        } else {
-                                            self.known = true;
-                                            self.after.clear();
-                                        }
-                                    }
-                                }
-                                engine.catalog.db.execute("UPDATE residency SET last_activity=? WHERE group_id IN(SELECT group_id FROM members WHERE path=?)",params![clock.now(),path.as_str()])?;
-                            }
-                        }
-                    }
-                }
                 _ => return Err(AppError::integrity("unexpected observation worker reply")),
             }
+        }
+        if self.rescan_requested {
+            self.rescan_requested = false;
+            self.discover = true;
+            self.discover_started = false;
+            self.status.startup_complete = false;
         }
         if !self.worker.available()? {
             return Ok(());
@@ -251,13 +242,6 @@ impl ObservationDriver {
                     context,
                     recovering: true,
                 },
-            )
-        } else if !self.watch_ready {
-            (
-                NasCommand::WatchLocal {
-                    root: engine.config.working_root.clone(),
-                },
-                Phase::Watch,
             )
         } else if let Some(owner) =
             next_unblocked(&mut self.queue, &engine.catalog, self.blocked_group)?
@@ -407,14 +391,63 @@ impl ObservationDriver {
                 return Ok(());
             }
             return Ok(());
-        } else if self.events_due {
-            self.events_due = false;
-            (NasCommand::LocalEvents, Phase::Events)
         } else {
             return Ok(());
         };
         let ticket = self.worker.submit(command)?;
         self.active = Some((ticket, phase));
+        Ok(())
+    }
+    fn observe_events(
+        &mut self,
+        engine: &mut ImportCoordinator,
+        local: &RootHandle,
+        clock: &dyn Clock,
+        events: Vec<LocalEvent>,
+    ) -> AppResult<()> {
+        for event in events {
+            match event {
+                LocalEvent::RescanRequired => {
+                    self.rescan_requested = true;
+                    engine.catalog.queue_physical_checks(local)?;
+                    self.discover = true;
+                    self.known = true;
+                    self.after.clear();
+                }
+                LocalEvent::Changed(path) => {
+                    if is_generated_output_path(&path)
+                        || matches!(
+                            crate::import::source_role(path.as_str()),
+                            Some(SourceRole::Original(_))
+                        )
+                    {
+                        self.observe_media(engine, local, clock, &path)?;
+                    }
+                    if matches!(
+                        crate::import::source_role(path.as_str()),
+                        Some(SourceRole::Companion(_))
+                    ) {
+                        ensure_generated_base(engine, local, &path)?;
+                        let owner = discover(&mut engine.catalog, &path)?;
+                        if !self.queue.iter().any(|queued| queued.id == owner.id) {
+                            if let Some(group) = owner.group {
+                                engine.catalog.db.execute(
+                                    "UPDATE residency SET last_activity=? WHERE group_id=?",
+                                    params![clock.now(), group.to_string()],
+                                )?;
+                            }
+                            if self.queue.len() < 128 {
+                                self.queue.push_back(owner);
+                            } else {
+                                self.known = true;
+                                self.after.clear();
+                            }
+                        }
+                    }
+                    engine.catalog.db.execute("UPDATE residency SET last_activity=? WHERE group_id IN(SELECT group_id FROM members WHERE path=?)",params![clock.now(),path.as_str()])?;
+                }
+            }
+        }
         Ok(())
     }
     fn observe_media(
@@ -430,7 +463,9 @@ impl ObservationDriver {
             Err(error) => return Err(error),
         };
         if original_claimed(&engine.catalog, path)? {
-            engine.catalog.queue_observed_original(path, present)?;
+            engine
+                .catalog
+                .queue_observed_original(path, present, local)?;
             return Ok(());
         }
         let owner = match engine.catalog.generated_owner(path)? {
@@ -1200,7 +1235,6 @@ mod fast_startup_tests {
         std::fs::set_permissions(&worker_path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let worker = WorkerSupervisor::new_local(worker_path, vec![]).unwrap();
         let mut driver = ObservationDriver::new(worker);
-        driver.watch_ready = true;
         driver.discover = false;
         driver.known = false;
         driver.queue.push_back(owner);
@@ -1312,7 +1346,6 @@ mod generated_observation_tests {
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut driver =
             ObservationDriver::new(WorkerSupervisor::new_local(executable, vec![]).unwrap());
-        driver.watch_ready = true;
         driver.discover = false;
         driver.known = false;
         driver.queue.push_back(owner.clone());

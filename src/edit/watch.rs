@@ -15,6 +15,12 @@ pub struct LocalWatcher {
     fd: OwnedFd,
     directories: BTreeMap<i32, String>,
 }
+
+impl AsRawFd for LocalWatcher {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.fd.as_raw_fd()
+    }
+}
 impl LocalWatcher {
     pub fn open(root: &RootHandle) -> AppResult<Self> {
         // The returned inotify descriptor is owned and nonblocking from creation.
@@ -42,6 +48,7 @@ impl LocalWatcher {
             let name = CString::new(format!("/proc/self/fd/{}", dir.as_raw_fd()))
                 .map_err(|_| AppError::invalid("NUL"))?;
             let mask = libc::IN_CLOSE_WRITE
+                | libc::IN_ATTRIB
                 | libc::IN_CREATE
                 | libc::IN_DELETE
                 | libc::IN_MOVED_FROM
@@ -137,5 +144,31 @@ impl LocalWatcher {
             self.rescan()?;
         }
         Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn metadata_changes_wake_watcher_and_drain_readiness() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("image.ORF");
+        std::fs::write(&path, b"original").unwrap();
+        let root = RootHandle::open(temp.path(), crate::fs::RootPolicy::Local).unwrap();
+        let mut watcher = LocalWatcher::open(&root).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let mut descriptor = libc::pollfd {
+            fd: watcher.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 1);
+        assert!(watcher.poll().unwrap().iter().any(
+            |event| matches!(event, LocalEvent::Changed(path) if path.as_str() == "image.ORF")
+        ));
+        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 0);
     }
 }
