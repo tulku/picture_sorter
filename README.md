@@ -15,6 +15,6 @@ Start with [migration](docs/migration.md), then [usage and installation](docs/us
 
 The optional integrations use source-backed RapidRAW profiles and the pinned Immich 3.3.5 API. Unknown editor formats remain opaque preserved content. GIMP projects and native Immich edits are outside the initial semantic synchronization scope. Immich rating writes require explicit best-effort mode because the API has no compare-and-set.
 
-The old sorter remains available only as `photo_sorter_legacy`. Its incremental timestamp behavior is a separate legacy workflow; never run it or another importer/Syncthing writer concurrently over the new managed tree. `run.sh` requires an explicit profile and card path and delegates to the new CLI without initializing anything.
+Do not run another importer or Syncthing writer concurrently over the managed tree. `run.sh` requires an explicit profile and card path and delegates to the new CLI without initializing anything.
 
 Development tests use generated temporary files, isolated service processes and loopback HTTP fixtures. They cover process-loss recovery, two local clients, preservation conflicts and measured repeat-import work. They do not certify NAS power-loss durability, deployed cross-client filesystem semantics or installed GUI/API behavior.

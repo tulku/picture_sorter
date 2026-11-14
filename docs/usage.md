@@ -99,7 +99,7 @@ Same-filename NAS updates temporarily retain the old file and require separate g
 
 ## Nix package
 
-The repository flake builds `photo_sorter` and `photo_sorter_legacy` on Linux and supplies ExifTool and rsync at runtime:
+The repository flake builds `photo_sorter` on Linux and supplies ExifTool and rsync at runtime:
 
 ```sh
 nix build .

@@ -29,36 +29,6 @@ pub struct VersionStore<'a> {
     catalog: &'a mut Catalog,
     root: &'a RootHandle,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VersionDecision {
-    Unchanged,
-    PublishLocal(Vec<VersionId>),
-    AdoptRemote(Vec<VersionId>),
-    Conflict(Vec<VersionId>),
-}
-pub fn reconcile_heads(
-    base: &[VersionId],
-    local: &[VersionId],
-    remote: &[VersionId],
-) -> VersionDecision {
-    let ordered = |ids: &[VersionId]| {
-        ids.iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>()
-    };
-    let b = ordered(base);
-    let l = ordered(local);
-    let r = ordered(remote);
-    if l == r {
-        VersionDecision::Unchanged
-    } else if r == b {
-        VersionDecision::PublishLocal(l.into_iter().collect())
-    } else if l == b {
-        VersionDecision::AdoptRemote(r.into_iter().collect())
-    } else {
-        VersionDecision::Conflict(l.union(&r).copied().collect())
-    }
-}
 impl<'a> VersionStore<'a> {
     pub fn new(catalog: &'a mut Catalog, root: &'a RootHandle) -> Self {
         Self { catalog, root }

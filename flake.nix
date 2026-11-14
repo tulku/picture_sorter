@@ -26,10 +26,8 @@
                 --replace-fail '#!/usr/bin/env bash' '#!${pkgs.bash}/bin/bash'
             '';
             postInstall = ''
-              for binary in photo_sorter photo_sorter_legacy; do
-                wrapProgram "$out/bin/$binary" \
-                  --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.exiftool pkgs.rsync ]}
-              done
+              wrapProgram "$out/bin/photo_sorter" \
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.exiftool pkgs.rsync ]}
             '';
             meta = {
               description = "Offline photo import, working copies and verified archive publication";

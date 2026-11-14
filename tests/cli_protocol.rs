@@ -222,7 +222,7 @@ fn exit_codes_distinguish_accepted_completed_blocked() {
     );
 }
 #[test]
-fn profile_identifiers_are_required_and_legacy_help_remains_available() {
+fn profile_identifiers_are_required() {
     let r = TestRig::new();
     let p = config(&r);
     let text = std::fs::read_to_string(&p).unwrap();
@@ -233,14 +233,6 @@ fn profile_identifiers_are_required_and_legacy_help_remains_available() {
         .join("\n");
     std::fs::write(&p, text).unwrap();
     assert!(Config::load(&p).is_err());
-    assert!(
-        Command::new(env!("CARGO_BIN_EXE_photo_sorter_legacy"))
-            .arg("--help")
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
 }
 #[test]
 fn cli_reports_integrity_and_operation_failures_without_changing_bytes() {

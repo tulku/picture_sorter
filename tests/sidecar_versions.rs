@@ -63,34 +63,6 @@ fn same_bytes_different_parents_preserve_ancestry() {
     assert_ne!(c.version(x).unwrap().parents, c.version(y).unwrap().parents);
 }
 #[test]
-fn concurrent_edits_keep_both_heads() {
-    let base = VersionId::new();
-    let a = VersionId::new();
-    let b = VersionId::new();
-    match reconcile_heads(&[base], &[a], &[b]) {
-        VersionDecision::Conflict(mut heads) => {
-            heads.sort();
-            let mut expected = vec![a, b];
-            expected.sort();
-            assert_eq!(heads, expected);
-        }
-        _ => panic!("divergence must preserve both heads"),
-    }
-}
-#[test]
-fn reset_vs_edit_conflicts() {
-    let r = support::TestRig::new();
-    let (mut c, s) = setup(&r);
-    let base = save(&mut c, &r, s, vec![], Some(b"base"));
-    let reset = save(&mut c, &r, s, vec![base], None);
-    let edit = save(&mut c, &r, s, vec![base], Some(b"edit"));
-    assert!(matches!(
-        reconcile_heads(&[base], &[reset], &[edit]),
-        VersionDecision::Conflict(_)
-    ));
-    assert_eq!(c.version(reset).unwrap().body, VersionBody::Reset);
-}
-#[test]
 fn old_upload_does_not_ack_new_save() {
     let r = support::TestRig::new();
     let (mut c, s) = setup(&r);

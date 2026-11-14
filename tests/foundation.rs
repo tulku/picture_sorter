@@ -29,21 +29,16 @@ fn digest_validation() {
     }
 }
 #[test]
-fn legacy_help_still_available() {
-    for executable in [
-        env!("CARGO_BIN_EXE_photo_sorter"),
-        env!("CARGO_BIN_EXE_photo_sorter_legacy"),
-    ] {
-        let output = std::process::Command::new(executable)
-            .arg("--help")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+fn cli_help_is_available() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_photo_sorter"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 #[test]
 fn profile_validation_defers_archive_filesystem_access_to_worker() {
