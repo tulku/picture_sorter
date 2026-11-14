@@ -367,7 +367,11 @@ impl ObservationDriver {
             }
         } else if self.known {
             let mut query = engine.catalog.db.prepare(
-                "SELECT id,group_id,path,owner FROM sidecars WHERE id>? ORDER BY id LIMIT 128",
+                "SELECT s.id,s.group_id,s.path,s.owner FROM sidecars s WHERE s.id>?
+                 AND (EXISTS(SELECT 1 FROM local_heads l WHERE l.sidecar=s.id)
+                      OR EXISTS(SELECT 1 FROM observations o WHERE o.path=s.path
+                                AND (o.digest IS NOT NULL OR o.size IS NOT NULL OR o.absent_since IS NOT NULL)))
+                 ORDER BY s.id LIMIT 128",
             )?;
             let rows = query
                 .query_map([&self.after], |r| {
@@ -439,6 +443,7 @@ impl ObservationDriver {
                             if self.queue.len() < 128 {
                                 self.queue.push_back(owner);
                             } else {
+                                self.rescan_requested = true;
                                 self.known = true;
                                 self.after.clear();
                             }
@@ -1184,6 +1189,211 @@ mod application_serialization_tests {
 mod fast_startup_tests {
     use super::*;
     use crate::{config::Config, fs::RootPolicy};
+    fn known_scan_fixture() -> (
+        tempfile::TempDir,
+        ObservationDriver,
+        ImportCoordinator,
+        RootHandle,
+        RootHandle,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let local_path = temp.path().join("local");
+        let state_path = temp.path().join("state");
+        let archive_path = temp.path().join("archive");
+        for path in [&local_path, &state_path, &archive_path] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let local = RootHandle::open(&local_path, RootPolicy::Local).unwrap();
+        let state = RootHandle::open(&state_path, RootPolicy::Local).unwrap();
+        let catalog = Catalog::open(&state).unwrap();
+        let engine =
+            ImportCoordinator::new(Config::new(local_path, state_path, archive_path), catalog);
+        let shell = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|path| path.join("bash"))
+            .find(|path| path.is_file())
+            .unwrap();
+        let executable = temp.path().join("idle-worker");
+        std::fs::write(
+            &executable,
+            format!("#!{}\nwhile read -r line; do :; done\n", shell.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut driver =
+            ObservationDriver::new(WorkerSupervisor::new_local(executable, vec![]).unwrap());
+        driver.watcher = Some(LocalWatcher::open(&local).unwrap());
+        driver.discover = false;
+        (temp, driver, engine, local, state)
+    }
+
+    #[test]
+    fn remote_only_catalog_completes_known_scan_in_one_advance() {
+        let (_temp, mut driver, mut engine, local, state) = known_scan_fixture();
+        let tx = engine.catalog.db.transaction().unwrap();
+        for index in 0..12_000 {
+            tx.execute(
+                "INSERT INTO sidecars(id,path,owner) VALUES(?,?,'rapidraw-base')",
+                params![
+                    SidecarId::new().to_string(),
+                    format!("remote-{index}.ORF.rrdata")
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO observations(path,readable) VALUES(?,0)",
+                [format!("remote-{index}.ORF.rrdata")],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        unsafe extern "C" fn query_budget(pointer: *mut std::ffi::c_void) -> i32 {
+            let calls = unsafe { &mut *(pointer as *mut u32) };
+            *calls += 1;
+            i32::from(*calls > 1000)
+        }
+        let mut calls = 0u32;
+        let handle = unsafe { engine.catalog.db.handle() };
+        unsafe {
+            rusqlite::ffi::sqlite3_progress_handler(
+                handle,
+                1000,
+                Some(query_budget),
+                (&mut calls as *mut u32).cast(),
+            );
+        }
+        let started = std::time::Instant::now();
+        let result = driver.advance(
+            &mut engine,
+            &local,
+            &state,
+            &ManualClock::default(),
+            false,
+            false,
+        );
+        unsafe {
+            rusqlite::ffi::sqlite3_progress_handler(handle, 0, None, std::ptr::null_mut());
+        }
+        result.unwrap();
+        eprintln!(
+            "12,000 remote-only sidecars reconciled in {:?}, approximately {} SQLite VM steps",
+            started.elapsed(),
+            calls * 1000
+        );
+        assert!(driver.status.startup_complete);
+        assert!(driver.queue.is_empty());
+        assert!(driver.active.is_none());
+        let progress = driver.progress();
+        driver
+            .advance(
+                &mut engine,
+                &local,
+                &state,
+                &ManualClock::default(),
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(driver.progress(), progress);
+    }
+
+    #[test]
+    fn known_scan_keeps_each_local_evidence_kind_across_pages_and_reopen() {
+        let (_temp, mut driver, mut engine, local, state) = known_scan_fixture();
+        let group = engine.catalog.create_group(false).unwrap();
+        let mut expected = Vec::new();
+        for index in 0..260 {
+            let id = SidecarId::new();
+            let path = format!("observed-{index}.ORF.rrdata");
+            engine
+                .catalog
+                .register_sidecar(
+                    id,
+                    Some(group),
+                    ArchivePath::parse(&path).unwrap(),
+                    "rapidraw-base",
+                )
+                .unwrap();
+            match index % 4 {
+                0 => {
+                    engine
+                        .catalog
+                        .db
+                        .execute(
+                            "INSERT INTO observations(path,digest) VALUES(?,'previous')",
+                            [&path],
+                        )
+                        .unwrap();
+                }
+                1 => {
+                    engine
+                        .catalog
+                        .db
+                        .execute("INSERT INTO observations(path,size) VALUES(?,0)", [&path])
+                        .unwrap();
+                }
+                2 => {
+                    engine
+                        .catalog
+                        .db
+                        .execute(
+                            "INSERT INTO observations(path,absent_since) VALUES(?,0)",
+                            [&path],
+                        )
+                        .unwrap();
+                }
+                _ => {
+                    let version = VersionId::new().to_string();
+                    engine.catalog.db.execute("INSERT INTO versions(id,sidecar,body,origin,operation) VALUES(?,?,?,?,?)",params![version,id.to_string(),serde_json::to_string(&VersionBody::Reset).unwrap(),serde_json::to_string(&VersionOrigin::Observed).unwrap(),OperationId::new().to_string()]).unwrap();
+                    engine
+                        .catalog
+                        .db
+                        .execute(
+                            "INSERT INTO local_heads(sidecar,version) VALUES(?,?)",
+                            params![id.to_string(), version],
+                        )
+                        .unwrap();
+                }
+            }
+            expected.push(id.to_string());
+        }
+        engine.catalog = Catalog::open(&state).unwrap();
+        let mut actual = Vec::new();
+        for _ in 0..4 {
+            driver
+                .advance(
+                    &mut engine,
+                    &local,
+                    &state,
+                    &ManualClock::default(),
+                    false,
+                    false,
+                )
+                .unwrap();
+            actual.extend(driver.queue.drain(..).map(|owner| owner.id.to_string()));
+        }
+        expected.sort();
+        assert_eq!(actual, expected);
+        assert!(driver.status.startup_complete);
+        assert!(driver.active.is_none());
+    }
+
+    #[test]
+    fn overflowing_changed_events_rescan_unobserved_companions() {
+        let (_temp, mut driver, mut engine, local, _state) = known_scan_fixture();
+        driver.known = false;
+        let events = (0..129)
+            .map(|index| {
+                LocalEvent::Changed(ArchivePath::parse(&format!("new-{index}.ORF.rrdata")).unwrap())
+            })
+            .collect();
+        driver
+            .observe_events(&mut engine, &local, &ManualClock::default(), events)
+            .unwrap();
+        assert_eq!(driver.queue.len(), 128);
+        assert!(driver.rescan_requested);
+    }
+
     fn missing_sidecar_allocations(observed: bool) -> (u64, u64) {
         let temp = tempfile::tempdir().unwrap();
         let local_path = temp.path().join("local");
