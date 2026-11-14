@@ -110,6 +110,7 @@ fn offline_import_edit_restart_reconnect_archive_with_actual_immich_pin() {
     let server = support::http::RatingServer::new();
     let origin = server.origin.to_string();
     let mut service = ServiceFixture::with_config(|config, r| {
+        config.poll_seconds = 1;
         use std::os::unix::fs::PermissionsExt;
         let key = r._temp.path().join("key");
         std::fs::write(&key, "isolated-fixture-key").unwrap();
@@ -187,6 +188,15 @@ fn offline_import_edit_restart_reconnect_archive_with_actual_immich_pin() {
     service.stop();
     std::fs::write(&sidecar, later).unwrap();
     service.restart();
+    let deadline = Instant::now();
+    while service.status()["archive"]["reason"].is_null() {
+        assert!(
+            deadline.elapsed() < Duration::from_secs(7),
+            "offline archive failure was not observed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
     std::fs::rename(&offline, &service.r.archive).unwrap();
     if service
         .r
@@ -214,8 +224,20 @@ fn offline_import_edit_restart_reconnect_archive_with_actual_immich_pin() {
     {
         assert!(
             deadline.elapsed() < Duration::from_secs(20),
-            "offline/restart work did not converge: {}",
-            service.status()
+            "offline/restart work did not converge: {}; retries: {:?}",
+            service.status(),
+            rusqlite::Connection::open(service.r.state.join("catalog.sqlite"))
+                .unwrap()
+                .prepare("SELECT failures,next_attempt,reason FROM job_retry")
+                .unwrap()
+                .query_map([], |row| Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, String>(2)?
+                )))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
         );
         std::thread::sleep(Duration::from_millis(50));
     }
