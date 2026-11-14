@@ -1476,8 +1476,10 @@ impl Runtime {
                 }
                 continue;
             }
-            let result = self.advance(&record);
+            let mut retry_required = false;
+            let result = self.advance(&record, &mut retry_required);
             if let Err(error) = result {
+                retry_required = true;
                 let state = match error.code {
                     ErrorCode::Conflict | ErrorCode::Integrity | ErrorCode::SourceChanged => {
                         JobState::Conflict
@@ -1516,7 +1518,13 @@ impl Runtime {
                 }
             }
             let current = self.engine.catalog.job(record.id)?;
+            let unchanged_nas_wait = matches!(record.request.kind, JobKind::Import { .. })
+                && record.state == JobState::WaitingNas
+                && current.state == record.state
+                && current.generation == record.generation
+                && current.reason == record.reason;
             if was_due
+                && (!unchanged_nas_wait || retry_required)
                 && !waits_for_capacity_measurement(&current)
                 && matches!(
                     current.state,
@@ -1623,7 +1631,7 @@ impl Runtime {
         };
         Ok(self.reader.completed_syncs >= required)
     }
-    fn advance(&mut self, record: &JobRecord) -> AppResult<()> {
+    fn advance(&mut self, record: &JobRecord, retry_required: &mut bool) -> AppResult<()> {
         let job = record.id;
         let config = self.engine.config.clone();
         match &record.request.kind {
@@ -1714,9 +1722,10 @@ impl Runtime {
                         && self.control.is_none()
                         && self.worker.available()?)
                 {
-                    let _ = self
+                    *retry_required = self
                         .upload
-                        .advance(&mut self.engine, &mut self.worker, job)?;
+                        .advance_outcome(&mut self.engine, &mut self.worker, job)?
+                        .retry_required;
                 }
             }
             JobKind::Bootstrap { .. } => {
@@ -2030,5 +2039,200 @@ impl Runtime {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    fn waiting_import() -> (tempfile::TempDir, Runtime, JobId, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let local_path = temp.path().join("local");
+        let state_path = temp.path().join("state");
+        let archive_path = temp.path().join("archive");
+        let source_path = temp.path().join("source");
+        for path in [&local_path, &state_path, &archive_path, &source_path] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let local = RootHandle::open(&local_path, RootPolicy::Local).unwrap();
+        let state = RootHandle::open(&state_path, RootPolicy::Local).unwrap();
+        let mut config = Config::new(local_path, state_path, archive_path);
+        config.archive_id = Some(ArchiveId::new());
+        config.local_test_backend = true;
+        let catalog = Catalog::open(&state).unwrap();
+        let mut engine = ImportCoordinator::new(config.clone(), catalog);
+        let job = engine
+            .begin_scan(&ImportRequest {
+                source_path: source_path.clone(),
+                strict: false,
+                dry_run: false,
+                operation_id: OperationId::new(),
+            })
+            .unwrap();
+        engine
+            .catalog
+            .db
+            .execute(
+                "UPDATE import_stats SET selected=1 WHERE job=?",
+                [job.to_string()],
+            )
+            .unwrap();
+        engine
+            .catalog
+            .db
+            .execute(
+                "UPDATE import_scans SET complete=1 WHERE job=?",
+                [job.to_string()],
+            )
+            .unwrap();
+        engine.catalog.db.execute("INSERT INTO import_items(id,parent,source_root,source_path,digest,size,role,destination,state,local_ready) VALUES(?,?,?,'photo.ORF',?,7,?,'photo.ORF','waiting_upload',1)",params![JobId::new().to_string(),job.to_string(),source_path.to_str().unwrap(),Digest::of(b"fixture").as_str(),serde_json::to_string(&SourceRole::Original(MediaRole::Raw)).unwrap()]).unwrap();
+        let error = AppError::new(ErrorCode::Unavailable, "NAS offline");
+        engine
+            .catalog
+            .transition(
+                job,
+                0,
+                JobTransition::Wait(JobState::WaitingNas, error.to_string()),
+            )
+            .unwrap();
+        engine
+            .catalog
+            .defer_job(job, SystemClock::default().now() - 10, &error.to_string())
+            .unwrap();
+        let shell = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|path| path.join("bash"))
+            .find(|path| path.is_file())
+            .unwrap();
+        let idle = temp.path().join("idle-worker");
+        std::fs::write(
+            &idle,
+            format!("#!{}\nwhile read -r command; do :; done\n", shell.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&idle, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let response = temp.path().join("response");
+        let fifo = std::ffi::CString::new(response.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let executable = temp.path().join("nas-worker");
+        std::fs::write(&executable,format!("#!{}\nwhile read -r command; do while IFS= read -r reply; do printf '%s\\n' \"$reply\"; done < '{}'; done\n",shell.display(),response.display())).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let idle_worker = || WorkerSupervisor::new_local(idle.clone(), vec![]).unwrap();
+        let mut scheduler = super::super::Scheduler::new(&config);
+        scheduler.tick(SystemClock::default().now()).unwrap();
+        let runtime = Runtime {
+            integration: super::super::integration::Integration::new(&config, &local, &state),
+            maintenance: idle_worker(),
+            startup: Default::default(),
+            space: Default::default(),
+            local_audit: Default::default(),
+            refresh_application: Default::default(),
+            cleanup: Default::default(),
+            reader: Default::default(),
+            merge_cursor: None,
+            job_cursor: None,
+            engine,
+            local,
+            state,
+            worker: WorkerSupervisor::new(executable, vec![]).unwrap(),
+            observation: super::super::observation::ObservationDriver::new(idle_worker()),
+            shared_publisher: Default::default(),
+            scan: super::super::scan::ScanDriver::new().unwrap(),
+            local_transfer: super::super::local_transfer::LocalTransferDriver::new(idle_worker()),
+            scheduler,
+            upload: Default::default(),
+            bootstrap: Default::default(),
+            fetch: Default::default(),
+            sessions: Default::default(),
+            authorizations: Default::default(),
+            control: None,
+            local_control: None,
+            archive_status: serde_json::Value::Null,
+            doctor_snapshot: serde_json::Value::Null,
+            editor_identity: None,
+        };
+        (temp, runtime, job, response)
+    }
+
+    fn failures(runtime: &Runtime, job: JobId) -> u64 {
+        runtime
+            .engine
+            .catalog
+            .db
+            .query_row(
+                "SELECT failures FROM job_retry WHERE job=?",
+                [job.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn busy_worker_does_not_count_an_import_retry() {
+        let (_temp, mut runtime, job, _response) = waiting_import();
+        runtime
+            .worker
+            .submit(NasCommand::LocalInventoryStart {
+                root: runtime.engine.config.working_root.clone(),
+            })
+            .unwrap();
+        for _ in 0..3 {
+            runtime.job_cursor = None;
+            runtime.tick().unwrap();
+            assert_eq!(failures(&runtime, job), 1);
+            assert!(
+                runtime
+                    .engine
+                    .catalog
+                    .job_is_due(job, SystemClock::default().now())
+                    .unwrap()
+            );
+            assert!(runtime.upload.active_job().is_none());
+        }
+    }
+
+    #[test]
+    fn repeated_identical_upload_failures_back_off_only_after_the_reply() {
+        let (_temp, mut runtime, job, response) = waiting_import();
+        for expected in [2, 3] {
+            runtime
+                .engine
+                .catalog
+                .db
+                .execute(
+                    "UPDATE job_retry SET next_attempt=0 WHERE job=?",
+                    [job.to_string()],
+                )
+                .unwrap();
+            runtime.job_cursor = None;
+            runtime.tick().unwrap();
+            assert_eq!(runtime.upload.active_job(), Some(job));
+            assert_eq!(failures(&runtime, job), expected - 1);
+            let ticket = runtime.worker.latest_ticket().unwrap();
+            let error = AppError::new(ErrorCode::Unavailable, "NAS offline");
+            std::fs::write(
+                &response,
+                format!(
+                    "{}\n",
+                    serde_json::json!({"ticket":ticket,"result":{"Err":error}})
+                ),
+            )
+            .unwrap();
+            let started = Instant::now();
+            while runtime.upload.active_job().is_some() {
+                runtime.job_cursor = None;
+                runtime.tick().unwrap();
+                assert!(started.elapsed() < Duration::from_secs(3));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(failures(&runtime, job), expected);
+            assert!(
+                !runtime
+                    .engine
+                    .catalog
+                    .job_is_due(job, SystemClock::default().now())
+                    .unwrap()
+            );
+        }
     }
 }

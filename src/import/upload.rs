@@ -24,6 +24,10 @@ type UploadItemRow = (
 pub struct UploadDriver {
     active: Option<Active>,
 }
+pub(crate) struct UploadAdvance {
+    report: ImportReport,
+    pub retry_required: bool,
+}
 #[derive(Clone)]
 struct Active {
     job: JobId,
@@ -168,8 +172,18 @@ impl UploadDriver {
         worker: &mut WorkerSupervisor,
         job: JobId,
     ) -> AppResult<ImportReport> {
+        self.advance_outcome(engine, worker, job)
+            .map(|outcome| outcome.report)
+    }
+    pub(crate) fn advance_outcome(
+        &mut self,
+        engine: &mut ImportCoordinator,
+        worker: &mut WorkerSupervisor,
+        job: JobId,
+    ) -> AppResult<UploadAdvance> {
         let backup = self.active.clone();
-        let result = self.advance_inner(engine, worker, job);
+        let mut retry_required = false;
+        let result = self.advance_inner(engine, worker, job, &mut retry_required);
         if result.is_err()
             && self.active.is_none()
             && let Some(mut active) = backup
@@ -179,13 +193,17 @@ impl UploadDriver {
             active.phase = Phase::Drain;
             self.active = Some(active);
         }
-        result
+        result.map(|report| UploadAdvance {
+            report,
+            retry_required,
+        })
     }
     fn advance_inner(
         &mut self,
         engine: &mut ImportCoordinator,
         worker: &mut WorkerSupervisor,
         job: JobId,
+        retry_required: &mut bool,
     ) -> AppResult<ImportReport> {
         engine.bind_archive()?;
         let archive = engine
@@ -284,6 +302,7 @@ impl UploadDriver {
                 ));
             }
             WorkerState::Failed(error) => {
+                *retry_required = true;
                 if matches!(active.phase, Phase::List) {
                     engine
                         .catalog
