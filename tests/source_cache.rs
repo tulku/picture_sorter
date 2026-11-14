@@ -143,16 +143,36 @@ fn service_repeat_avoids_old_jpeg_and_raw_hashes() {
         "{}",
         String::from_utf8_lossy(&first.stdout)
     );
-    let before = service.status()["session_metrics"].clone();
+    use std::{
+        io::Read,
+        os::{fd::FromRawFd, unix::ffi::OsStrExt},
+    };
+    let descriptor = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    assert!(descriptor >= 0);
+    let mut accesses = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    for name in ["a.JPG", "b.ORF"] {
+        let path =
+            std::ffi::CString::new(service.r.source.join(name).as_os_str().as_bytes()).unwrap();
+        assert!(
+            unsafe { libc::inotify_add_watch(descriptor, path.as_ptr(), libc::IN_ACCESS) } >= 0
+        );
+    }
     let second = import();
     assert!(
         second.status.success(),
         "{}",
         String::from_utf8_lossy(&second.stdout)
     );
-    let after = service.status()["session_metrics"].clone();
-    assert_eq!(after["streamed_hash_bytes"], before["streamed_hash_bytes"]);
-    assert_eq!(after["transfer_bytes"], before["transfer_bytes"]);
+    let repeated: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(repeated["outcome"]["detail"]["hash_bytes"], 0);
+    assert_eq!(repeated["outcome"]["detail"]["transfer_bytes"], 0);
+    let mut events = [0u8; 256];
+    assert_eq!(
+        accesses.read(&mut events).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    std::fs::read(service.r.source.join("a.JPG")).unwrap();
+    assert!(accesses.read(&mut events).unwrap() > 0);
     std::fs::write(service.r.source.join("c.ORF"), b"new").unwrap();
     let appended = import();
     assert!(

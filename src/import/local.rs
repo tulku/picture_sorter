@@ -157,6 +157,7 @@ impl ImportCoordinator {
             )
         };
         let AdmissionDecision::Local { additional_bytes } = decision else {
+            self.catalog.request_admission_measurement();
             self.catalog.transition(job,record.generation,JobTransition::Wait(JobState::WaitingCapacity,"local budget or filesystem reserve unavailable; source retained while direct archive publication is considered".into()))?;
             return Ok(None);
         };

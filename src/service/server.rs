@@ -495,6 +495,14 @@ struct Runtime {
     editor_identity: Option<crate::qualification::EditorRuntimeIdentity>,
     last_tick: Instant,
 }
+fn waits_for_capacity_measurement(record: &JobRecord) -> bool {
+    record.state == JobState::WaitingCapacity
+        && record.reason.as_deref().is_some_and(|reason| {
+            reason.contains(crate::catalog::admission::ADMISSION_PENDING)
+                || reason.contains("fresh worker capacity measurement pending")
+        })
+}
+
 impl Runtime {
     fn enqueue(&mut self, request: &Request, kind: JobKind) -> AppResult<ResponseOutcome> {
         let job = self.engine.catalog.enqueue(DurableRequest {
@@ -867,12 +875,7 @@ impl Runtime {
         {
             return Ok(None);
         }
-        if record.state == JobState::WaitingCapacity
-            && record
-                .reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("fresh worker capacity measurement pending"))
-        {
+        if waits_for_capacity_measurement(&record) {
             return Ok(None);
         }
         if record.state == JobState::WaitingNas
@@ -1454,9 +1457,7 @@ impl Runtime {
             }
             let current = self.engine.catalog.job(record.id)?;
             if was_due
-                && !current.reason.as_deref().is_some_and(|reason| {
-                    reason.contains("fresh worker capacity measurement pending")
-                })
+                && !waits_for_capacity_measurement(&current)
                 && matches!(
                     current.state,
                     JobState::WaitingNas
@@ -1740,10 +1741,7 @@ impl Runtime {
                     .catalog
                     .job_is_due(job, SystemClock::default().now())?;
                 let local_can_progress = (record.state == JobState::WaitingNas
-                    || (record.state == JobState::WaitingCapacity
-                        && record.reason.as_deref().is_some_and(|reason| {
-                            reason.contains("fresh worker capacity measurement pending")
-                        })))
+                    || waits_for_capacity_measurement(record))
                     && self.import_has_local_work(job)?;
                 if due || local_can_progress || self.scan.active_job() == Some(job) {
                     self.scan.advance(&mut self.engine, job)?;

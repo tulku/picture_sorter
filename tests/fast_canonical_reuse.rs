@@ -409,3 +409,73 @@ fn cached_retired_plan_prefers_canonical_metadata_with_archive_offline() {
         2
     );
 }
+
+#[test]
+fn cached_live_scan_batches_durable_receipts_without_rewriting_sources() {
+    let r = support::TestRig::new();
+    let mut e = engine(&r);
+    for index in 0..64 {
+        let name = format!("{index:04}.ORF");
+        let bytes = name.as_bytes();
+        seed(&mut e, &r, &format!("legacy/{name}"), bytes, MediaRole::Raw);
+        std::fs::write(r.source.join(&name), bytes).unwrap();
+    }
+    prepare(&mut e, &r);
+    let db = rusqlite::Connection::open(r.state.join("catalog.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE source_rewrites(value INTEGER); CREATE TRIGGER count_source_rewrites AFTER UPDATE ON sources BEGIN INSERT INTO source_rewrites VALUES(1); END; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    let request = ImportRequest {
+        source_path: r.source.clone(),
+        strict: false,
+        dry_run: false,
+        operation_id: OperationId::new(),
+    };
+    let job = e.begin_scan(&request).unwrap();
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let mut inventory =
+        Inventory::open(RootHandle::open(&r.source, RootPolicy::Local).unwrap()).unwrap();
+    let entries = inventory.next_batch(128).unwrap();
+    let started = std::time::Instant::now();
+    let report = e.accept_scan_batch(job, &entries, None).unwrap();
+    let elapsed = started.elapsed();
+    let frames: u64 = db
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(1))
+        .unwrap();
+    let rewrites: u64 = db
+        .query_row("SELECT count(*) FROM source_rewrites", [], |row| row.get(0))
+        .unwrap();
+    eprintln!(
+        "cached live batch: files=64 elapsed={elapsed:?} WAL_frames={frames} source_rewrites={rewrites}"
+    );
+    assert_eq!(report.selected, 64);
+    assert_eq!(report.recognized, 64);
+    assert_eq!(report.archive_committed, 64);
+    assert_eq!(report.hash_bytes, 0);
+    assert_eq!(report.transfer_bytes, 0);
+    assert!(frames < 64, "cached batch wrote {frames} WAL pages");
+    assert_eq!(rewrites, 0);
+    let replay = e.accept_scan_batch(job, &entries, None).unwrap();
+    assert_eq!(replay.selected, 64);
+    assert_eq!(replay.recognized, 64);
+    assert_eq!(replay.hash_bytes, 0);
+    let interrupted = e
+        .begin_scan(&ImportRequest {
+            operation_id: OperationId::new(),
+            ..request
+        })
+        .unwrap();
+    db.execute_batch("CREATE TRIGGER interrupt_receipts BEFORE INSERT ON import_items WHEN NEW.source_path='0032.ORF' BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;").unwrap();
+    assert!(e.accept_scan_batch(interrupted, &entries, None).is_err());
+    let partial = e.report(interrupted).unwrap();
+    assert_eq!(partial.selected, 0);
+    assert_eq!(partial.recognized, 0);
+    assert_eq!(partial.archive_committed, 0);
+    db.execute_batch("DROP TRIGGER interrupt_receipts").unwrap();
+    let retried = e.accept_scan_batch(interrupted, &entries, None).unwrap();
+    assert_eq!(retried.selected, 64);
+    assert_eq!(retried.recognized, 64);
+    assert_eq!(retried.hash_bytes, 0);
+    drop(e);
+    let mut e = engine(&r);
+    assert_eq!(e.finish_scan(job, 0).unwrap().archive_committed, 64);
+    assert_eq!(e.finish_scan(interrupted, 0).unwrap().archive_committed, 64);
+}

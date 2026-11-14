@@ -154,8 +154,10 @@ impl<'a> VersionStore<'a> {
             stored.register(self.root, self.catalog)?;
         }
         if let SnapshotPayload::Content(bytes) = &intent.payload {
-            self.catalog
-                .admit_inline_snapshot(self.root, bytes.len() as u64)?;
+            if !fresh_intent {
+                self.catalog
+                    .admit_inline_snapshot(self.root, bytes.len() as u64)?;
+            }
             let digest = Digest::of(bytes);
             self.root
                 .mkdir_all(&ArchivePath::parse(".photo-sorter/snapshots")?)?;

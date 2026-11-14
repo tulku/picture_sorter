@@ -313,39 +313,56 @@ impl ImportCoordinator {
             size,
         })
     }
-    pub(crate) fn account_canonical_original(
+    pub(crate) fn account_canonical_originals(
         &mut self,
         job: JobId,
-        entry: &SourceEntry,
-        digest: &Digest,
-        selection: CanonicalSelection,
-    ) -> AppResult<bool> {
-        let (candidate, image, conflict) = match selection {
-            CanonicalSelection::None => return Ok(false),
-            CanonicalSelection::Exact(candidate) => (Some(candidate), None, false),
-            CanonicalSelection::Image(candidate, image) => (Some(candidate), Some(image), false),
-            CanonicalSelection::Ambiguous => (None, None, true),
-        };
-        let child = JobId::new();
-        let destination = candidate
-            .as_ref()
-            .map(|value| &value.path)
-            .unwrap_or(&entry.path);
-        let group = candidate.as_ref().map(|value| value.group);
-        if conflict {
-            self.catalog.record_ambiguity("original_collision",None,serde_json::json!({"digest":digest,"source":entry.path,"reason":"multiple canonical archived placements"}))?;
+        entries: &[SourceEntry],
+        digests: &[Digest],
+        selections: Vec<(usize, CanonicalSelection)>,
+    ) -> AppResult<()> {
+        if selections.is_empty() {
+            return Ok(());
+        }
+        for (index, selection) in &selections {
+            if matches!(selection, CanonicalSelection::Ambiguous) {
+                let entry = &entries[*index];
+                let digest = &digests[*index];
+                self.catalog.record_ambiguity("original_collision",None,serde_json::json!({"digest":digest,"source":entry.path,"reason":"multiple canonical archived placements"}))?;
+            }
         }
         let tx = self.catalog.db.transaction()?;
-        tx.execute("INSERT INTO import_items(id,parent,source_root,source_path,digest,size,role,group_id,destination,state,local_ready,archived,warning) VALUES(?,?,?,?,?,?,?,?,?,?,0,?,0)",params![child.to_string(),job.to_string(),entry.root.path().to_str().ok_or_else(||AppError::invalid("UTF-8 source root required"))?,entry.path.as_str(),digest.as_str(),entry.size,serde_json::to_string(&entry.role)?,group.map(|id|id.to_string()),destination.as_str(),if conflict {"conflict"} else if image.is_some() {"image_duplicate"} else {"accounted"},!conflict && image.is_none()])?;
-        if let (Some(candidate), Some(image)) = (&candidate, &image) {
-            tx.execute("INSERT INTO jpeg_duplicates(item,archive,canonical_group,canonical_path,canonical_digest,canonical_size,image) VALUES(?,?,?,?,?,?,?)",params![child.to_string(),self.config.archive_id.unwrap().to_string(),candidate.group.to_string(),candidate.path.as_str(),candidate.digest.as_str(),candidate.size,image.as_str()])?;
+        let mut selected = 0u64;
+        let mut recognized = 0u64;
+        for (index, selection) in selections {
+            let entry = &entries[index];
+            let digest = &digests[index];
+            let (candidate, image, conflict) = match selection {
+                CanonicalSelection::None => continue,
+                CanonicalSelection::Exact(candidate) => (Some(candidate), None, false),
+                CanonicalSelection::Image(candidate, image) => {
+                    (Some(candidate), Some(image), false)
+                }
+                CanonicalSelection::Ambiguous => (None, None, true),
+            };
+            let child = JobId::new();
+            let destination = candidate
+                .as_ref()
+                .map(|value| &value.path)
+                .unwrap_or(&entry.path);
+            let group = candidate.as_ref().map(|value| value.group);
+            tx.execute("INSERT INTO import_items(id,parent,source_root,source_path,digest,size,role,group_id,destination,state,local_ready,archived,warning) VALUES(?,?,?,?,?,?,?,?,?,?,0,?,0)",params![child.to_string(),job.to_string(),entry.root.path().to_str().ok_or_else(||AppError::invalid("UTF-8 source root required"))?,entry.path.as_str(),digest.as_str(),entry.size,serde_json::to_string(&entry.role)?,group.map(|id|id.to_string()),destination.as_str(),if conflict {"conflict"} else if image.is_some() {"image_duplicate"} else {"accounted"},!conflict && image.is_none()])?;
+            if let (Some(candidate), Some(image)) = (&candidate, &image) {
+                tx.execute("INSERT INTO jpeg_duplicates(item,archive,canonical_group,canonical_path,canonical_digest,canonical_size,image) VALUES(?,?,?,?,?,?,?)",params![child.to_string(),self.config.archive_id.unwrap().to_string(),candidate.group.to_string(),candidate.path.as_str(),candidate.digest.as_str(),candidate.size,image.as_str()])?;
+            }
+            selected += 1;
+            recognized += u64::from(!conflict);
         }
         tx.execute(
-            "UPDATE import_stats SET selected=selected+1,recognized=recognized+? WHERE job=?",
-            params![u64::from(!conflict), job.to_string()],
+            "UPDATE import_stats SET selected=selected+?,recognized=recognized+? WHERE job=?",
+            params![selected, recognized, job.to_string()],
         )?;
         tx.commit()?;
-        Ok(true)
+        Ok(())
     }
     pub(crate) fn prepare_jpeg_check(
         &self,

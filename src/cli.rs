@@ -469,12 +469,22 @@ fn print_response(response: &Response) -> AppResult<()> {
     match &response.outcome {
         ResponseOutcome::Accepted { job } => println!("Accepted job {job}"),
         ResponseOutcome::Error { error } => eprintln!("{error}"),
+        ResponseOutcome::Job { job, detail }
+            if matches!(job.request.kind, crate::catalog::JobKind::Import { .. }) =>
+        {
+            println!("{}", progress::describe(job, detail))
+        }
         ResponseOutcome::Job { job, detail } => println!(
             "Job {}: {:?}\n{}",
             job.id,
             job.state,
             serde_json::to_string_pretty(detail)?
         ),
+        ResponseOutcome::Data { data }
+            if data.get("schema_version").is_some() && data.get("space").is_some() =>
+        {
+            println!("{}", progress::status(data))
+        }
         ResponseOutcome::Data { data } => println!("{}", serde_json::to_string_pretty(data)?),
     }
     Ok(())

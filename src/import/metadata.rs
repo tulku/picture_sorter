@@ -138,13 +138,32 @@ impl Catalog {
         identity: &SourceIdentity,
         digest: &Digest,
     ) -> AppResult<()> {
-        entry.validate()?;
+        self.remember_sources(
+            std::slice::from_ref(entry),
+            identity,
+            std::slice::from_ref(digest),
+        )
+    }
+    pub(crate) fn remember_sources(
+        &mut self,
+        entries: &[SourceEntry],
+        identity: &SourceIdentity,
+        digests: &[Digest],
+    ) -> AppResult<()> {
+        if entries.len() > 128 || entries.len() != digests.len() {
+            return Err(AppError::invalid("invalid source bookkeeping batch"));
+        }
+        for entry in entries {
+            entry.validate()?;
+        }
         let tx = self.db.transaction()?;
-        tx.execute(
-            "INSERT INTO blobs(digest,size) VALUES(?,?) ON CONFLICT DO NOTHING",
-            params![digest.as_str(), entry.size],
-        )?;
-        tx.execute("INSERT INTO sources(incarnation,path,size,mtime,digest) VALUES(?,?,?,?,?) ON CONFLICT(incarnation,path) DO UPDATE SET size=excluded.size,mtime=excluded.mtime,digest=excluded.digest",params![identity.incarnation,entry.path.as_str(),entry.size,entry.fingerprint,digest.as_str()])?;
+        for (entry, digest) in entries.iter().zip(digests) {
+            tx.execute(
+                "INSERT INTO blobs(digest,size) VALUES(?,?) ON CONFLICT DO NOTHING",
+                params![digest.as_str(), entry.size],
+            )?;
+            tx.execute("INSERT INTO sources(incarnation,path,size,mtime,digest) VALUES(?,?,?,?,?) ON CONFLICT(incarnation,path) DO UPDATE SET size=excluded.size,mtime=excluded.mtime,digest=excluded.digest WHERE sources.size<>excluded.size OR sources.mtime<>excluded.mtime OR sources.digest<>excluded.digest",params![identity.incarnation,entry.path.as_str(),entry.size,entry.fingerprint,digest.as_str()])?;
+        }
         tx.commit()?;
         Ok(())
     }

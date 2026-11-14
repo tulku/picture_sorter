@@ -24,6 +24,7 @@ pub struct SpaceSnapshot {
 }
 #[derive(Debug, Serialize)]
 pub struct StatusSnapshot {
+    pub activity: serde_json::Value,
     pub session_metrics: crate::metrics::Metrics,
     pub pagination: serde_json::Value,
     pub schema_version: u32,
@@ -108,7 +109,37 @@ impl StatusSnapshot {
             subset_note:"Filesystem observations are cached at occupancy_observed_at; null means unmeasured. Metadata includes state snapshots, staging and catalog overhead. Pinned/protected/evictable overlap resident bytes. Do not add overlapping subsets or cached/current observations; admission and deletion recheck fresh evidence.".into(),
         };
 
+        let active_count: u64 = catalog.db.query_row("SELECT count(*) FROM jobs WHERE json_extract(state,'$') NOT IN ('Complete','Cancelled','Failed')", [], |r| r.get(0))?;
+        let mut active_query = catalog.db.prepare("SELECT id FROM jobs WHERE json_extract(state,'$') NOT IN ('Complete','Cancelled','Failed') ORDER BY CASE WHEN json_extract(request,'$.kind.type')='import' THEN 0 ELSE 1 END, rowid DESC LIMIT 8")?;
+        let active_ids = active_query
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut active = Vec::new();
+        for id in active_ids {
+            let id: JobId = serde_json::from_value(id.into())?;
+            let job = catalog.job(id)?;
+            let detail = if matches!(job.request.kind, JobKind::Import { .. })
+                && catalog.db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM import_stats WHERE job=?)",
+                    [id.to_string()],
+                    |r| r.get::<_, bool>(0),
+                )? {
+                serde_json::to_value(engine.report(id)?)?
+            } else {
+                serde_json::Value::Null
+            };
+            active.push(serde_json::json!({"job":job,"detail":detail}));
+        }
+        let pending_upload: u64 = catalog.db.query_row("SELECT count(*) FROM (SELECT DISTINCT i.digest,i.destination FROM import_items i JOIN jobs j ON j.id=i.parent WHERE i.archived=0 AND i.state NOT IN ('image_duplicate','conflict','jpeg_pending') AND json_extract(j.state,'$') NOT IN ('Complete','Cancelled','Failed','CancelRequested') EXCEPT SELECT digest,destination FROM import_items WHERE archived=1)", [], |r| r.get(0))?;
+        let recent = catalog
+            .successful_operations(3)?
+            .into_iter()
+            .map(|id| catalog.job(id))
+            .collect::<AppResult<Vec<_>>>()?;
+        let activity = serde_json::json!({"active_count":active_count,"active":active,"recent":recent,"pending_upload":pending_upload});
+
         Ok(Self {
+            activity,
             session_metrics: crate::metrics::snapshot(),
             pagination,
             schema_version: crate::catalog::schema::VERSION as u32,
@@ -126,5 +157,77 @@ impl StatusSnapshot {
             watcher: serde_json::json!({"recovery":"startup reconciliation pending"}),
             worker,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn activity_ignores_cancelled_uploads_and_finds_active_jobs_beyond_the_page() {
+        let temp = tempfile::tempdir().unwrap();
+        for dir in ["local", "state", "archive"] {
+            std::fs::create_dir(temp.path().join(dir)).unwrap();
+        }
+        let config = crate::config::Config::new(
+            temp.path().join("local"),
+            temp.path().join("state"),
+            temp.path().join("archive"),
+        );
+        let root =
+            crate::fs::RootHandle::open(&config.state_root, crate::fs::RootPolicy::Local).unwrap();
+        let mut catalog = Catalog::open(&root).unwrap();
+        let mut active = None;
+        for index in 0..130 {
+            let id = catalog
+                .enqueue(DurableRequest {
+                    operation_id: OperationId::new(),
+                    kind: JobKind::ArchiveInit,
+                })
+                .unwrap();
+            let sorted = format!("00000000-0000-0000-0000-{index:012x}");
+            catalog
+                .db
+                .execute(
+                    "UPDATE jobs SET id=? WHERE id=?",
+                    rusqlite::params![sorted, id.to_string()],
+                )
+                .unwrap();
+            let id: JobId = serde_json::from_value(sorted.into()).unwrap();
+            catalog
+                .db
+                .execute(
+                    "UPDATE jobs SET state=? WHERE id=?",
+                    rusqlite::params![
+                        if index == 129 {
+                            "\"WaitingNas\""
+                        } else {
+                            "\"Cancelled\""
+                        },
+                        id.to_string()
+                    ],
+                )
+                .unwrap();
+            if index == 129 {
+                active = Some(id);
+            }
+            catalog.db.execute("INSERT INTO import_items(id,parent,source_root,source_path,digest,size,role,destination,state) VALUES(?,?,?,?,?,1,'raw',?,'planned')", rusqlite::params![JobId::new().to_string(),id.to_string(),"/card",format!("{index}.ORF"),"digest","image.ORF"]).unwrap();
+        }
+        let active = active.unwrap();
+        let engine = ImportCoordinator::new(config, catalog);
+        let status = StatusSnapshot::collect_page(
+            &engine,
+            &super::super::space::SpaceMeter::default(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+            &super::super::protocol::StatusQuery::default(),
+        )
+        .unwrap();
+        assert_eq!(status.activity["active_count"], 1);
+        assert_eq!(status.activity["pending_upload"], 1);
+        assert_eq!(
+            status.activity["active"][0]["job"]["id"],
+            active.to_string()
+        );
     }
 }

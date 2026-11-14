@@ -24,7 +24,11 @@ pub struct ImportReport {
     pub skipped: u64,
     pub recognized: u64,
     pub local_ready: u64,
+    #[serde(default)]
+    pub copy_ready: u64,
     pub archive_committed: u64,
+    #[serde(default)]
+    pub archive_reused: u64,
     #[serde(default)]
     pub image_duplicates: u64,
     pub pending_archive: u64,
@@ -190,12 +194,13 @@ impl ImportCoordinator {
             self.catalog.job(job)?.request.kind,
             JobKind::Import { strict: true, .. }
         );
+        self.catalog.remember_sources(entries, &identity, digests)?;
+        let mut canonical = vec![];
         let mut recognized = vec![];
         let mut new = vec![];
         let mut accounted = std::collections::BTreeSet::new();
-        for (entry, digest) in entries.iter().zip(digests) {
+        for (index, (entry, digest)) in entries.iter().zip(digests).enumerate() {
             entry.validate()?;
-            self.catalog.remember_source(entry, &identity, digest)?;
             if matches!(entry.role, SourceRole::Original(MediaRole::Jpeg))
                 && self.catalog.jpeg_fingerprint(digest)?.is_none()
             {
@@ -209,11 +214,12 @@ impl ImportCoordinator {
                 self.catalog.cache_jpeg_inspection(&inspection)?;
             }
             let exists:bool=self.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM import_items WHERE parent=? AND source_path=? AND digest=?)",params![job.to_string(),entry.path.as_str(),digest.as_str()],|row|row.get(0))?;
-            if exists {
+            if exists || accounted.contains(&entry.path) {
                 accounted.insert(entry.path.clone());
             } else if matches!(entry.role, SourceRole::Original(_)) {
                 let selection = self.canonical_archived_original(entry, digest, strict)?;
-                if self.account_canonical_original(job, entry, digest, selection)? {
+                if !matches!(selection, CanonicalSelection::None) {
+                    canonical.push((index, selection));
                     accounted.insert(entry.path.clone());
                 }
             }
@@ -231,6 +237,7 @@ impl ImportCoordinator {
                 hashed_bytes: entry.size,
             });
         }
+        self.account_canonical_originals(job, entries, digests, canonical)?;
         let results = if let Some(metadata) = metadata {
             metadata
         } else if !new.is_empty() {
@@ -556,7 +563,7 @@ impl ImportCoordinator {
     }
     pub fn report(&self, job: JobId) -> AppResult<ImportReport> {
         let (selected,recognized,exif_invocations,transfer_bytes,hash_bytes)=self.catalog.db.query_row("SELECT selected,recognized,exif_calls,transfer_bytes,hash_bytes FROM import_stats WHERE job=?",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
-        let(local_ready,archive_committed,waiting,conflicting,association_warnings):(u64,u64,u64,u64,u64)=self.catalog.db.query_row("SELECT coalesce(sum(local_ready),0),coalesce(sum(archived),0),coalesce(sum(local_ready=0 AND archived=0 AND state NOT IN('conflict','image_duplicate')),0),coalesce(sum(state='conflict'),0),coalesce(sum(warning),0) FROM import_items WHERE parent=?",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+        let(local_ready,archive_committed,waiting,conflicting,association_warnings,archive_reused,copy_ready):(u64,u64,u64,u64,u64,u64,u64)=self.catalog.db.query_row("SELECT coalesce(sum(local_ready),0),coalesce(sum(archived),0),coalesce(sum(local_ready=0 AND archived=0 AND state NOT IN('conflict','image_duplicate')),0),coalesce(sum(state='conflict'),0),coalesce(sum(warning),0),coalesce(sum(archived=1 AND state='accounted'),0),coalesce(sum(local_ready=1 AND state<>'accounted'),0) FROM import_items WHERE parent=?",[job.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?;
         let image_duplicates: u64 = self.catalog.db.query_row(
             "SELECT count(*) FROM import_items WHERE parent=? AND state='image_duplicate'",
             [job.to_string()],
@@ -585,7 +592,9 @@ impl ImportCoordinator {
             selected,
             recognized,
             local_ready,
+            copy_ready,
             archive_committed,
+            archive_reused,
             image_duplicates,
             pending_archive,
             waiting,

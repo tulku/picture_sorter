@@ -340,7 +340,7 @@ fn human_import_reports_progress_before_a_paused_copy_finishes() {
     assert!(early.unwrap().contains(service.r.source.to_str().unwrap()));
     let heartbeat = heartbeat.unwrap();
     assert!(heartbeat.contains("checked "), "{heartbeat}");
-    assert!(heartbeat.contains("pending upload "), "{heartbeat}");
+    assert!(heartbeat.contains("queued"), "{heartbeat}");
     assert!(output.status.success(), "{output:?}");
 }
 
@@ -382,9 +382,16 @@ fn human_archive_wait_preserves_ingested_milestone_and_final_request_identity() 
         ],
     );
     let text = String::from_utf8_lossy(&output.stdout);
-    let detail = text.split_once('\n').unwrap().1;
-    let detail: serde_json::Value = serde_json::from_str(detail).unwrap();
-    let job = detail["job"].as_str().unwrap();
+    assert!(text.contains("Card can be removed"), "{text}");
+    let status = service.status();
+    let job = status["activity"]["active"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["job"]["request"]["kind"]["type"] == "import")
+        .unwrap()["job"]["id"]
+        .as_str()
+        .unwrap();
     let mut waiter = Command::new(env!("CARGO_BIN_EXE_photo_sorter"))
         .arg("--config")
         .arg(&service.profile)
@@ -400,7 +407,7 @@ fn human_archive_wait_preserves_ingested_milestone_and_final_request_identity() 
     assert!(output.status.success(), "{output:?}");
     assert!(waiting, "archive wait returned before publication");
     assert!(final_output.status.success(), "{final_output:?}");
-    assert!(String::from_utf8_lossy(&final_output.stderr).contains(job));
+    assert!(String::from_utf8_lossy(&final_output.stdout).contains("uploaded"));
     let result = service.cli(&["jobs", "wait", job, "--request-id", &request]);
     let response: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(response["request_id"], request);
@@ -458,4 +465,74 @@ fn human_import_reports_source_while_service_acceptance_is_withheld() {
     let early = early.expect("missing source progress before service acceptance");
     assert!(early.contains(r.source.to_str().unwrap()), "{early}");
     assert!(early.contains("Checking card"), "{early}");
+}
+
+#[test]
+fn default_status_is_a_bounded_human_summary() {
+    let service = support::service::ServiceFixture::new();
+    let result = cli(&service.profile, &["status"]);
+    assert!(result.status.success(), "{result:?}");
+    let text = String::from_utf8_lossy(&result.stdout);
+    assert!(text.contains("Current work:"), "{text}");
+    assert!(text.contains("Cache:"), "{text}");
+    assert!(text.contains("Upload:"), "{text}");
+    assert!(text.lines().count() < 24, "{text}");
+    assert!(!text.contains("schema_version"), "{text}");
+}
+
+#[test]
+fn human_progress_uses_simultaneous_rows_in_a_terminal() {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    let service = support::service::ServiceFixture::new();
+    std::fs::write(service.r.source.join("A.ORF"), b"generated raw").unwrap();
+    let pid = service.status()["worker"]["local_pid"].as_u64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let (mut master, mut slave) = (-1, -1);
+    let size = libc::winsize {
+        ws_row: 24,
+        ws_col: 120,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &size,
+            )
+        },
+        0
+    );
+    let mut terminal = unsafe { std::fs::File::from_raw_fd(master) };
+    let stderr = unsafe { std::fs::File::from_raw_fd(slave) };
+    let child = Command::new(env!("CARGO_BIN_EXE_photo_sorter"))
+        .arg("--config")
+        .arg(&service.profile)
+        .arg("import")
+        .arg(&service.r.source)
+        .env("TERM", "xterm-256color")
+        .stdout(Stdio::piped())
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut rendered = Vec::new();
+        let _ = terminal.read_to_end(&mut rendered);
+        rendered
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    let result = child.wait_with_output().unwrap();
+    let rendered = reader.join().unwrap();
+    let text = String::from_utf8_lossy(&rendered);
+    assert!(result.status.success(), "{result:?}");
+    for label in ["Checking card", "Local copy", "Upload"] {
+        assert!(text.contains(label), "{text}");
+    }
+    assert!(text.contains("\x1b["), "terminal did not redraw: {text}");
+    assert!(!String::from_utf8_lossy(&result.stdout).contains("archive_committed"));
 }

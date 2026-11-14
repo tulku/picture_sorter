@@ -16,9 +16,13 @@ pub struct Catalog {
     _root: File,
     pub(crate) async_admission: bool,
     admission_limits: Option<(u64, u64)>,
-    admission_observed: std::cell::Cell<Option<std::time::Instant>>,
     admission_requested: std::cell::Cell<bool>,
-    admission_proof: std::cell::RefCell<Option<(u64, crate::fs::ManagedSpaceMeasurement)>>,
+    admission_proof: std::cell::RefCell<
+        Option<(
+            admission::AdmissionCheckpoint,
+            crate::fs::ManagedSpaceMeasurement,
+        )>,
+    >,
 }
 impl Catalog {
     pub fn open(state: &RootHandle) -> AppResult<Self> {
@@ -111,15 +115,21 @@ CREATE TRIGGER IF NOT EXISTS residency_expected_update_v2 AFTER UPDATE OF local_
 CREATE TRIGGER IF NOT EXISTS residency_expected_delete AFTER DELETE ON placements BEGIN DELETE FROM local_residency_expectations WHERE placement=old.id; END;
 CREATE TABLE IF NOT EXISTS reservation_ceilings(id TEXT PRIMARY KEY,bytes INTEGER NOT NULL);
 INSERT OR IGNORE INTO reservation_ceilings SELECT id,remaining FROM reservations;
+CREATE TABLE IF NOT EXISTS admission_generation(value INTEGER NOT NULL);
+INSERT INTO admission_generation SELECT 0 WHERE NOT EXISTS(SELECT 1 FROM admission_generation);
+CREATE TABLE IF NOT EXISTS admission_allocations(filesystem TEXT PRIMARY KEY,bytes INTEGER NOT NULL CHECK(typeof(bytes)='integer' AND bytes>=0));
 CREATE TRIGGER IF NOT EXISTS admission_insert AFTER INSERT ON reservations BEGIN UPDATE admission_epoch SET value=value+1; INSERT INTO reservation_ceilings VALUES(new.id,new.remaining); END;
 CREATE TRIGGER IF NOT EXISTS admission_update AFTER UPDATE OF remaining ON reservations WHEN old.remaining<>new.remaining BEGIN UPDATE admission_epoch SET value=value+1; UPDATE reservation_ceilings SET bytes=max(bytes,new.remaining) WHERE id=new.id; END;
-CREATE TRIGGER IF NOT EXISTS admission_delete AFTER DELETE ON reservations BEGIN UPDATE admission_epoch SET value=value+1; DELETE FROM reservation_ceilings WHERE id=old.id; END;")?;
+CREATE TRIGGER IF NOT EXISTS admission_delete AFTER DELETE ON reservations BEGIN UPDATE admission_epoch SET value=value+1; DELETE FROM reservation_ceilings WHERE id=old.id; END;
+CREATE TRIGGER IF NOT EXISTS allocation_insert AFTER INSERT ON reservations BEGIN INSERT INTO admission_allocations VALUES(new.filesystem,new.remaining) ON CONFLICT(filesystem) DO UPDATE SET bytes=bytes+new.remaining; END;
+CREATE TRIGGER IF NOT EXISTS allocation_update AFTER UPDATE OF remaining ON reservations WHEN new.remaining>old.remaining BEGIN INSERT INTO admission_allocations VALUES(new.filesystem,new.remaining-old.remaining) ON CONFLICT(filesystem) DO UPDATE SET bytes=bytes+new.remaining-old.remaining; END;
+")?;
+
         Ok(Self {
             db,
             _root: root,
             async_admission: false,
             admission_limits: None,
-            admission_observed: std::cell::Cell::new(None),
             admission_requested: std::cell::Cell::new(false),
             admission_proof: std::cell::RefCell::new(None),
         })
@@ -198,7 +208,7 @@ pub(crate) fn backup_readonly(state: &RootHandle, dest: &Path) -> AppResult<()> 
 mod rating_convergence;
 pub use rating_convergence::*;
 
-mod admission;
+pub(crate) mod admission;
 
 mod favorite_convergence;
 pub use favorite_convergence::*;

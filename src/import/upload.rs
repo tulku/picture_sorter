@@ -105,7 +105,7 @@ impl ImportCoordinator {
                 let archived:bool=self.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM sidecars s JOIN heads h ON h.sidecar=s.id JOIN versions v ON v.id=h.version JOIN archived_versions a ON a.version=v.id WHERE s.path=? AND json_extract(v.body,'$.Content.digest')=? AND json_extract(v.body,'$.Content.size')=?)",params![target.as_str(),item.digest.as_str(),item.size],|r|r.get(0))?;
                 if archived {
                     self.catalog.db.execute(
-                        "UPDATE import_items SET archived=1,state='archived' WHERE id=?",
+                        "UPDATE import_items SET archived=1,state='accounted' WHERE id=?",
                         [item.id.to_string()],
                     )?;
                     self.catalog.db.execute(
@@ -751,4 +751,92 @@ fn source_owner(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    #[test]
+    fn already_archived_companion_receipt_is_reuse_without_an_upload() {
+        let temp = tempfile::tempdir().unwrap();
+        for directory in ["source", "local", "state", "archive"] {
+            std::fs::create_dir(temp.path().join(directory)).unwrap();
+        }
+        let config = crate::config::Config::new(
+            temp.path().join("local"),
+            temp.path().join("state"),
+            temp.path().join("archive"),
+        );
+        let state =
+            crate::fs::RootHandle::open(&config.state_root, crate::fs::RootPolicy::Local).unwrap();
+        let catalog = Catalog::open(&state).unwrap();
+        let mut engine = ImportCoordinator::new(config, catalog);
+        let source = temp.path().join("source");
+        std::fs::write(source.join("orphan.rrdata"), b"sidecar").unwrap();
+        let report = engine
+            .prepare(ImportRequest {
+                source_path: source,
+                strict: false,
+                dry_run: false,
+                operation_id: OperationId::new(),
+            })
+            .unwrap();
+        let job = report.job.unwrap();
+        let destination: String = engine
+            .catalog
+            .db
+            .query_row(
+                "SELECT destination FROM import_items WHERE parent=?",
+                [job.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let sidecar = SidecarId::new();
+        let version = VersionId::new();
+        let db = &engine.catalog.db;
+        db.execute(
+            "INSERT INTO sidecars(id,path,owner) VALUES(?,?,?)",
+            params![sidecar.to_string(), destination, "fixture"],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO versions(id,sidecar,body,origin,operation) VALUES(?,?,?,?,?)",
+            params![
+                version.to_string(),
+                sidecar.to_string(),
+                serde_json::to_string(&VersionBody::Content {
+                    digest: Digest::of(b"sidecar"),
+                    size: 7
+                })
+                .unwrap(),
+                "fixture",
+                OperationId::new().to_string()
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO heads(sidecar,version) VALUES(?,?)",
+            params![sidecar.to_string(), version.to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO archived_versions(version) VALUES(?)",
+            [version.to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE import_items SET local_ready=1 WHERE parent=?",
+            [job.to_string()],
+        )
+        .unwrap();
+        assert!(engine.next_upload(job).unwrap().is_none());
+        let reused = engine.report(job).unwrap();
+        assert_eq!(reused.archive_committed, 1);
+        assert_eq!(reused.archive_reused, 1);
+        assert_eq!(reused.recognized, 1);
+        assert_eq!(reused.transfer_bytes, 0);
+        assert_eq!(reused.local_ready, 1);
+        assert_eq!(serde_json::to_value(&reused).unwrap()["copy_ready"], 0);
+    }
 }

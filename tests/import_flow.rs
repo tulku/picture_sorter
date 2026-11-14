@@ -39,10 +39,19 @@ fn repeat_zero_exif_zero_copy() {
     let initial = e.prepare(request(&r)).unwrap();
     drive(&mut e, initial.job.unwrap());
     let report = e.prepare(request(&r)).unwrap();
+    assert_eq!(report.selected, 1);
+    assert_eq!(report.recognized, 1);
+    assert_eq!(report.pending_archive, 1);
+    let value = serde_json::to_value(&report).unwrap();
+    assert_eq!(value["archive_reused"], 0);
+    let pending_work =
+        report.selected - value["archive_reused"].as_u64().unwrap() - report.image_duplicates;
+    assert_eq!(pending_work, 1);
     let final_report = drive(&mut e, report.job.unwrap());
     assert_eq!(final_report.exif_invocations, 0);
     assert_eq!(final_report.transfer_bytes, 0);
     assert_eq!(final_report.local_ready, 1);
+    assert_eq!(final_report.copy_ready, 1);
 }
 #[test]
 fn offline_capacity_pause_then_resume() {
@@ -227,10 +236,17 @@ fn evicted_known_original_not_reimported() {
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
+    let uploaded = e.report(initial.job.unwrap()).unwrap();
+    assert_eq!(uploaded.archive_committed, 1);
+    assert_eq!(
+        serde_json::to_value(&uploaded).unwrap()["archive_reused"],
+        0
+    );
     let group = e.catalog.group_batch(None, 128).unwrap().remove(0);
     std::fs::remove_file(r.local.join(group.members[0].path.as_str())).unwrap();
     let report = e.prepare(request(&r)).unwrap();
     assert_eq!(report.archive_committed, 1);
+    assert_eq!(serde_json::to_value(&report).unwrap()["archive_reused"], 1);
     assert_eq!(report.local_ready, 0);
     assert_eq!(report.transfer_bytes, 0);
     assert_eq!(report.exif_invocations, 0);

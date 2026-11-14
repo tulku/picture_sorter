@@ -123,9 +123,14 @@ impl Catalog {
     }
     pub fn update_reservation(&mut self, id: ReservationId, remaining: u64) -> AppResult<()> {
         if self.db.execute(
-            "UPDATE reservations SET remaining=? WHERE id=?",
-            params![remaining, id.to_string()],
-        )? != 1
+            "UPDATE reservations SET remaining=? WHERE id=? AND remaining<>?",
+            params![remaining, id.to_string(), remaining],
+        )? == 0
+            && !self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM reservations WHERE id=?)",
+                [id.to_string()],
+                |row| row.get::<_, bool>(0),
+            )?
         {
             return Err(AppError::invalid("unknown reservation"));
         }
@@ -177,5 +182,40 @@ impl Catalog {
             metadata_current,
             waiting_reason: reason,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::{RootHandle, RootPolicy};
+
+    #[test]
+    fn unchanged_reservation_poll_does_not_write_catalogue() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = RootHandle::open(directory.path(), RootPolicy::Local).unwrap();
+        let mut catalog = Catalog::open(&root).unwrap();
+        let job = catalog
+            .enqueue(DurableRequest {
+                operation_id: OperationId::new(),
+                kind: JobKind::Clean,
+            })
+            .unwrap();
+        let reservation = catalog
+            .reserve(job, FilesystemId(root.device()), 100)
+            .unwrap();
+        let changes = catalog.db.total_changes();
+        for _ in 0..100 {
+            catalog.update_reservation(reservation, 100).unwrap();
+        }
+        assert_eq!(catalog.db.total_changes(), changes);
+        catalog.update_reservation(reservation, 60).unwrap();
+        assert_eq!(
+            catalog
+                .remaining_reservations(FilesystemId(root.device()))
+                .unwrap(),
+            60
+        );
+        assert!(catalog.update_reservation(ReservationId::new(), 0).is_err());
     }
 }
