@@ -20,26 +20,26 @@
 - Disabled integration must do no unnecessary work, enabled integration keeps its semantics.
 
 ### Task 1: Local verification evidence
-- [ ] Add regression tests proving unchanged files are not rehashed; changed stamps, restart, explicit audit and watcher recovery remain safe.
-- [ ] Implement cached verified stamps and metadata-only reconciliation in recovery/observation/catalog paths.
-- [ ] Run focused tests and commit.
+- [x] Add regression tests proving unchanged files are not rehashed; changed stamps, restart, explicit audit and watcher recovery remain safe.
+- [x] Implement cached verified stamps and metadata-only reconciliation in recovery/observation/catalog paths.
+- [x] Run focused tests and commit.
 
 ### Task 2: Pending work and lifecycle
-- [ ] Add active-job query index/performance regression and cancelled-parent recovery regression; observe failures.
-- [ ] Implement indexed active query and quiescence-bound abandoned child settlement.
-- [ ] Run focused tests and commit.
+- [x] Add active-job query index/performance regression and cancelled-parent recovery regression; observe failures.
+- [x] Implement indexed active query and quiescence-bound abandoned child settlement.
+- [x] Run focused tests and commit.
 
 ### Task 3: Descriptor-driven coordinator
-- [ ] Add real readiness/deadline and idle resource regression tests; observe failures.
-- [ ] Implement wait module, worker descriptors, local watcher readiness and timers; replace fixed loop sleeps.
-- [ ] Verify responsiveness under import/copy, idle socket requests, worker backpressure and retries.
+- [x] Add real readiness/deadline and idle resource regression tests; observe failures.
+- [x] Implement wait module, worker descriptors, local watcher readiness and timers; replace fixed loop sleeps.
+- [x] Verify responsiveness under import/copy, idle socket requests, worker backpressure and retries.
 
 ### Task 4: Remove dead code and isolate optional integration
-- [ ] Remove legacy sorter/exclusive modules/rayon/regex and test-only production abstractions; update meaningful tests and docs.
-- [ ] Extract Immich orchestration/state out of coordinator, preserving tests and sync behavior.
-- [ ] Run relevant tests and commit.
+- [x] Remove legacy sorter/exclusive modules/rayon/regex and test-only production abstractions; update meaningful tests and docs.
+- [x] Extract Immich orchestration/state out of coordinator, preserving tests and sync behavior.
+- [x] Run relevant tests and commit.
 
 ### Task 5: Review, measure and deliver
-- [ ] Full cargo tests, fmt, strict clippy; independent whole-branch review.
-- [ ] Repeat isolated idle measurement with representative catalogue and compare baseline; never run copied production jobs against real photo roots.
-- [ ] Merge/push approved main workflow, update Nix pin/build/commit, hand off activation and post-switch measurement to user.
+- [x] Full cargo tests, fmt, strict clippy; independent whole-branch review.
+- [x] Repeat isolated idle measurement with representative catalogue and compare baseline; never run copied production jobs against real photo roots.
+- [x] Merge/push approved main workflow, update Nix pin/build/commit, hand off activation and post-switch measurement to user.
