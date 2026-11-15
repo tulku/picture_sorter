@@ -708,6 +708,14 @@ impl Runtime {
             }
             Command::ConflictsPage { after, limit } => {
                 let conflicts = self.engine.catalog.conflicts_page(*after, *limit, false)?;
+                let display = conflicts
+                    .iter()
+                    .map(|conflict| {
+                        self.engine
+                            .catalog
+                            .describe_conflict(conflict, &self.engine.config)
+                    })
+                    .collect::<AppResult<Vec<_>>>()?;
                 let next = conflicts.last().map(|c| c.id);
                 let has_more = if let Some(id) = next {
                     !self
@@ -718,7 +726,9 @@ impl Runtime {
                 } else {
                     false
                 };
-                data(serde_json::json!({"conflicts":conflicts,"next":next,"has_more":has_more}))
+                data(
+                    serde_json::json!({"conflicts":conflicts,"display":display,"next":next,"has_more":has_more}),
+                )
             }
             Command::ConflictsList => data(serde_json::to_value(
                 self.engine.catalog.conflicts_page(None, 128, false)?,

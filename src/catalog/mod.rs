@@ -197,6 +197,7 @@ pub use maintenance::*;
 mod verify;
 pub use verify::*;
 mod conflicts;
+mod projection_catchup;
 mod publication;
 pub use conflicts::*;
 

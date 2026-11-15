@@ -2,6 +2,8 @@
 
 `photo_sorter status` summarizes saved local files, how many have a committed NAS backup, available cache capacity, and problems needing attention. Repeated imports count once. Cache availability is an estimate limited by the cache budget and both filesystems' free space after reservations and the filesystem reserve. `status --json` retains job details, measurements, archive capability reasons, and pending saved edits. Local copies alone are not a NAS backup.
 
+Pending saved edits appear separately from photo backups: a NAS that cannot safely replace existing edit files can still accept original photos. Known older NAS edits are caught up through committed history when safe replacement is supported. Unknown changes still require review. `photo_sorter conflicts list` groups reports by filename and explains each mismatch; `conflicts list --json` retains the full records. A conflict does not necessarily mean two computers were used.
+
 For automatic single-writer archive checks, configure an existing scratch folder once in the profile:
 
 ```toml

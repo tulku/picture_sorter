@@ -40,6 +40,55 @@ pub(crate) fn refresh_association_flags(db: &Connection) -> AppResult<()> {
     Ok(())
 }
 impl Catalog {
+    pub(crate) fn describe_conflict(
+        &self,
+        conflict: &ConflictRecord,
+        config: &crate::config::Config,
+    ) -> AppResult<serde_json::Value> {
+        let path = self.conflict_path(conflict)?;
+        let mut behind = false;
+        if conflict.kind == "nas_projection"
+            && conflict.details["preserved"].is_null()
+            && let (Ok(sidecar), Ok(version), Ok(observed)) = (
+                serde_json::from_value::<SidecarId>(conflict.details["sidecar"].clone()),
+                serde_json::from_value::<VersionId>(conflict.details["version"].clone()),
+                serde_json::from_value::<VersionBody>(conflict.details["observed"].clone()),
+            )
+        {
+            let heads = self.heads(sidecar)?;
+            if let [head] = heads.as_slice() {
+                behind = self.is_ancestor(version, *head)?
+                    && self.archived_ancestor_body(sidecar, *head, &observed)?;
+            }
+        }
+        let (summary, action) = match conflict.kind.as_str() {
+            "nas_projection" if behind => (
+                "NAS has an older saved edit, not competing edits.",
+                "No version choice is needed; the live NAS edit copy still needs updating.",
+            ),
+            "nas_projection" => (
+                "NAS edit differs from the saved version expected by the app.",
+                "Review the local and NAS edit files before choosing which version to keep.",
+            ),
+            "sidecar" => (
+                "More than one saved edit version needs review.",
+                "Compare the saved versions before choosing one; originals are retained.",
+            ),
+            "association" => (
+                "The app cannot determine which files belong together.",
+                "Review the file grouping before associating them.",
+            ),
+            _ => (
+                "The app found a file mismatch that needs review.",
+                "Use --json for the full record before resolving it.",
+            ),
+        };
+        Ok(
+            serde_json::json!({"id":conflict.id,"path":path,"kind":conflict.kind,"summary":summary,"action":action,"backup_behind":behind,
+            "local_path":path.as_ref().map(|p|config.working_root.join(p)),"archive_path":path.as_ref().map(|p|config.archive_root.join(p))}),
+        )
+    }
+
     pub fn record_ambiguity(
         &mut self,
         kind: &str,

@@ -6,6 +6,7 @@ use crate::{
     fs::*,
     service::{self, protocol::*},
 };
+mod conflicts;
 mod progress;
 mod status;
 
@@ -485,6 +486,9 @@ fn print_response(response: &Response) -> AppResult<()> {
             if data.get("schema_version").is_some() && data.get("space").is_some() =>
         {
             println!("{}", progress::status(data))
+        }
+        ResponseOutcome::Data { data } if data["conflicts"].is_array() => {
+            println!("{}", conflicts::render(data))
         }
         ResponseOutcome::Data { data } => println!("{}", serde_json::to_string_pretty(data)?),
     }

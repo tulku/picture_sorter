@@ -409,6 +409,36 @@ impl SharedPublisher {
                     preserved,
                 } = outcome
                 {
+                    let latest_attempt = active
+                        .plan
+                        .as_ref()
+                        .is_some_and(|p| p.projections.iter().any(|p| p.version == version));
+                    if preserved.is_none()
+                        && latest_attempt
+                        && let Some((commit, plan)) = engine
+                            .catalog
+                            .committed_projection_successor(archive, sidecar, version, &observed)?
+                    {
+                        engine
+                            .catalog
+                            .queue_stale_projection_resolutions(sidecar, version)?;
+                        active.plan = Some(VersionPublication {
+                            commit: commit.clone(),
+                            history: vec![],
+                            projections: vec![plan.clone()],
+                            attempt: OperationId::new(),
+                            generated_authorizations: vec![],
+                        });
+                        active.ticket = worker.submit(NasCommand::RepairProjection {
+                            session: session(&active)?,
+                            commit,
+                            authorization: None,
+                            plan,
+                        })?;
+                        self.reason = Some("Catching up older saved NAS edits".into());
+                        self.active = Some(active);
+                        return Ok(());
+                    }
                     let group: Option<String> = engine.catalog.db.query_row(
                         "SELECT group_id FROM sidecars WHERE id=?",
                         [sidecar.to_string()],
@@ -423,6 +453,15 @@ impl SharedPublisher {
                     );
                     active.phase = Phase::Abort;
                 } else {
+                    if active
+                        .plan
+                        .as_ref()
+                        .is_some_and(|p| p.projections.iter().any(|p| p.version == version))
+                    {
+                        engine
+                            .catalog
+                            .queue_stale_projection_resolutions(sidecar, version)?;
+                    }
                     let commit = active
                         .plan
                         .as_ref()
@@ -618,6 +657,17 @@ fn prepare(engine: &mut ImportCoordinator, candidate: &Candidate) -> AppResult<V
                 |r| r.get(0),
             )?;
             records = serde_json::from_str(&text)?;
+            engine.catalog.revalidate_queued_resolutions(&mut records)?;
+            if records.is_empty() {
+                engine.catalog.db.execute(
+                    "UPDATE pending_shared_records SET committed=1 WHERE operation=?",
+                    [operation.to_string()],
+                )?;
+                return Err(AppError::new(
+                    crate::error::ErrorCode::Conflict,
+                    "queued resolutions are no longer needed",
+                ));
+            }
             for record in records.clone() {
                 let convergence = match &record {
                     ArchiveRecord::RatingConverged { evidence } => {

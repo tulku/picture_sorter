@@ -26,24 +26,33 @@ pub(super) fn render(data: &Value) -> String {
         if pending > 0 {
             line.push_str(&format!("; {pending} waiting"));
         }
-        if edits > 0 {
-            line.push_str(&format!("; {edits} saved edit(s) pending"));
-        }
-        if pending > 0 || copying > 0 || edits > 0 {
+        if pending > 0 || copying > 0 {
             if data["archive"]["availability"].as_str() == Some("unavailable") {
                 line.push_str(" — NAS unavailable; will retry");
             } else if let Some(reason) =
-                data["worker"]["publication_reason"].as_str().or_else(|| {
-                    (data["capabilities"]["nas_publication"]["allowed"].as_bool() == Some(false))
-                        .then(|| data["capabilities"]["nas_publication"]["reason"].as_str())
-                        .flatten()
-                })
+                (data["capabilities"]["nas_publication"]["allowed"].as_bool() == Some(false))
+                    .then(|| data["capabilities"]["nas_publication"]["reason"].as_str())
+                    .flatten()
             {
                 line.push_str(" — ");
                 line.push_str(&friendly_reason(reason));
             }
         }
         lines.push(line);
+        if edits > 0 {
+            let mut line = format!("Saved edits: {edits} saved edit(s) pending on NAS");
+            if data["capabilities"]["nas_metadata_replacement"]["allowed"].as_bool() == Some(false)
+                && data["capabilities"]["nas_metadata_replacement"]["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("exchange"))
+            {
+                line.push_str(" — NAS cannot safely replace existing edit files");
+            } else if let Some(reason) = data["worker"]["publication_reason"].as_str() {
+                line.push_str(" — ");
+                line.extend(reason.chars().filter(|c| !c.is_control()).take(160));
+            }
+            lines.push(line);
+        }
     }
     let space = &data["space"];
     let available = (|| {

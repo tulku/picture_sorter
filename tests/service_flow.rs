@@ -2,6 +2,61 @@ mod support;
 use photo_sorter::{config::Config, domain::*};
 use std::time::{Duration, Instant};
 use support::service::ServiceFixture;
+
+#[test]
+fn known_older_nas_edits_catch_up_without_becoming_conflicts() {
+    let service = ServiceFixture::with_config(|config, _| config.debounce_seconds = 0);
+    std::fs::write(service.r.source.join("a.ORF"), b"raw").unwrap();
+    assert!(service.cli(&["archive", "init"]).status.success());
+    assert!(
+        service
+            .cli(&[
+                "import",
+                service.r.source.to_str().unwrap(),
+                "--wait-for",
+                "archived"
+            ])
+            .status
+            .success()
+    );
+    let status = service.status();
+    let path = status["groups"][0]["group"]["members"][0]["path"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+        + ".rrdata";
+    let first = br#"{"version":1,"rating":1}"#;
+    for bytes in [
+        first.as_slice(),
+        br#"{"version":1,"rating":2}"#,
+        br#"{"version":1,"rating":3}"#,
+    ] {
+        std::fs::write(service.r.local.join(&path), bytes).unwrap();
+        let deadline = Instant::now();
+        while !std::fs::read(service.r.archive.join(&path)).is_ok_and(|b| b == bytes) {
+            assert!(
+                deadline.elapsed() < Duration::from_secs(12),
+                "{}",
+                service.status()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    std::fs::write(service.r.archive.join(&path), first).unwrap();
+    let latest = br#"{"version":1,"rating":4}"#;
+    std::fs::write(service.r.local.join(&path), latest).unwrap();
+    let deadline = Instant::now();
+    while !std::fs::read(service.r.archive.join(&path)).is_ok_and(|b| b == latest) {
+        assert!(
+            deadline.elapsed() < Duration::from_secs(15),
+            "{}",
+            service.status()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(service.status()["conflicts"].as_array().unwrap().is_empty());
+    assert_eq!(std::fs::read(service.r.local.join(&path)).unwrap(), latest);
+}
 #[test]
 fn hung_nas_status_and_local_work_respond() {
     let service = ServiceFixture::new();
