@@ -256,12 +256,6 @@ impl ImmichClient {
             ));
         }
         let server = self.server_info()?;
-        if server.version != TESTED_VERSION {
-            return Err(AppError::new(
-                ErrorCode::Unsupported,
-                "server upgrade invalidated rating write profile",
-            ));
-        }
         let decision =
             self.rating_registry
                 .allows(crate::qualification::OperationKind::FavoriteWrite {
@@ -283,12 +277,6 @@ impl ImmichClient {
             ));
         }
         let server = self.server_info()?;
-        if server.version != TESTED_VERSION {
-            return Err(AppError::new(
-                ErrorCode::Unsupported,
-                "server upgrade invalidated rating write profile",
-            ));
-        }
         let decision =
             self.rating_registry
                 .allows(crate::qualification::OperationKind::RatingWrite {
@@ -303,12 +291,13 @@ impl ImmichClient {
     }
     pub(crate) fn probe_rating(
         &self,
+        expected_version: &str,
         request: super::RatingWrite,
     ) -> AppResult<super::WriteOutcome> {
-        if self.server_info()?.version != TESTED_VERSION {
+        if self.server_info()?.version != expected_version {
             return Err(AppError::new(
                 ErrorCode::Unsupported,
-                "unsupported probe server version",
+                "server version changed during qualification",
             ));
         }
         self.write_rating_checked(request)
@@ -369,12 +358,14 @@ impl ImmichClient {
 impl ImmichClient {
     pub(crate) fn probe_favorite(
         &self,
+        expected_version: &str,
         request: super::FavoriteWrite,
     ) -> AppResult<super::FavoriteOutcome> {
-        if self.server_info()?.version != TESTED_VERSION {
+        let version = self.server_info()?.version;
+        if version != expected_version {
             return Err(AppError::new(
                 ErrorCode::Unsupported,
-                "unsupported probe server version",
+                "server version changed during qualification",
             ));
         }
         self.write_favorite_checked(request)

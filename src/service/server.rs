@@ -599,6 +599,14 @@ impl Runtime {
                 status.capabilities["nas_metadata_replacement"] = serde_json::to_value(exchange)?;
                 status.worker["publication_reason"] =
                     serde_json::to_value(&self.shared_publisher.reason)?;
+                status.worker["immich_api_error"] = serde_json::to_value(
+                    self.integration
+                        .http
+                        .as_ref()
+                        .and_then(|http| http.api_error()),
+                )?;
+                status.worker["immich_last_sync_issue"] =
+                    serde_json::to_value(&self.integration.reason)?;
                 status.worker["publication_activity"] =
                     serde_json::to_value(self.shared_publisher.activity(&self.engine.catalog)?)?;
                 status.watcher = serde_json::to_value(&self.observation.status)?;

@@ -75,6 +75,21 @@ pub(super) fn render(data: &Value) -> String {
         bytes(space["exclusive_total"].as_u64())
     ));
     let mut attention = Vec::new();
+    if let Some(error) = data["worker"]["immich_api_error"].as_str() {
+        let error: String = error
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(180)
+            .collect();
+        lines.push(format!("Immich: API error: {error}"));
+    } else if let Some(reason) = data["worker"]["immich_last_sync_issue"].as_str() {
+        let reason: String = reason
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(180)
+            .collect();
+        lines.push(format!("Immich: last sync issue: {reason}"));
+    }
     if count("conflicts") > 0 {
         attention.push(format!(
             "{} conflicts; run photo_sorter conflicts list",
@@ -114,5 +129,18 @@ fn friendly_reason(reason: &str) -> String {
                 .take(120)
                 .collect::<String>()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn immich_errors_are_visible_without_calling_backups_paused() {
+        let text = super::render(
+            &serde_json::json!({"worker":{"immich_api_error":"Immich returned HTTP 503\u{001b}[31m"}}),
+        );
+        assert!(text.contains("Immich: API error: Immich returned HTTP 503"));
+        assert!(!text.contains('\u{001b}'));
+        assert!(!text.contains("uploads paused"));
     }
 }
