@@ -17,6 +17,278 @@ use std::{
     time::{Duration, Instant},
 };
 const MAX_LINE: usize = 16 * 1024 * 1024;
+
+#[cfg(test)]
+mod automatic_qualification_tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn fixture() -> (tempfile::TempDir, Config) {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["local", "state", "archive", "scratch"] {
+            std::fs::create_dir(temp.path().join(name)).unwrap();
+        }
+        let mut config = Config::new(
+            temp.path().join("local"),
+            temp.path().join("state"),
+            temp.path().join("archive"),
+        );
+        config.archive_id = Some(ArchiveId::new());
+        let mut encoded = serde_json::to_value(&config).unwrap();
+        encoded["nas_qualification_scratch"] = serde_json::json!(temp.path().join("scratch"));
+        let config: Config = serde_json::from_value(encoded).unwrap();
+        let root = RootHandle::open(&config.archive_root, RootPolicy::TestArchive).unwrap();
+        ArchiveStore::initialize(
+            &root,
+            InitArchive {
+                archive_id: config.archive_id.unwrap(),
+                writer_id: config.writer_id,
+            },
+        )
+        .unwrap();
+        (temp, config)
+    }
+
+    #[test]
+    fn automatic_checks_allow_writes_and_reuse_evidence_without_probing_reads() {
+        let (temp, config) = fixture();
+        let mut runtime = ArchiveRuntime {
+            settings: WorkerSettings::configured(&config).unwrap(),
+            ..Default::default()
+        };
+        runtime
+            .execute(NasCommand::ReadJournalStart {
+                root: config.archive_root.clone(),
+                archive: config.archive_id.unwrap(),
+                writer: config.writer_id,
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("scratch"))
+                .unwrap()
+                .count(),
+            0
+        );
+        for _ in 0..2 {
+            let NasReply::Session { session, .. } = runtime
+                .execute(NasCommand::BeginArchive {
+                    root: config.archive_root.clone(),
+                    archive: config.archive_id.unwrap(),
+                    writer: config.writer_id,
+                })
+                .unwrap()
+            else {
+                panic!("expected publication session")
+            };
+            runtime.execute(NasCommand::EndArchive { session }).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("scratch/.photo-sorter-qualification"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert!(
+            runtime
+                .open_store(
+                    &config.archive_root,
+                    config.archive_id.unwrap(),
+                    config.writer_id
+                )
+                .unwrap()
+                .write_decision()
+                .allowed
+        );
+    }
+
+    #[test]
+    fn automatic_checks_reject_overlapping_scratch() {
+        let (_, config) = fixture();
+        let mut encoded = serde_json::to_value(&config).unwrap();
+        encoded["nas_qualification_scratch"] =
+            serde_json::json!(config.working_root.join("scratch"));
+        let config: Config = serde_json::from_value(encoded).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn automatic_checks_renew_stale_evidence_without_growing_registry() {
+        let (_temp, config) = fixture();
+        let mut runtime = ArchiveRuntime {
+            settings: WorkerSettings::configured(&config).unwrap(),
+            ..Default::default()
+        };
+        runtime
+            .open_writable_store(
+                &config.archive_root,
+                config.archive_id.unwrap(),
+                config.writer_id,
+            )
+            .unwrap();
+        let mut report = crate::qualification::load_registry(&config)
+            .unwrap()
+            .reports()[0]
+            .clone();
+        report.config_fingerprint = crate::domain::Digest::of(b"previous boot");
+        crate::qualification::persist_automatic_report(&config, &report).unwrap();
+        runtime
+            .open_writable_store(
+                &config.archive_root,
+                config.archive_id.unwrap(),
+                config.writer_id,
+            )
+            .unwrap();
+        let registry = crate::qualification::load_registry(&config).unwrap();
+        assert_eq!(registry.reports().len(), 1);
+        assert_ne!(
+            registry.reports()[0].config_fingerprint,
+            report.config_fingerprint
+        );
+    }
+
+    #[test]
+    fn automatic_evidence_is_not_copied_by_other_qualification_and_recovers_manual_failure() {
+        let (_temp, config) = fixture();
+        let mut runtime = ArchiveRuntime {
+            settings: WorkerSettings::configured(&config).unwrap(),
+            ..Default::default()
+        };
+        runtime
+            .open_writable_store(
+                &config.archive_root,
+                config.archive_id.unwrap(),
+                config.writer_id,
+            )
+            .unwrap();
+        let mut report = crate::qualification::load_registry(&config)
+            .unwrap()
+            .reports()[0]
+            .clone();
+        let mut unrelated = report.clone();
+        unrelated.capability = "other-integration".into();
+        crate::qualification::persist_report(&config, &unrelated).unwrap();
+        let manual: Vec<crate::qualification::CapabilityReport> = serde_json::from_slice(
+            &std::fs::read(config.state_root.join("capability-registry.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manual.len(), 1);
+        report.results[0].outcome = crate::qualification::ProbeOutcome::Fail;
+        crate::qualification::persist_report(&config, &report).unwrap();
+        assert!(
+            !runtime
+                .open_store(
+                    &config.archive_root,
+                    config.archive_id.unwrap(),
+                    config.writer_id
+                )
+                .unwrap()
+                .write_decision()
+                .allowed
+        );
+        runtime
+            .open_writable_store(
+                &config.archive_root,
+                config.archive_id.unwrap(),
+                config.writer_id,
+            )
+            .unwrap();
+        assert!(
+            runtime
+                .open_store(
+                    &config.archive_root,
+                    config.archive_id.unwrap(),
+                    config.writer_id
+                )
+                .unwrap()
+                .write_decision()
+                .allowed
+        );
+    }
+
+    #[test]
+    fn automatic_checks_keep_missing_scratch_blocked_and_back_off() {
+        let (temp, config) = fixture();
+        std::fs::remove_dir(temp.path().join("scratch")).unwrap();
+        let mut runtime = ArchiveRuntime {
+            settings: WorkerSettings::configured(&config).unwrap(),
+            ..Default::default()
+        };
+        assert!(
+            runtime
+                .open_writable_store(
+                    &config.archive_root,
+                    config.archive_id.unwrap(),
+                    config.writer_id
+                )
+                .is_err()
+        );
+        std::fs::create_dir(temp.path().join("scratch")).unwrap();
+        assert!(
+            runtime
+                .open_writable_store(
+                    &config.archive_root,
+                    config.archive_id.unwrap(),
+                    config.writer_id
+                )
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("scratch"))
+                .unwrap()
+                .count(),
+            0
+        );
+        runtime.qualification_failure.as_mut().unwrap().1 =
+            Instant::now() - Duration::from_secs(61);
+        assert!(
+            runtime
+                .open_writable_store(
+                    &config.archive_root,
+                    config.archive_id.unwrap(),
+                    config.writer_id
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn automatic_checks_never_qualify_another_writer_or_multi_writer_mode() {
+        let (temp, config) = fixture();
+        let mut runtime = ArchiveRuntime {
+            settings: WorkerSettings::configured(&config).unwrap(),
+            ..Default::default()
+        };
+        assert!(
+            runtime
+                .open_writable_store(
+                    &config.archive_root,
+                    config.archive_id.unwrap(),
+                    WriterId::new()
+                )
+                .is_err()
+        );
+        let marker_path = config.archive_root.join(".photo-sorter/archive.json");
+        let mut marker: ArchiveMarker =
+            serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+        marker.mode = PublicationMode::MultiWriter;
+        std::fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        assert!(
+            runtime
+                .open_writable_store(
+                    &config.archive_root,
+                    config.archive_id.unwrap(),
+                    config.writer_id
+                )
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("scratch"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NasCommand {
     InspectJpegArchive {
@@ -307,6 +579,8 @@ struct WorkerSettings {
     local_test_backend: bool,
     state_root: Option<PathBuf>,
     capability_evidence: Vec<PathBuf>,
+    #[serde(default)]
+    qualification_config: Option<crate::config::Config>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct ProfileRoot {
@@ -333,6 +607,7 @@ impl WorkerSettings {
             local_test_backend: config.local_test_backend,
             state_root: Some(config.state_root.clone()),
             capability_evidence: config.capability_evidence.clone(),
+            qualification_config: Some(config.clone()),
         })
     }
     fn bound(
@@ -358,6 +633,7 @@ impl WorkerSettings {
             local_test_backend: config.local_test_backend,
             state_root: Some(config.state_root.clone()),
             capability_evidence: config.capability_evidence.clone(),
+            qualification_config: Some(config.clone()),
         })
     }
     fn local_root(&self, path: &std::path::Path) -> AppResult<RootHandle> {
@@ -851,6 +1127,7 @@ fn run_worker_mode(local_only: bool) -> AppResult<()> {
 
 #[derive(Default)]
 struct ArchiveRuntime {
+    qualification_failure: Option<(crate::domain::Digest, Instant, AppError)>,
     last_decision: Option<crate::qualification::CapabilityDecision>,
     last_exchange_decision: Option<crate::qualification::CapabilityDecision>,
     settings: WorkerSettings,
@@ -860,6 +1137,126 @@ struct ArchiveRuntime {
     guard: Option<PublicationGuard>,
 }
 impl ArchiveRuntime {
+    fn open_writable_store(
+        &mut self,
+        root: &std::path::Path,
+        archive: ArchiveId,
+        writer: WriterId,
+    ) -> AppResult<ArchiveStore> {
+        let result = self.renew_writable_store(root, archive, writer);
+        if let Err(error) = &result {
+            self.last_decision = Some(crate::qualification::CapabilityDecision {
+                allowed: false,
+                reason: error.to_string(),
+            });
+            self.last_exchange_decision = self.last_decision.clone();
+        }
+        result
+    }
+
+    fn renew_writable_store(
+        &mut self,
+        root: &std::path::Path,
+        archive: ArchiveId,
+        writer: WriterId,
+    ) -> AppResult<ArchiveStore> {
+        let mut store = self.open_store(root, archive, writer)?;
+        if let Err(error) = store.require_writable() {
+            if error.message != "no matching filesystem/version/mode qualification"
+                || store.marker.mode != PublicationMode::SingleWriter
+            {
+                return Err(error);
+            }
+            let config = self
+                .settings
+                .qualification_config
+                .clone()
+                .ok_or(error.clone())?;
+            let scratch = config.nas_qualification_scratch.clone().ok_or_else(|| AppError::new(ErrorCode::Unsupported,
+                "archive checks need setup: configure nas_qualification_scratch once on the NAS, outside the photo archive"))?;
+            let fingerprint = crate::qualification::nas_fingerprint(
+                &store.root,
+                archive,
+                writer,
+                &store.marker.mode,
+                store.marker.mode_revision,
+            )?;
+            if let Some((previous, when, error)) = &self.qualification_failure
+                && previous == &fingerprint
+                && when.elapsed() < Duration::from_secs(60)
+            {
+                return Err(error.clone());
+            }
+            let result = (|| {
+                let scratch_handle = self.settings.root(&scratch).map_err(|error| {
+                    AppError::new(
+                        error.code,
+                        format!(
+                            "archive checks cannot open scratch directory {}: {}",
+                            scratch.display(),
+                            error.message
+                        ),
+                    )
+                })?;
+                for expected in &self.settings.profile_roots {
+                    crate::fs::ensure_disjoint_roots(
+                        &scratch_handle,
+                        &self.settings.local_root(&expected.path)?,
+                    )?;
+                }
+                let request = crate::qualification::NasProbeRequest {
+                    archive_root: root.to_owned(),
+                    archive,
+                    writer,
+                    mode: store.marker.mode.clone(),
+                    mode_revision: store.marker.mode_revision,
+                    scratch_root: scratch,
+                    session: OperationId::new(),
+                    phase: crate::qualification::NasProbePhase::Prepare,
+                    local_test_backend: false,
+                    prior_peer_stopped: false,
+                    all_writers_quiescent: false,
+                    disconnect_observed: false,
+                    interrupt_bytes: 1024 * 1024,
+                };
+                crate::qualification::validate_request(
+                    &config,
+                    &crate::qualification::QualificationRequest::Nas(request.clone()),
+                )?;
+                let report = crate::qualification::qualify_nas(request)?;
+                self.settings.validate_roots()?;
+                crate::qualification::persist_automatic_report(&config, &report)?;
+                store.set_registry(self.settings.registry());
+                store.require_writable().map_err(|_| {
+                    let failures = report
+                        .results
+                        .iter()
+                        .filter(|result| {
+                            matches!(result.outcome, crate::qualification::ProbeOutcome::Fail)
+                        })
+                        .map(|result| format!("{}: {}", result.name, result.detail))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    AppError::new(
+                        ErrorCode::Unsupported,
+                        format!("archive checks failed; uploads paused: {failures}"),
+                    )
+                })
+            })();
+            if let Err(error) = result {
+                self.qualification_failure = Some((fingerprint, Instant::now(), error.clone()));
+                self.last_decision = Some(crate::qualification::CapabilityDecision {
+                    allowed: false,
+                    reason: error.to_string(),
+                });
+                return Err(error);
+            }
+            self.qualification_failure = None;
+        }
+        self.last_decision = Some(store.write_decision());
+        self.last_exchange_decision = Some(store.exchange_decision());
+        Ok(store)
+    }
     fn open_store(
         &mut self,
         root: &std::path::Path,
@@ -926,7 +1323,7 @@ impl ArchiveRuntime {
                 context,
                 ceiling,
             } => {
-                let store = self.open_store(&root, archive, writer)?;
+                let store = self.open_writable_store(&root, archive, writer)?;
                 store.require_writable()?;
                 let local = self.settings.local_root(&local)?;
                 let receipt = crate::edit::capture_history(&local, &store.root, &context, ceiling)?;
@@ -1068,7 +1465,7 @@ impl ArchiveRuntime {
                 writer,
                 spec,
             } => {
-                let store = self.open_store(&spec.destination_root, archive, writer)?;
+                let store = self.open_writable_store(&spec.destination_root, archive, writer)?;
                 store.require_writable()?;
                 let source = self.settings.local_root(&spec.source.root)?;
                 let result = TransferEngine::stage_confined(&spec, &source, &store.root)?;
@@ -1108,7 +1505,7 @@ impl ArchiveRuntime {
                         "worker already holds a publication session",
                     ));
                 }
-                let store = self.open_store(&root, archive, writer)?;
+                let store = self.open_writable_store(&root, archive, writer)?;
                 let guard = store.acquire_publication()?;
                 let session = guard.owner.session;
                 let marker = store.marker().clone();

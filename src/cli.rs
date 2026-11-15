@@ -7,6 +7,7 @@ use crate::{
     service::{self, protocol::*},
 };
 mod progress;
+mod status;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

@@ -2,6 +2,8 @@
 
 Normal startup and `doctor` never probe or mutate NAS objects or application state. Production publication and outgoing ratings are disabled until matching evidence exists. Normal reads, local saved-edit capture and private pins continue independently. The local test backend is explicit and rejects network filesystems; it never supplies production evidence.
 
+With `nas_qualification_scratch` configured, single-writer publication automatically obtains fresh filesystem evidence before writes when the current evidence is missing or stale. This includes evidence invalidated by a reboot. The scratch folder must already exist outside every managed root and share the archive mount. Read-only commands remain passive. Ownership, mode-administration and multi-client restrictions are never bypassed. Failures keep writes disabled and are retried with at least a minute between attempts per worker. Automatic evidence occupies one active report slot rather than adding an active report on each boot; manual evidence and displaced report files remain retained.
+
 | Capability | Automated evidence | Deployment requirement |
 |---|---|---|
 | Single-writer immutable publication | Actual exclusive creation, no-replace, lock exclusion and flush/reopen on generated temporary files | Run the probe on a separate explicit scratch directory on the target mount |

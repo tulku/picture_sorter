@@ -24,6 +24,7 @@ pub struct SpaceSnapshot {
 }
 #[derive(Debug, Serialize)]
 pub struct StatusSnapshot {
+    pub backup: serde_json::Value,
     pub activity: serde_json::Value,
     pub session_metrics: crate::metrics::Metrics,
     pub pagination: serde_json::Value,
@@ -82,7 +83,30 @@ impl StatusSnapshot {
         let subset = |condition: &str| -> AppResult<u64> {
             Ok(catalog.db.query_row(&format!("SELECT coalesce(sum(b.size),0) FROM placements p JOIN blobs b ON b.digest=p.digest JOIN residency r ON r.group_id=p.group_id WHERE p.local_ready=1 AND {condition}"),[],|r|r.get(0))?)
         };
-        let measured = occupancy.measurement.as_ref();
+        let mut occupancy_reason = occupancy.reason.clone();
+        let accounted = if occupancy.measurement.is_some() && catalog.async_admission {
+            let result = (|| {
+                let local = crate::fs::RootHandle::open(
+                    &engine.config.working_root,
+                    crate::fs::RootPolicy::Local,
+                )?;
+                let state = crate::fs::RootHandle::open(
+                    &engine.config.state_root,
+                    crate::fs::RootPolicy::Local,
+                )?;
+                catalog.admission_measurement(&local, &state)
+            })();
+            match result {
+                Ok(measurement) => Some(measurement),
+                Err(error) => {
+                    occupancy_reason = Some(error.to_string());
+                    None
+                }
+            }
+        } else {
+            occupancy.measurement.clone()
+        };
+        let measured = accounted.as_ref();
         let exclusive_total = measured
             .map(|m| {
                 m.local
@@ -103,10 +127,10 @@ impl StatusSnapshot {
             .collect::<AppResult<Vec<_>>>()?;
         let space=SpaceSnapshot {
             budget:engine.config.budget,reserve:engine.config.reserve,
-            filesystem_free:measured.map(|m|m.filesystem_free),state_filesystem_free:measured.map(|m|m.state_filesystem_free),occupancy_observed_at:occupancy.observed_at,occupancy_reason:occupancy.reason.clone(),
+            filesystem_free:measured.map(|m|m.filesystem_free),state_filesystem_free:measured.map(|m|m.state_filesystem_free),occupancy_observed_at:occupancy.observed_at,occupancy_reason,
             exclusive_total,resident,metadata:measured.map(|m|m.state.total),staging:measured.map(|m|m.local.staging.saturating_add(m.state.staging)),snapshots:measured.map(|m|m.state.snapshots),source_companions:measured.map(|m|m.local.companions),retained_displaced:measured.map(|m|m.local.retained),catalog_overhead:measured.map(|m|m.state.catalog),
             pinned:subset("r.pin=1")?,protected:subset("r.protected=1 OR r.conflict=1")?,evictable:subset("r.pin=0 AND r.protected=0 AND r.conflict=0")?,remaining_reservations:catalog.total_remaining_reservations()?,
-            subset_note:"Filesystem observations are cached at occupancy_observed_at; null means unmeasured. Metadata includes state snapshots, staging and catalog overhead. Pinned/protected/evictable overlap resident bytes. Do not add overlapping subsets or cached/current observations; admission and deletion recheck fresh evidence.".into(),
+            subset_note:"Occupancy is based on occupancy_observed_at plus consumed allocations and current catalog bytes; filesystem free space is refreshed for asynchronous admission. Null means unmeasured. Metadata includes state snapshots, staging and catalog overhead. Pinned/protected/evictable overlap resident bytes. Do not add overlapping subsets; admission and deletion recheck fresh evidence.".into(),
         };
 
         let active_count: u64 = catalog.db.query_row("SELECT count(*) FROM jobs WHERE json_extract(state,'$') NOT IN ('Complete','Cancelled','Failed')", [], |r| r.get(0))?;
@@ -147,7 +171,39 @@ impl StatusSnapshot {
         )?;
         let activity = serde_json::json!({"active_count":active_count,"active":active,"recent":recent,"pending_upload":pending_upload,"generated":{"total":generated_total,"pending":generated_pending}});
 
+        let (local_files, backed_up, awaiting_local): (u64, u64, u64) = catalog.db.query_row(
+            "WITH evidence AS (
+                SELECT digest,path AS destination,local_ready,archived,0 AS active FROM placements
+                UNION ALL
+                SELECT i.digest,i.destination,
+                    CASE WHEN EXISTS(SELECT 1 FROM placements p WHERE p.digest=i.digest AND p.path=i.destination)
+                        THEN 0 ELSE i.local_ready END,
+                    i.archived,
+                    json_extract(j.state,'$') NOT IN ('Complete','Cancelled','Failed','CancelRequested')
+                FROM import_items i JOIN jobs j ON j.id=i.parent WHERE i.state<>'image_duplicate'
+            ), files AS (
+                SELECT digest,destination,max(local_ready) AS local_ready,max(archived) AS archived,max(active) AS active
+                FROM evidence GROUP BY digest,destination
+            ) SELECT coalesce(sum(local_ready=1),0),coalesce(sum(local_ready=1 AND archived=1),0),
+                coalesce(sum(local_ready=0 AND archived=0 AND active=1),0) FROM files",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        )?;
+        let scanning: u64 = catalog.db.query_row("SELECT count(*) FROM import_scans s JOIN jobs j ON j.id=s.job WHERE s.complete=0 AND json_extract(j.state,'$') NOT IN ('Complete','Cancelled','Failed','CancelRequested')",[],|r|r.get(0))?;
+        let unresolved: u64 =
+            catalog
+                .db
+                .query_row("SELECT count(*) FROM conflicts WHERE resolved=0", [], |r| {
+                    r.get(0)
+                })?;
+        let physical_issues: u64 =
+            catalog
+                .db
+                .query_row("SELECT count(*) FROM physical_findings", [], |r| r.get(0))?;
+        let pending_edits: u64 = catalog.db.query_row("SELECT count(*) FROM sidecars s WHERE EXISTS(SELECT 1 FROM heads h WHERE h.sidecar=s.id AND NOT EXISTS(SELECT 1 FROM archived_versions a WHERE a.version=h.version)) OR EXISTS(SELECT 1 FROM local_heads l WHERE l.sidecar=s.id AND NOT EXISTS(SELECT 1 FROM archived_versions a WHERE a.version=l.version)) OR EXISTS(SELECT 1 FROM nas_projections p WHERE p.sidecar=s.id AND p.applied=0) OR EXISTS(SELECT 1 FROM generated_observations o WHERE o.path=s.path AND o.present=1 AND (o.captured_stamp IS NULL OR o.captured_stamp<>o.stamp))",[],|r|r.get(0))?;
+        let backup = serde_json::json!({"local_files":local_files,"backed_up":backed_up,"awaiting_local":awaiting_local,"scanning":scanning,"conflicts":unresolved,"pending_edits":pending_edits,"physical_issues":physical_issues});
+
         Ok(Self {
+            backup,
             activity,
             session_metrics: crate::metrics::snapshot(),
             pagination,
@@ -172,6 +228,112 @@ impl StatusSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_cache_keeps_consumed_reservations_charged_between_measurements() {
+        let temp = tempfile::tempdir().unwrap();
+        for dir in ["local", "state", "archive"] {
+            std::fs::create_dir(temp.path().join(dir)).unwrap();
+        }
+        let config = crate::config::Config::new(
+            temp.path().join("local"),
+            temp.path().join("state"),
+            temp.path().join("archive"),
+        );
+        let root =
+            crate::fs::RootHandle::open(&config.state_root, crate::fs::RootPolicy::Local).unwrap();
+        let local = crate::fs::RootHandle::open(&config.working_root, crate::fs::RootPolicy::Local)
+            .unwrap();
+        let mut catalog = Catalog::open(&root).unwrap();
+        catalog.enable_async_admission();
+        let checkpoint = catalog.admission_checkpoint().unwrap();
+        let baseline = crate::fs::measure_managed_space(&local, &root).unwrap();
+        catalog
+            .accept_admission_measurement(checkpoint, baseline.clone())
+            .unwrap();
+        let mut meter = super::super::space::SpaceMeter::default();
+        meter.measurement = Some(baseline.clone());
+        let job = catalog
+            .enqueue(DurableRequest {
+                operation_id: OperationId::new(),
+                kind: JobKind::ArchiveInit,
+            })
+            .unwrap();
+        let reserved = catalog
+            .reserve(
+                job,
+                crate::storage::FilesystemId(local.device()),
+                50 * 1073741824,
+            )
+            .unwrap();
+        catalog.update_reservation(reserved, 0).unwrap();
+        let engine = ImportCoordinator::new(config, catalog);
+        let snapshot = StatusSnapshot::collect_page(
+            &engine,
+            &meter,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            &super::super::protocol::StatusQuery::default(),
+        )
+        .unwrap();
+        assert!(
+            snapshot.space.exclusive_total.unwrap()
+                >= baseline.local.total + baseline.state.total + 50 * 1073741824
+        );
+        assert_eq!(snapshot.space.remaining_reservations, 0);
+    }
+
+    #[test]
+    fn backup_counts_deduplicate_jobs_and_include_cancelled_local_files() {
+        let temp = tempfile::tempdir().unwrap();
+        for dir in ["local", "state", "archive"] {
+            std::fs::create_dir(temp.path().join(dir)).unwrap();
+        }
+        let config = crate::config::Config::new(
+            temp.path().join("local"),
+            temp.path().join("state"),
+            temp.path().join("archive"),
+        );
+        let root =
+            crate::fs::RootHandle::open(&config.state_root, crate::fs::RootPolicy::Local).unwrap();
+        let mut catalog = Catalog::open(&root).unwrap();
+        for index in 0..3 {
+            let job = catalog
+                .enqueue(DurableRequest {
+                    operation_id: OperationId::new(),
+                    kind: JobKind::ArchiveInit,
+                })
+                .unwrap();
+            if index == 2 {
+                catalog
+                    .db
+                    .execute(
+                        "UPDATE jobs SET state='\"Cancelled\"' WHERE id=?",
+                        [job.to_string()],
+                    )
+                    .unwrap();
+            }
+            for (digest, destination, archived) in [("a", "a.ORF", 0), ("b", "b.ORF", 1)] {
+                catalog.db.execute("INSERT INTO import_items(id,parent,source_root,source_path,digest,size,role,destination,state,local_ready,archived) VALUES(?,?,?,?,?,1,'raw',?,'planned',1,?)",rusqlite::params![JobId::new().to_string(),job.to_string(),"/card",destination,digest,destination,archived]).unwrap();
+            }
+            if index == 2 {
+                catalog.db.execute("INSERT INTO import_items(id,parent,source_root,source_path,digest,size,role,destination,state,local_ready) VALUES(?,?, '/card','c.ORF','c',1,'raw','c.ORF','planned',1)",rusqlite::params![JobId::new().to_string(),job.to_string()]).unwrap();
+            }
+        }
+        let engine = ImportCoordinator::new(config, catalog);
+        let snapshot = StatusSnapshot::collect_page(
+            &engine,
+            &super::super::space::SpaceMeter::default(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+            &super::super::protocol::StatusQuery::default(),
+        )
+        .unwrap();
+        let data = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(data["backup"]["local_files"], 3);
+        assert_eq!(data["backup"]["backed_up"], 1);
+        assert_eq!(data["backup"]["awaiting_local"], 0);
+    }
 
     #[test]
     fn generated_status_counts_local_saved_heads_before_publication() {

@@ -306,7 +306,7 @@ pub(super) fn describe(job: &JobRecord, detail: &Value) -> String {
             if job.archive_committed {
                 line.push_str(". Card can be removed; archive complete.");
             } else {
-                line.push_str(". Card can be removed; background upload continues until archived.");
+                line.push_str(". Card can be removed; NAS backup is not complete.");
             }
         }
     }
@@ -317,107 +317,7 @@ pub(super) fn describe(job: &JobRecord, detail: &Value) -> String {
 }
 
 pub(super) fn status(data: &Value) -> String {
-    let activity = &data["activity"];
-    let active = activity["active_count"].as_u64().unwrap_or(0);
-    let mut lines = vec![format!("Current work: {active} active jobs")];
-    if let Some(jobs) = activity["active"].as_array() {
-        for entry in jobs.iter().take(8) {
-            if let Ok(job) = serde_json::from_value::<JobRecord>(entry["job"].clone()) {
-                let label = match &job.request.kind {
-                    JobKind::Import { source, .. } => {
-                        format!("Import {}", compact(&source.display().to_string()))
-                    }
-                    JobKind::LocalTransfer { .. } => "Local copy".into(),
-                    JobKind::SnapshotCapture { context, .. }
-                        if context["owner"]["kind"].as_str() == Some("Generated") =>
-                    {
-                        format!(
-                            "Saving {}",
-                            compact(
-                                context["owner"]["path"]
-                                    .as_str()
-                                    .unwrap_or("generated file")
-                            )
-                        )
-                    }
-                    _ => "Background work".into(),
-                };
-                lines.push(format!("  {label}: {}", describe(&job, &entry["detail"])));
-            }
-        }
-        if active > jobs.len() as u64 {
-            lines.push(format!("  … and {} more", active - jobs.len() as u64));
-        }
-    }
-    lines.push(format!(
-        "Upload: {} queued; archive {}",
-        activity["pending_upload"].as_u64().unwrap_or(0),
-        data["archive"]["availability"]
-            .as_str()
-            .unwrap_or("unknown")
-    ));
-    if activity["generated"]["total"].as_u64().unwrap_or(0) > 0 {
-        lines.push(format!(
-            "Generated files: {} tracked; {} pending",
-            activity["generated"]["total"].as_u64().unwrap_or(0),
-            activity["generated"]["pending"].as_u64().unwrap_or(0),
-        ));
-    }
-    if let Some(activity) = data["worker"]["publication_activity"].as_str() {
-        lines.push(compact(activity));
-    }
-    if let Some(reason) = data["worker"]["publication_reason"].as_str() {
-        lines.push(format!("Waiting: {}", compact(reason)));
-    }
-    let space = &data["space"];
-    let bytes = |value: &Value| {
-        value
-            .as_u64()
-            .map(|v| format!("{:.1} GiB", v as f64 / 1073741824.0))
-            .unwrap_or_else(|| "unmeasured".into())
-    };
-    lines.push(format!(
-        "Cache: {} used / {} budget; {} filesystem free; {} reserved",
-        bytes(&space["exclusive_total"]),
-        bytes(&space["budget"]),
-        bytes(&space["filesystem_free"]),
-        bytes(&space["remaining_reservations"])
-    ));
-    if let Some(observed) = space["occupancy_observed_at"].as_u64() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(observed);
-        lines.push(format!(
-            "  Cache measurement: {}s ago",
-            now.saturating_sub(observed)
-        ));
-    }
-    if let Some(reason) = space["occupancy_reason"].as_str() {
-        lines.push(format!("Warning: cache measurement: {}", compact(reason)));
-    }
-    if let Some(reason) = data["archive"]["reason"].as_str() {
-        lines.push(format!("Warning: archive: {}", compact(reason)));
-    }
-    if let Some(conflicts) = data["conflicts"].as_array().filter(|v| !v.is_empty()) {
-        lines.push(format!(
-            "Warning: {} conflicts on this page; use conflicts list",
-            conflicts.len()
-        ));
-    }
-    if let Some(recent) = activity["recent"].as_array().filter(|v| !v.is_empty()) {
-        lines.push(format!(
-            "Recent completed jobs: {}",
-            recent
-                .iter()
-                .take(3)
-                .filter_map(|j| j["request"]["kind"]["type"].as_str())
-                .map(|kind| kind.replace('_', " "))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    lines.join("\n")
+    super::status::render(data)
 }
 fn compact(text: &str) -> String {
     text.chars()
@@ -430,6 +330,44 @@ fn compact(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::catalog::DurableRequest;
+
+    #[test]
+    fn backup_status_is_concise_and_counts_reserved_cache_space() {
+        let gib = 1073741824_u64;
+        let data = serde_json::json!({
+            "backup": {"local_files":517,"backed_up":0,"awaiting_local":0,"scanning":0,"conflicts":3,"pending_edits":0,"physical_issues":0},
+            "activity":{"active_count":2,"pending_upload":517},
+            "capabilities":{"nas_publication":{"allowed":false,"reason":"Unsupported: no matching filesystem/version/mode qualification"}},
+            "space":{"exclusive_total":38*gib,"budget":70*gib,"remaining_reservations":2*gib,"filesystem_free":268*gib,"state_filesystem_free":268*gib,"reserve":5*gib}
+        });
+        let output = status(&data);
+        assert!(output.contains("Local files: 517 saved"), "{output}");
+        assert!(
+            output.contains("NAS backup: 0/517 local files backed up"),
+            "{output}"
+        );
+        assert!(
+            output.contains("Cache: 30.0 GiB available / 70.0 GiB"),
+            "{output}"
+        );
+        assert!(output.contains("3 conflicts"), "{output}");
+        assert!(!output.contains("active jobs"), "{output}");
+        assert!(!output.contains("filesystem/version"), "{output}");
+        assert!(output.lines().count() <= 5, "{output}");
+    }
+
+    #[test]
+    fn backup_status_never_calls_an_unknown_or_incomplete_backup_complete() {
+        let output = status(&serde_json::json!({}));
+        assert!(output.contains("unknown"), "{output}");
+        assert!(!output.contains("complete"), "{output}");
+        let output = status(
+            &serde_json::json!({"backup":{"local_files":1,"backed_up":1,"awaiting_local":2,"scanning":1,"conflicts":0,"pending_edits":1,"physical_issues":0}}),
+        );
+        assert!(output.contains("2 awaiting local copy"), "{output}");
+        assert!(output.contains("1 saved edit"), "{output}");
+        assert!(!output.contains("complete"), "{output}");
+    }
 
     #[test]
     fn current_import_counts_exclude_recognized_archive_items() {
