@@ -23,20 +23,20 @@ Scratch stays outside managed roots on the same mount. Automatic checks cover si
 
 Files: src/config.rs, src/qualification/nas.rs, src/qualification/report.rs, src/transfer/worker.rs, docs/compatibility.md, docs/usage.md.
 
-- [ ] Add regression tests for writable renewal/reuse, failure, multi-writer and scratch overlap; run focused tests and observe failure.
-- [ ] Add optional nas_qualification_scratch configuration, validate roots, renew at write boundaries with retry backoff, and persist bounded automatic evidence.
-- [ ] Run focused tests and commit after passing.
+- [x] Add regression tests for writable renewal/reuse, failure, multi-writer and scratch overlap; run focused tests and observe failure.
+- [x] Add optional nas_qualification_scratch configuration, validate roots, renew at write boundaries with retry backoff, and persist bounded automatic evidence.
+- [x] Run focused tests and commit after passing.
 
 ### Task 2: Backup status
 
 Files: src/service/status.rs, src/cli/progress.rs and their tests.
 
-- [ ] Add regression tests for deduplicated global counts, concise output, unknown/free cache and blocked-import wording; observe failures.
-- [ ] Aggregate local originals and backup gaps independently of job pagination. Render backup, cache and attention lines; retain JSON detail.
-- [ ] Run focused tests and commit after passing.
+- [x] Add regression tests for deduplicated global counts, concise output, unknown/free cache and blocked-import wording; observe failures.
+- [x] Aggregate local originals and backup gaps independently of job pagination. Render backup, cache and attention lines; retain JSON detail.
+- [x] Run focused tests and commit after passing.
 
 ### Task 3: Validate and deliver
 
-- [ ] Run formatting, clippy, all-target tests and release build via nix develop; expect success.
-- [ ] Independent whole-branch review; address material findings with regression tests.
-- [ ] Record validation/deployment status; push planning changes only to origin/meta/superpowers-plans.
+- [x] Run formatting, clippy, all-target tests and release build via nix develop; expect success.
+- [x] Independent whole-branch review; address material findings with regression tests.
+- [x] Record validation/deployment status; push planning changes only to origin/meta/superpowers-plans.
