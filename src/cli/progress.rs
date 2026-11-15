@@ -332,6 +332,24 @@ mod tests {
     use crate::catalog::DurableRequest;
 
     #[test]
+    fn blocked_saved_edits_do_not_label_original_uploads_paused() {
+        let output = status(&serde_json::json!({
+            "backup":{"local_files":517,"backed_up":7,"pending_edits":2},
+            "activity":{"pending_upload":510},
+            "capabilities":{"nas_publication":{"allowed":true},"nas_metadata_replacement":{"allowed":false,"reason":"atomic exchange evidence required"}},
+            "worker":{"publication_reason":"NAS sidecar differs from committed predecessor; all bytes retained"}
+        }));
+        let originals = output
+            .lines()
+            .find(|line| line.starts_with("NAS backup:"))
+            .unwrap();
+        assert!(!originals.contains("paused"), "{output}");
+        assert!(!originals.contains("sidecar"), "{output}");
+        assert!(output.contains("Saved edits:"), "{output}");
+        assert!(output.contains("cannot safely replace"), "{output}");
+    }
+
+    #[test]
     fn backup_status_is_concise_and_counts_reserved_cache_space() {
         let gib = 1073741824_u64;
         let data = serde_json::json!({

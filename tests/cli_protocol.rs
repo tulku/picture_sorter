@@ -474,6 +474,25 @@ fn default_status_is_a_bounded_human_summary() {
 }
 
 #[test]
+fn default_conflicts_list_is_readable_and_json_is_preserved() {
+    let service = support::service::ServiceFixture::new();
+    let result = cli(&service.profile, &["conflicts", "list"]);
+    assert!(result.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout).trim(),
+        "No conflicts need review."
+    );
+    let result = cli(&service.profile, &["conflicts", "list", "--json"]);
+    let data: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert!(
+        data["outcome"]["data"]["conflicts"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn human_progress_uses_simultaneous_rows_in_a_terminal() {
     use std::io::Read;
     use std::os::fd::FromRawFd;
