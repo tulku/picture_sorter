@@ -27,6 +27,7 @@ pub struct Config {
     pub rapidraw_version: String,
     pub rapidraw_binary: Option<PathBuf>,
     pub capability_evidence: Vec<PathBuf>,
+    pub nas_qualification_scratch: Option<PathBuf>,
     pub local_test_backend: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +61,7 @@ impl Default for Config {
             rapidraw_version: "1.6.6".into(),
             rapidraw_binary: None,
             capability_evidence: vec![],
+            nas_qualification_scratch: None,
             local_test_backend: false,
         }
     }
@@ -114,6 +116,17 @@ impl Config {
                         "working, state and archive roots must not overlap",
                     ));
                 }
+            }
+        }
+        if let Some(scratch) = &self.nas_qualification_scratch {
+            let scratch = normalized(scratch)?;
+            if roots
+                .iter()
+                .any(|root| scratch.starts_with(root) || root.starts_with(&scratch))
+            {
+                return Err(AppError::invalid(
+                    "NAS check scratch directory must be outside all managed roots",
+                ));
             }
         }
         if self.metadata_batch == 0

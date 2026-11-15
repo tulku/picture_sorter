@@ -465,10 +465,11 @@ fn default_status_is_a_bounded_human_summary() {
     let result = cli(&service.profile, &["status"]);
     assert!(result.status.success(), "{result:?}");
     let text = String::from_utf8_lossy(&result.stdout);
-    assert!(text.contains("Current work:"), "{text}");
+    assert!(text.contains("Local files:"), "{text}");
     assert!(text.contains("Cache:"), "{text}");
-    assert!(text.contains("Upload:"), "{text}");
-    assert!(text.lines().count() < 24, "{text}");
+    assert!(text.contains("NAS backup:"), "{text}");
+    assert!(text.lines().count() <= 4, "{text}");
+    assert!(!text.contains("Current work:"), "{text}");
     assert!(!text.contains("schema_version"), "{text}");
 }
 

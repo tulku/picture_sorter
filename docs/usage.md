@@ -1,5 +1,15 @@
 # Operating the local archive
 
+`photo_sorter status` summarizes saved local files, how many have a committed NAS backup, available cache capacity, and problems needing attention. Repeated imports count once. Cache availability is an estimate limited by the cache budget and both filesystems' free space after reservations and the filesystem reserve. `status --json` retains job details, measurements, archive capability reasons, and pending saved edits. Local copies alone are not a NAS backup.
+
+For automatic single-writer archive checks, configure an existing scratch folder once in the profile:
+
+```toml
+nas_qualification_scratch = "/mnt/common/Camera/.photo-sorter-syl-qualification"
+```
+
+Use your own archive mount's scratch path. It must be outside the archive, working and state directories, and on the same mounted filesystem as the archive. Restart the service after changing the profile. When an archive write needs fresh qualification (including after reboot), the worker runs isolated checks there automatically and resumes publication only if they pass. Reads and `doctor` do not run checks. Failed attempts retry no more often than once per minute per worker; `status --json` includes the reason. Automatic evidence has one active slot, with displaced reports and scratch sessions retained for diagnosis. Multi-writer deployments still require explicit two-client qualification. Existing archives need no reinitialization.
+
 Use absolute paths on local filesystems for working and state roots. They must be disjoint from each other and the archive. State includes SQLite/WAL, immutable edit snapshots, reservations, job intents and private pins. Never synchronize the live database to the NAS.
 
 Create a local profile explicitly; its parent must already exist:
