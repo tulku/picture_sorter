@@ -25,6 +25,8 @@ pub struct EditorProbeRequest {
     pub zero: ArchivePath,
     pub reopened: ArchivePath,
     pub regenerated_after_reset: ArchivePath,
+    #[serde(default)]
+    pub reset_removed_sidecar: bool,
     pub runtime_binary: Option<PathBuf>,
     pub runtime_saves_attested: bool,
 }
@@ -115,17 +117,48 @@ pub fn qualify_rapidraw(request: EditorProbeRequest) -> AppResult<CapabilityRepo
                 });
             }
         }
-        let reset =
-            adapter.inspect(&root.read(&request.regenerated_after_reset, 64 * 1024 * 1024)?)?;
-        let default = adapter.inspect(&adapter.initial_document(Rating::try_from(0)?)?)?;
+        let (reset_pass, reset_detail) = if request.reset_removed_sidecar {
+            if !request.runtime_saves_attested || request.runtime_binary.is_none() {
+                return Err(AppError::invalid(
+                    "native reset removal requires runtime attestation",
+                ));
+            }
+            let original = ArchivePath::parse(
+                request
+                    .regenerated_after_reset
+                    .as_str()
+                    .strip_suffix(".rrdata")
+                    .ok_or_else(|| AppError::invalid("reset sidecar must end in .rrdata"))?,
+            )?;
+            let absent = match root.metadata_relative(&request.regenerated_after_reset) {
+                Ok(_) => false,
+                Err(error) if error.errno == Some(libc::ENOENT) => true,
+                Err(error) => return Err(error),
+            };
+            let metadata = root.metadata_relative(&original)?;
+            (
+                absent
+                    && u32::from(metadata.stx_mode) & libc::S_IFMT == libc::S_IFREG
+                    && metadata.stx_size > 0,
+                "Operator confirmed native reset removed the sidecar; matching nonempty regular original retained",
+            )
+        } else {
+            let reset =
+                adapter.inspect(&root.read(&request.regenerated_after_reset, 64 * 1024 * 1024)?)?;
+            let default = adapter.inspect(&adapter.initial_document(Rating::try_from(0)?)?)?;
+            (
+                reset.value() == default.value(),
+                "Regenerated document compared with the source-backed native default",
+            )
+        };
         results.push(ProbeResult {
             name: "reset_regeneration".into(),
-            outcome: if reset.value() == default.value() {
+            outcome: if reset_pass {
                 ProbeOutcome::Pass
             } else {
                 ProbeOutcome::Fail
             },
-            detail: "Regenerated document compared with the source-backed native default".into(),
+            detail: reset_detail.into(),
         });
         Ok(results)
     };

@@ -273,6 +273,7 @@ fn editor_probe_compares_native_saves_and_detects_lost_unknown_fields() {
         zero: ArchivePath::parse("zero.json").unwrap(),
         reopened: ArchivePath::parse("reopen.json").unwrap(),
         regenerated_after_reset: ArchivePath::parse("reset.json").unwrap(),
+        reset_removed_sidecar: false,
         runtime_binary: None,
         runtime_saves_attested: false,
     };
@@ -714,6 +715,7 @@ fn pick_transform_requires_native_flag_evidence_independent_of_stars() {
         zero: path("base"),
         reopened: path("base"),
         regenerated_after_reset: path("reset"),
+        reset_removed_sidecar: false,
         runtime_binary: Some(binary),
         runtime_saves_attested: true,
         pick: None,
@@ -734,6 +736,34 @@ fn pick_transform_requires_native_flag_evidence_independent_of_stars() {
         rejected: path("reject"),
     });
     assert!(decision(qualify_rapidraw(req.clone()).unwrap()));
+    let mut removed = serde_json::to_value(&req).unwrap();
+    removed["reset_removed_sidecar"] = true.into();
+    removed["regenerated_after_reset"] = "photo.ORF.rrdata".into();
+    std::fs::write(scratch.join("photo.ORF"), b"retained original").unwrap();
+    let check = |value| {
+        let request = serde_json::from_value(value).expect("native sidecar removal request");
+        decision(qualify_rapidraw(request).unwrap())
+    };
+    assert!(check(removed.clone()));
+    let mut unattested = removed.clone();
+    unattested["runtime_saves_attested"] = false.into();
+    assert!(!check(unattested));
+    let mut implicit = removed.clone();
+    implicit
+        .as_object_mut()
+        .unwrap()
+        .remove("reset_removed_sidecar");
+    assert!(!check(implicit));
+    std::fs::write(scratch.join("photo.ORF.rrdata"), b"still present").unwrap();
+    assert!(!check(removed.clone()));
+    std::fs::remove_file(scratch.join("photo.ORF.rrdata")).unwrap();
+    std::os::unix::fs::symlink("missing", scratch.join("photo.ORF.rrdata")).unwrap();
+    assert!(!check(removed.clone()));
+    std::fs::remove_file(scratch.join("photo.ORF.rrdata")).unwrap();
+    std::fs::remove_file(scratch.join("photo.ORF")).unwrap();
+    assert!(!check(removed.clone()));
+    std::os::unix::fs::symlink("editor", scratch.join("photo.ORF")).unwrap();
+    assert!(!check(removed));
     let mut corrupted = base;
     corrupted["rating"] = 5.into();
     std::fs::write(
