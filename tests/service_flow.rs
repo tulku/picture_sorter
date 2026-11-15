@@ -104,6 +104,20 @@ fn fresh_url_unavailable_does_not_block_import() {
             .status
             .success()
     );
+    let deadline = Instant::now();
+    loop {
+        if service.status()["worker"]["immich_api_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("Immich network request unavailable"))
+        {
+            break;
+        }
+        assert!(
+            deadline.elapsed() < Duration::from_secs(5),
+            "Immich failure missing from status"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 #[test]
 fn offline_import_edit_restart_reconnect_archive_with_actual_immich_pin() {

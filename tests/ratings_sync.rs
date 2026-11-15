@@ -152,7 +152,7 @@ fn lost_response_then_new_remote_value_not_overwritten() {
     assert_eq!(server.state.writes.lock().unwrap().len(), 1);
 }
 #[test]
-fn schema_upgrade_disables_writes() {
+fn server_upgrade_with_unchanged_api_keeps_writes_enabled() {
     let r = support::TestRig::new();
     let server = support::http::RatingServer::new();
     let (mut c, client, group) = setup(&r, &server);
@@ -175,9 +175,9 @@ fn schema_upgrade_disables_writes() {
         }
         .advance(id)
         .unwrap()
-        .waiting
+        .confirmed
     );
-    assert!(server.state.writes.lock().unwrap().is_empty());
+    assert_eq!(*server.state.writes.lock().unwrap(), vec![Some(3)]);
 }
 #[test]
 fn rating_save_does_not_clobber_pending_adjustments() {

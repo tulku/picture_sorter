@@ -30,8 +30,8 @@ fn evidence(r: &support::TestRig, s: &support::http::RatingServer) -> Capability
     .unwrap()
 }
 #[test]
-fn favorite_qualification_tracks_exact_supported_server_version() {
-    for version in ["v3.3.5", "3.4.0", "v3.4.0"] {
+fn favorite_evidence_survives_server_upgrades_with_compatible_api() {
+    for version in ["v3.3.5", "3.4.0", "v3.4.0", "v99.0.0"] {
         let r = support::TestRig::new();
         let s = support::http::RatingServer::new();
         *s.state.version.lock().unwrap() = version.into();
@@ -60,18 +60,22 @@ fn favorite_qualification_tracks_exact_supported_server_version() {
             FavoriteOutcome::Confirmed
         ));
         let writes = s.state.favorite_writes.lock().unwrap().len();
-        *s.state.version.lock().unwrap() = "3.3.5".into();
-        assert!(c.set_favorite(request(&s, true, false)).is_err());
-        assert_eq!(s.state.favorite_writes.lock().unwrap().len(), writes);
+        *s.state.version.lock().unwrap() = "v100.0.0".into();
+        assert!(matches!(
+            c.set_favorite(request(&s, true, false)).unwrap(),
+            FavoriteOutcome::Confirmed
+        ));
+        assert_eq!(s.state.favorite_writes.lock().unwrap().len(), writes + 1);
     }
 }
 
 #[test]
-fn unknown_favorite_versions_never_probe_or_write() {
+fn future_versions_with_missing_favorite_field_are_never_written() {
     for version in ["3.4.1", "v3.4.0-beta.1", "v4.0.0"] {
         let r = support::TestRig::new();
         let s = support::http::RatingServer::new();
         *s.state.version.lock().unwrap() = version.into();
+        *s.state.favorite.lock().unwrap() = None;
         let report = evidence(&r, &s);
         assert!(
             report

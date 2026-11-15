@@ -304,6 +304,7 @@ fn isolated_immich_probe_round_trips_and_restores_without_certifying_other_asset
     use std::os::unix::fs::PermissionsExt;
     let r = support::TestRig::new();
     let server = support::http::RatingServer::new();
+    *server.state.version.lock().unwrap() = "v99.0.0".into();
     let key = r.state.join("key");
     std::fs::write(&key, "fixture-key").unwrap();
     std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -311,7 +312,7 @@ fn isolated_immich_probe_round_trips_and_restores_without_certifying_other_asset
     let request = ImmichProbeRequest {
         favorites: false,
         origin: server.origin.clone(),
-        key_file: key,
+        key_file: key.clone(),
         asset: server.asset,
         isolated_asset_confirmed: true,
         fixture: true,
@@ -326,6 +327,27 @@ fn isolated_immich_probe_round_trips_and_restores_without_certifying_other_asset
     );
     assert_eq!(*server.state.rating.lock().unwrap(), Some(2));
     let registry = CapabilityRegistry::new(vec![report]);
+    *server.state.version.lock().unwrap() = "v100.0.0".into();
+    let jpeg_checksum = server.state.checksum.lock().unwrap().clone();
+    let client = photo_sorter::immich::ImmichClient::new(server.origin.clone(), &key)
+        .unwrap()
+        .with_rating_policy(
+            photo_sorter::immich::RatingWriteMode::BestEffort,
+            registry.clone(),
+        );
+    assert!(matches!(
+        client
+            .set_rating(photo_sorter::immich::RatingWrite {
+                asset: server.asset,
+                expected: photo_sorter::domain::RatingObservation::Stars(
+                    photo_sorter::domain::Rating::try_from(2).unwrap()
+                ),
+                desired: photo_sorter::domain::Rating::try_from(3).unwrap(),
+                jpeg_checksum,
+            })
+            .unwrap(),
+        photo_sorter::immich::WriteOutcome::Confirmed
+    ));
     assert!(
         registry
             .allows(OperationKind::RatingWrite {

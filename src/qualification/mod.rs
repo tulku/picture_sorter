@@ -112,7 +112,7 @@ impl CapabilityRegistry {
         Self { reports }
     }
     pub fn allows(&self, operation: OperationKind<'_>) -> CapabilityDecision {
-        let (origin, asset, version, favorite) = match operation {
+        let (origin, asset, _version, favorite) = match operation {
             OperationKind::EditorPickTransform {
                 version,
                 fingerprint,
@@ -204,12 +204,12 @@ impl CapabilityRegistry {
                 mode,
             } => return self.archive_decision(mount_identity, fingerprint, mode, true),
         };
-        let fingerprint = if favorite {
-            favorite_fingerprint(origin, version)
-        } else {
-            rating_fingerprint(origin, version)
-        };
         for report in &self.reports {
+            let fingerprint = if favorite {
+                favorite_fingerprint(origin, &report.tested_version)
+            } else {
+                rating_fingerprint(origin, &report.tested_version)
+            };
             if report.schema_version != 1
                 || report.capability
                     != if favorite {
@@ -217,7 +217,6 @@ impl CapabilityRegistry {
                     } else {
                         "immich-ratings"
                     }
-                || report.tested_version != version
                 || report.config_fingerprint != fingerprint
                 || report.results.is_empty()
                 || (favorite
@@ -269,7 +268,7 @@ impl CapabilityRegistry {
         }
         CapabilityDecision {
             allowed: false,
-            reason: "no matching runtime qualification for origin/version/scope".into(),
+            reason: "no matching runtime qualification for origin/API contract/scope".into(),
         }
     }
 }

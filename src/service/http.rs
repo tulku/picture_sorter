@@ -30,6 +30,7 @@ enum Reply {
     Favorite(uuid::Uuid, AppResult<FavoriteOutcome>),
 }
 struct Inner {
+    last_error: Option<(Key, String)>,
     send: SyncSender<Task>,
     receive: Receiver<Reply>,
     active: Option<Key>,
@@ -136,6 +137,7 @@ impl AsyncImmich {
             mode,
             config: config.clone(),
             inner: RefCell::new(Inner {
+                last_error: None,
                 send,
                 receive,
                 active: None,
@@ -149,12 +151,26 @@ impl AsyncImmich {
     pub fn notification_fd(&self) -> std::os::fd::RawFd {
         self.notification.fd()
     }
+    pub fn api_error(&self) -> Option<String> {
+        self.inner
+            .borrow()
+            .last_error
+            .as_ref()
+            .map(|(_, error)| error.clone())
+    }
     pub fn pump(&self) -> AppResult<()> {
         self.notification.drain();
         let mut inner = self.inner.borrow_mut();
         loop {
             match inner.receive.try_recv() {
                 Ok(reply) => {
+                    let (key, error) = match &reply {
+                        Reply::Asset(id, result) => (Key::Asset(*id), result.as_ref().err()),
+                        Reply::Server(result) => (Key::Server, result.as_ref().err()),
+                        Reply::Favorite(id, result) => (Key::Favorite(*id), result.as_ref().err()),
+                        Reply::Write(id, result) => (Key::Write(*id), result.as_ref().err()),
+                    };
+                    update_api_error(&mut inner.last_error, key, error.map(ToString::to_string));
                     match reply {
                         Reply::Asset(asset, result) => {
                             inner.assets.insert(asset, (Instant::now(), result));
@@ -231,6 +247,14 @@ fn pending() -> AppError {
         "Immich operation is queued or in flight; local work continues",
     )
 }
+fn update_api_error(last: &mut Option<(Key, String)>, key: Key, error: Option<String>) {
+    if let Some(error) = error {
+        *last = Some((key, error));
+    } else if last.as_ref().is_some_and(|(failed, _)| *failed == key) {
+        *last = None;
+    }
+}
+
 impl ImmichAccess for AsyncImmich {
     fn origin(&self) -> &url::Url {
         &self.origin
@@ -313,5 +337,24 @@ impl ImmichAccess for AsyncImmich {
         } else {
             FavoriteProgress::None
         }
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    #[test]
+    fn unrelated_success_does_not_hide_api_failure_and_retry_clears_it() {
+        let mut last = None;
+        let failed = Key::Asset(uuid::Uuid::new_v4());
+        update_api_error(
+            &mut last,
+            failed.clone(),
+            Some("Immich returned HTTP 503".into()),
+        );
+        update_api_error(&mut last, Key::Server, None);
+        assert!(last.is_some());
+        update_api_error(&mut last, failed, None);
+        assert!(last.is_none());
     }
 }
