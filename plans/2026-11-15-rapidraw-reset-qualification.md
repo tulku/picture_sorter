@@ -1,0 +1,7 @@
+# Native RapidRAW reset qualification
+
+User completed the isolated RapidRAW 1.6.7 save sequence: edited color-mode baseline at 0 stars/neutral, Pick, cleared Pick, Reject, neutral 3 stars, 5 stars, 0 stars and reopen. Captured sidecars in `/home/tulku/Pictures/PhotoSorter-Immich-Test/evidence` match the baseline except for the requested star/flag field. User confirmed Reset; the editor removed the live sidecar and retained the RAW. Current validator requires a regenerated default document and cannot represent this observed native behavior.
+
+Add optional `reset_removed_sidecar`, default false. For this explicitly selected mode require native saves attested, a runtime binary identity, absent exact `.rrdata` path (ENOENT only), and its matching nonempty regular original within the same isolated root. Keep default-document comparison for existing requests. Never synthesize a native reset sidecar or treat unconfirmed absence as evidence. Tests must reject no attestation, missing original, present sidecar and symlinks. Run native qualification from captured evidence, retaining all immutable original documents and test RAW. Native UI steps need not be repeated.
+
+Code worktree `/home/tulku/Repos/picture_sorter/rapidraw-reset-qualification`, branch `fix/rapidraw-reset-qualification`. Review and test before delivery; outgoing writes stay disabled until valid native qualification is available.
