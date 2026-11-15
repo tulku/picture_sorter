@@ -75,6 +75,14 @@ pub(super) fn render(data: &Value) -> String {
         bytes(space["exclusive_total"].as_u64())
     ));
     let mut attention = Vec::new();
+    if let Some(mapped) = data["worker"]["immich_discovery"]["mapped"].as_u64() {
+        let progress = if data["worker"]["immich_discovery"]["scanning"].as_bool() == Some(true) {
+            "; matching library"
+        } else {
+            ""
+        };
+        lines.push(format!("Immich: {mapped} photos matched{progress}"));
+    }
     if let Some(error) = data["worker"]["immich_api_error"].as_str() {
         let error: String = error
             .chars()

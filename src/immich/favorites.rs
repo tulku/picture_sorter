@@ -437,6 +437,24 @@ impl FavoriteSynchronizer<'_> {
                 && baseline.pending.is_none()
             {
                 RatingDecision::Converge(Rating::try_from(u8::from(value))?)
+            } else if baseline.common.is_none()
+                && baseline.pending.is_none()
+                && local.version.is_none()
+                && remote == Some(false)
+            {
+                RatingDecision::Converge(Rating::try_from(0)?)
+            } else if baseline.common.is_none()
+                && baseline.pending.is_none()
+                && value == Some(true)
+                && remote == Some(false)
+            {
+                RatingDecision::PublishLocal(Rating::try_from(1)?)
+            } else if baseline.common.is_none()
+                && baseline.pending.is_none()
+                && value == Some(false)
+                && remote == Some(true)
+            {
+                RatingDecision::AdoptRemote(Rating::try_from(1)?)
             } else {
                 reconcile_rating(&RatingInputs {
                     last_common: observation(baseline.common),

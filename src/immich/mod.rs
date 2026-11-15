@@ -1,4 +1,6 @@
 mod client;
+mod discovery;
+pub use discovery::*;
 mod mapping;
 pub use client::*;
 pub use mapping::*;

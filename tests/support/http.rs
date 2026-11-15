@@ -28,6 +28,19 @@ pub fn serve(
                 break;
             }
         }
+        let headers_text = String::from_utf8(request.clone()).unwrap();
+        let length = headers_text
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        assert!(length <= 32768);
+        let mut body_bytes = vec![0; length];
+        stream.read_exact(&mut body_bytes).unwrap();
+        request.extend(body_bytes);
         let request = String::from_utf8(request).unwrap();
         tx.send(request).unwrap();
         let extra = headers
@@ -44,6 +57,8 @@ pub fn serve(
 }
 #[derive(Clone)]
 pub struct RatingServerState {
+    pub search_pages: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    pub fail_search: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub restore_favorite_on_put: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub asset_fields: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
     pub after_put_fields: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
@@ -75,6 +90,8 @@ impl RatingServer {
             url::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
         let asset = uuid::Uuid::new_v4();
         let state = RatingServerState {
+            search_pages: Arc::new(Mutex::new(Vec::new())),
+            fail_search: Arc::new(AtomicBool::new(false)),
             restore_favorite_on_put: Arc::new(AtomicBool::new(false)),
             asset_fields: Arc::new(Mutex::new(serde_json::json!({}))),
             after_put_fields: Arc::new(Mutex::new(serde_json::json!({}))),
@@ -127,6 +144,18 @@ impl RatingServer {
                 if stream.read_exact(&mut body).is_err() {
                     continue;
                 }
+                let search_page = if header.starts_with("POST /api/search/metadata ") {
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let page = request["page"].as_u64().unwrap() as u32;
+                    worker_state.search_pages.lock().unwrap().push(page);
+                    if worker_state.fail_search.swap(false, Ordering::SeqCst) {
+                        write!(stream,"HTTP/1.1 503 Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").unwrap();
+                        continue;
+                    }
+                    Some(page)
+                } else {
+                    None
+                };
                 let response = if header.starts_with("GET /api/server/about ") {
                     serde_json::json!({"version":*worker_state.version.lock().unwrap(),"versionUrl":"https://fixture.invalid","licensed":false})
                 } else {
@@ -192,7 +221,12 @@ impl RatingServer {
                     } else {
                         asset_value.as_object_mut().unwrap().remove("isFavorite");
                     }
-                    asset_value
+                    if let Some(page) = search_page {
+                        asset_value["isTrashed"] = false.into();
+                        serde_json::json!({"assets":{"items":[asset_value],"nextPage":if page == 1 {Some("2")} else {None}}})
+                    } else {
+                        asset_value
+                    }
                 };
                 let body = serde_json::to_string(&response).unwrap();
                 let _ = write!(

@@ -80,7 +80,90 @@ pub struct ImmichClient {
     origin: Url,
     http: Client,
 }
+#[derive(Debug, Clone)]
+pub struct DiscoveryPage {
+    pub items: Vec<AssetInfo>,
+    pub next_page: Option<u32>,
+}
 impl ImmichClient {
+    pub fn discover_page(&self, library: uuid::Uuid, page: u32) -> AppResult<DiscoveryPage> {
+        if page == 0 || page > 100_000 {
+            return Err(AppError::invalid(
+                "Immich discovery page outside supported range",
+            ));
+        }
+        let response = self.http.post(self.origin.join("/api/search/metadata").unwrap())
+            .json(&serde_json::json!({"libraryId":library,"type":"IMAGE","page":page,"size":100,"withDeleted":false}))
+            .send().map_err(|_| AppError::new(ErrorCode::Unavailable,"Immich library discovery unavailable"))?;
+        let code = response.status().as_u16();
+        if code != 200 {
+            return Err(AppError::new(
+                match code {
+                    401 => ErrorCode::Authentication,
+                    403 => ErrorCode::Permission,
+                    _ => ErrorCode::Unavailable,
+                },
+                format!("Immich library discovery returned HTTP {code}"),
+            ));
+        }
+        let mut bytes = Vec::new();
+        response.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err(AppError::invalid(
+                "Immich discovery response exceeds supported bound",
+            ));
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Item {
+            #[serde(flatten)]
+            asset: AssetInfo,
+            is_trashed: bool,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Assets {
+            items: Vec<Item>,
+            next_page: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Response {
+            assets: Assets,
+        }
+        let response: Response = serde_json::from_slice(&bytes)
+            .map_err(|_| AppError::invalid("unsupported Immich discovery response"))?;
+        let next = response
+            .assets
+            .next_page
+            .map(|value| value.parse::<u32>())
+            .transpose()
+            .map_err(|_| AppError::invalid("invalid Immich discovery next page"))?;
+        if response.assets.items.len() > 100
+            || next.is_some_and(|next| next != page + 1)
+            || (response.assets.items.is_empty() && next.is_some())
+        {
+            return Err(AppError::invalid("invalid Immich discovery pagination"));
+        }
+        let items = response
+            .assets
+            .items
+            .into_iter()
+            .filter(|item| !item.is_trashed)
+            .map(|item| item.asset)
+            .collect::<Vec<_>>();
+        if items
+            .iter()
+            .any(|item| item.library_id != Some(library) || item.checksum.is_empty())
+        {
+            return Err(AppError::integrity(
+                "Immich discovery library or identity mismatch",
+            ));
+        }
+        Ok(DiscoveryPage {
+            items,
+            next_page: next,
+        })
+    }
     pub fn new(origin: Url, key_file: &Path) -> AppResult<Self> {
         Self::new_with_timeout(origin, key_file, Duration::from_secs(5))
     }
@@ -176,7 +259,19 @@ impl ImmichClient {
         })
     }
     pub fn asset(&self, id: uuid::Uuid) -> AppResult<AssetInfo> {
-        let asset: AssetInfo = self.get(&format!("/api/assets/{id}"))?;
+        let value: serde_json::Value = self.get(&format!("/api/assets/{id}"))?;
+        if value.get("isTrashed").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Err(AppError::new(
+                ErrorCode::NotFound,
+                "Immich asset is in trash; synchronization skipped",
+            ));
+        }
+        let asset: AssetInfo = serde_json::from_value(value).map_err(|_| {
+            AppError::new(
+                ErrorCode::Unsupported,
+                "Immich response does not match the supported schema",
+            )
+        })?;
         if asset.id != id || asset.checksum.is_empty() {
             return Err(AppError::integrity("Immich asset identity mismatch"));
         }
