@@ -597,6 +597,20 @@ impl Runtime {
                 };
                 status.capabilities["nas_publication"] = serde_json::to_value(nas)?;
                 status.capabilities["nas_metadata_replacement"] = serde_json::to_value(exchange)?;
+                status.capabilities["immich_favorites"] =
+                    serde_json::to_value(self.integration.write_decision(
+                        &self.engine.config,
+                        self.editor_identity.as_ref(),
+                        true,
+                    ))?;
+                status.capabilities["immich_ratings"] =
+                    serde_json::to_value(self.integration.write_decision(
+                        &self.engine.config,
+                        self.editor_identity.as_ref(),
+                        false,
+                    ))?;
+                status.worker["immich_discovery"] =
+                    self.integration.discovery_status(&self.engine.catalog)?;
                 status.worker["publication_reason"] =
                     serde_json::to_value(&self.shared_publisher.reason)?;
                 status.worker["immich_api_error"] = serde_json::to_value(

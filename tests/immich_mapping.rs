@@ -99,6 +99,184 @@ fn tiff_is_not_eligible_jpeg() {
     assert!(resolve_asset(&asset(uuid::Uuid::new_v4(), "/external/a.TIFF"), &[], &c).is_err());
 }
 #[test]
+fn discovery_binds_exact_library_jpeg_without_pinning() {
+    let r = support::TestRig::new();
+    let mut c = Catalog::open(&RootHandle::open(&r.state, RootPolicy::Local).unwrap()).unwrap();
+    let group = c.create_group(false).unwrap();
+    c.attach_member(
+        group,
+        OriginalMember {
+            path: ArchivePath::parse("JPEG/a.JPG").unwrap(),
+            digest: Digest::of(b"jpeg"),
+            size: 4,
+            role: MediaRole::Jpeg,
+        },
+        photo_sorter::catalog::PairEvidence::UserSelected {
+            reason: "fixture".into(),
+        },
+    )
+    .unwrap();
+    let library = uuid::Uuid::new_v4();
+    let mappings = [PrefixMapping {
+        source: "/external".into(),
+        target: None,
+        library: Some(library),
+    }];
+    let origin = Url::parse("https://fixture.invalid").unwrap();
+    let mut jpeg = asset(uuid::Uuid::new_v4(), "/external/JPEG/a.JPG");
+    jpeg.library_id = Some(library);
+    let mut foreign = jpeg.clone();
+    foreign.id = uuid::Uuid::new_v4();
+    foreign.library_id = Some(uuid::Uuid::new_v4());
+    let items = vec![
+        jpeg.clone(),
+        foreign,
+        asset(uuid::Uuid::new_v4(), "/external/a.TIFF"),
+        asset(uuid::Uuid::new_v4(), "/external/JPEG/missing.JPG"),
+    ];
+    let result = discover_assets(&mut c, &origin, &mappings, &items).unwrap();
+    assert_eq!(result.matched, 1);
+    assert_eq!(result.skipped, 3);
+    assert!(c.jobs().unwrap().is_empty());
+    let db = rusqlite::Connection::open(r.state.join("catalog.sqlite")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM mappings", [], |r| r.get::<_, u64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        discover_assets(&mut c, &origin, &mappings, &[jpeg.clone()])
+            .unwrap()
+            .matched,
+        1
+    );
+    jpeg.checksum = "changed".into();
+    assert_eq!(
+        discover_assets(&mut c, &origin, &mappings, &[jpeg])
+            .unwrap()
+            .conflicts,
+        1
+    );
+}
+
+#[test]
+fn metadata_search_is_bounded_scoped_and_ignores_trash() {
+    let r = support::TestRig::new();
+    let library = uuid::Uuid::new_v4();
+    let mut item = serde_json::to_value(asset(uuid::Uuid::new_v4(), "/external/a.JPG")).unwrap();
+    item["libraryId"] = library.to_string().into();
+    item["isTrashed"] = false.into();
+    let mut trashed = item.clone();
+    trashed["isTrashed"] = true.into();
+    let body = serde_json::json!({"assets":{"items":[item,trashed],"nextPage":"2"}}).to_string();
+    let (origin, rx, handle) = support::http::serve(200, body, vec![]);
+    let client = ImmichClient::new(origin, &key(&r)).unwrap();
+    let page = client.discover_page(library, 1).unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.next_page, Some(2));
+    let request = rx.recv().unwrap();
+    assert!(request.starts_with("POST /api/search/metadata "));
+    assert!(request.contains(&library.to_string()));
+    handle.join().unwrap();
+}
+#[test]
+fn running_service_discovers_without_a_pin_request() {
+    let library = uuid::Uuid::new_v4();
+    let server = support::http::RatingServer::new();
+    *server.state.asset_fields.lock().unwrap() =
+        serde_json::json!({"originalPath":"/external/JPEG/a.JPG","libraryId":library});
+    server
+        .state
+        .fail_search
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let origin = server.origin.clone();
+    let service = support::service::ServiceFixture::with_config(|config, r| {
+        let mut c = Catalog::open(&RootHandle::open(&r.state, RootPolicy::Local).unwrap()).unwrap();
+        let group = c.create_group(false).unwrap();
+        c.attach_member(
+            group,
+            OriginalMember {
+                path: ArchivePath::parse("JPEG/a.JPG").unwrap(),
+                digest: Digest::of(b"jpeg"),
+                size: 4,
+                role: MediaRole::Jpeg,
+            },
+            photo_sorter::catalog::PairEvidence::UserSelected {
+                reason: "fixture".into(),
+            },
+        )
+        .unwrap();
+        config.immich = Some(photo_sorter::config::ImmichConfig {
+            origin: origin.to_string(),
+            key_file: key(r),
+            library_id: Some(library.to_string()),
+            write_mode: "disabled".into(),
+        });
+        config.immich_path_mappings = vec![PrefixMapping {
+            source: "/external".into(),
+            target: None,
+            library: Some(library),
+        }];
+        config.poll_seconds = 1;
+    });
+    let db = rusqlite::Connection::open(service.r.state.join("catalog.sqlite")).unwrap();
+    let deadline = std::time::Instant::now();
+    loop {
+        if db
+            .query_row("SELECT count(*) FROM mappings", [], |r| r.get::<_, u64>(0))
+            .unwrap()
+            == 1
+            && server.state.search_pages.lock().unwrap().contains(&2)
+        {
+            break;
+        }
+        assert!(
+            deadline.elapsed() < std::time::Duration::from_secs(8),
+            "service never discovered the asset"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(&server.state.search_pages.lock().unwrap()[..3], &[1, 1, 2]);
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM jobs WHERE json_extract(request,'$.kind.type')='pin_url'",
+            [],
+            |r| r.get::<_, u64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        service.status()["worker"]["immich_api_error"],
+        serde_json::Value::Null
+    );
+}
+#[test]
+fn metadata_search_rejects_invalid_pages_and_foreign_library_results() {
+    let r = support::TestRig::new();
+    let library = uuid::Uuid::new_v4();
+    let mut item = serde_json::to_value(asset(uuid::Uuid::new_v4(), "/external/a.JPG")).unwrap();
+    item["libraryId"] = library.to_string().into();
+    item["isTrashed"] = false.into();
+    let mut foreign = item.clone();
+    foreign["libraryId"] = uuid::Uuid::new_v4().to_string().into();
+    for body in [
+        serde_json::json!({"assets":{"items":[item],"nextPage":"1"}}),
+        serde_json::json!({"assets":{"items":[],"nextPage":"2"}}),
+        serde_json::json!({"assets":{"items":[foreign],"nextPage":null}}),
+    ] {
+        let (origin, rx, handle) = support::http::serve(200, body.to_string(), vec![]);
+        assert!(
+            ImmichClient::new(origin, &key(&r))
+                .unwrap()
+                .discover_page(library, 1)
+                .is_err()
+        );
+        rx.recv().unwrap();
+        handle.join().unwrap();
+    }
+}
+#[test]
 fn known_url_works_offline() {
     let r = support::TestRig::new();
     let mut c = Catalog::open(&RootHandle::open(&r.state, RootPolicy::Local).unwrap()).unwrap();

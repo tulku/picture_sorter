@@ -239,11 +239,43 @@ fn selecting_reject_during_initial_favorite_disagreement_still_clears_favorite()
     let mut f = Fixture::new();
     f.save(serde_json::Value::Null);
     *f.server.state.favorite.lock().unwrap() = Some(true);
-    assert_eq!(f.poll().conflicts, 1);
+    assert_eq!(f.poll().conflicts, 0);
+    assert_eq!(f.pending()["flag"], "pick");
     f.save(serde_json::json!("reject"));
     assert_eq!(f.poll().conflicts, 0);
     assert!(f.advance().confirmed);
     assert_eq!(*f.server.state.favorite.lock().unwrap(), Some(false));
+}
+#[test]
+fn initial_pick_is_published_without_requiring_a_prior_neutral_baseline() {
+    let mut f = Fixture::new();
+    f.save(serde_json::json!("pick"));
+    assert_eq!(f.poll().conflicts, 0);
+    assert!(f.advance().confirmed);
+    assert_eq!(*f.server.state.favorite.lock().unwrap(), Some(true));
+    assert!(f.server.state.writes.lock().unwrap().is_empty());
+}
+#[test]
+fn initial_nonfavorite_without_edits_does_not_create_a_sidecar() {
+    let mut f = Fixture::new();
+    assert_eq!(f.poll().conflicts, 0);
+    assert!(f.c.favorite_pending_version(f.group).unwrap().is_none());
+    assert!(f.c.next_favorite_intent(0).unwrap().is_none());
+    *f.server.state.favorite.lock().unwrap() = Some(true);
+    f.poll();
+    assert_eq!(f.pending()["flag"], "pick");
+}
+#[test]
+fn previously_matched_photo_in_trash_cannot_receive_a_queued_favorite() {
+    let mut f = Fixture::new();
+    let writes = f.server.state.favorite_writes.lock().unwrap().len();
+    f.save(serde_json::json!("pick"));
+    f.poll();
+    f.server.state.asset_fields.lock().unwrap()["isTrashed"] = true.into();
+    let result = f.advance();
+    assert!(!result.confirmed);
+    assert_eq!(*f.server.state.favorite.lock().unwrap(), Some(false));
+    assert_eq!(f.server.state.favorite_writes.lock().unwrap().len(), writes);
 }
 #[test]
 fn association_preserves_favorite_outbox_and_baseline() {
@@ -1229,6 +1261,6 @@ fn reject_with_unobserved_remote_does_not_invent_a_false_common_baseline() {
     assert!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["common"].is_null());
     f.save(serde_json::Value::Null);
     *f.server.state.favorite.lock().unwrap() = Some(true);
-    assert_eq!(f.poll().conflicts, 1);
-    assert!(f.c.favorite_pending_version(f.group).unwrap().is_none());
+    assert_eq!(f.poll().conflicts, 0);
+    assert_eq!(f.pending()["flag"], "pick");
 }

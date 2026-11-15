@@ -12,24 +12,28 @@ use std::{
 };
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Key {
+    Discovery(u32),
     Asset(uuid::Uuid),
     Server,
     Write(uuid::Uuid),
     Favorite(uuid::Uuid),
 }
 enum Task {
+    Discovery(uuid::Uuid, u32),
     Asset(uuid::Uuid),
     Server,
     Write(RatingWrite),
     Favorite(FavoriteWrite),
 }
 enum Reply {
+    Discovery(u32, AppResult<DiscoveryPage>),
     Asset(uuid::Uuid, AppResult<AssetInfo>),
     Server(AppResult<ServerInfo>),
     Write(uuid::Uuid, AppResult<WriteOutcome>),
     Favorite(uuid::Uuid, AppResult<FavoriteOutcome>),
 }
 struct Inner {
+    discovery: Option<(u32, AppResult<DiscoveryPage>)>,
     last_error: Option<(Key, String)>,
     send: SyncSender<Task>,
     receive: Receiver<Reply>,
@@ -95,6 +99,11 @@ impl AsyncImmich {
                     }
                 };
                 let reply = match task {
+                    Task::Discovery(library, page) => Reply::Discovery(
+                        page,
+                        configured
+                            .and_then(|_| client.as_ref().unwrap().discover_page(library, page)),
+                    ),
                     Task::Asset(asset) => Reply::Asset(
                         asset,
                         configured.and_then(|_| client.as_ref().unwrap().asset(asset)),
@@ -137,6 +146,7 @@ impl AsyncImmich {
             mode,
             config: config.clone(),
             inner: RefCell::new(Inner {
+                discovery: None,
                 last_error: None,
                 send,
                 receive,
@@ -165,6 +175,9 @@ impl AsyncImmich {
             match inner.receive.try_recv() {
                 Ok(reply) => {
                     let (key, error) = match &reply {
+                        Reply::Discovery(page, result) => {
+                            (Key::Discovery(*page), result.as_ref().err())
+                        }
                         Reply::Asset(id, result) => (Key::Asset(*id), result.as_ref().err()),
                         Reply::Server(result) => (Key::Server, result.as_ref().err()),
                         Reply::Favorite(id, result) => (Key::Favorite(*id), result.as_ref().err()),
@@ -172,6 +185,7 @@ impl AsyncImmich {
                     };
                     update_api_error(&mut inner.last_error, key, error.map(ToString::to_string));
                     match reply {
+                        Reply::Discovery(page, result) => inner.discovery = Some((page, result)),
                         Reply::Asset(asset, result) => {
                             inner.assets.insert(asset, (Instant::now(), result));
                             if inner.assets.len() > 256
@@ -210,6 +224,31 @@ impl AsyncImmich {
             .assets
             .get(&asset)
             .is_some_and(|(at, result)| at.elapsed() < Duration::from_secs(30) && result.is_ok())
+    }
+    pub fn discover_page(
+        &self,
+        library: uuid::Uuid,
+        page: u32,
+    ) -> AppResult<Option<AppResult<DiscoveryPage>>> {
+        self.pump()?;
+        if self
+            .inner
+            .borrow()
+            .discovery
+            .as_ref()
+            .is_some_and(|(ready, _)| *ready == page)
+        {
+            return Ok(self
+                .inner
+                .borrow_mut()
+                .discovery
+                .take()
+                .map(|(_, result)| result));
+        }
+        if !self.in_flight() {
+            self.queue(Key::Discovery(page), Task::Discovery(library, page))?;
+        }
+        Ok(None)
     }
     pub fn asset_failed(&self, asset: uuid::Uuid) -> bool {
         self.inner
