@@ -130,12 +130,13 @@ fn qualify_favorites(request: ImmichProbeRequest) -> AppResult<CapabilityReport>
         ));
     }
     let mut report=CapabilityReport {schema_version:1,capability:"immich-favorites".into(),backend_or_application:if request.fixture {"immich-fixture"}else {"immich"}.into(),tested_version:TESTED_VERSION.into(),mount_identity:None,config_fingerprint:favorite_fingerprint(&request.origin,TESTED_VERSION),scope:if request.fixture {ProbeScope::FixtureAsset {origin:request.origin.to_string(),asset:request.asset}}else {ProbeScope::IsolatedRuntime {origin:request.origin.to_string(),asset:request.asset}},results:vec![],limitations:vec!["Immich has no conditional rating update; a concurrent user change can race a PUT. Only the explicitly isolated asset is mutated by this probe.".into()]};
-    let execute = || -> AppResult<Vec<ProbeResult>> {
+    let mut execute = || -> AppResult<Vec<ProbeResult>> {
         let client = ImmichClient::new(request.origin.clone(), &request.key_file)?;
-        if client.server_info()?.version != TESTED_VERSION {
-            return Err(AppError::invalid(
-                "server version does not match the pinned profile",
-            ));
+        let version = client.server_info()?.version;
+        report.tested_version = version.clone();
+        report.config_fingerprint = favorite_fingerprint(&request.origin, &version);
+        if !supported_favorite_version(&version) {
+            return Err(AppError::invalid("unsupported Favorite API server version"));
         }
         let initial = client.asset(request.asset)?;
         if initial.kind != "IMAGE"
@@ -155,14 +156,17 @@ fn qualify_favorites(request: ImmichProbeRequest) -> AppResult<CapabilityReport>
             detail: "Pinned server and explicit JPEG identity observed".into(),
         }];
         for desired in [!original, original] {
-            let outcome = client.probe_favorite(FavoriteWrite {
-                asset: request.asset,
-                expected,
-                desired,
-                jpeg_checksum: initial.checksum.clone(),
-                external_path: initial.original_path.clone(),
-                library_id: initial.library_id,
-            })?;
+            let outcome = client.probe_favorite(
+                &version,
+                FavoriteWrite {
+                    asset: request.asset,
+                    expected,
+                    desired,
+                    jpeg_checksum: initial.checksum.clone(),
+                    external_path: initial.original_path.clone(),
+                    library_id: initial.library_id,
+                },
+            )?;
             if !matches!(outcome, FavoriteOutcome::Confirmed) {
                 results.push(ProbeResult {
                     name: format!("favorite_{desired}"),
@@ -182,14 +186,17 @@ fn qualify_favorites(request: ImmichProbeRequest) -> AppResult<CapabilityReport>
                         .into(),
             });
         }
-        let restored = client.probe_favorite(FavoriteWrite {
-            asset: request.asset,
-            expected,
-            desired: original,
-            jpeg_checksum: initial.checksum,
-            external_path: initial.original_path,
-            library_id: initial.library_id,
-        })?;
+        let restored = client.probe_favorite(
+            &version,
+            FavoriteWrite {
+                asset: request.asset,
+                expected,
+                desired: original,
+                jpeg_checksum: initial.checksum,
+                external_path: initial.original_path,
+                library_id: initial.library_id,
+            },
+        )?;
         results.push(ProbeResult {name:"restore_original".into(),outcome:if matches!(restored,FavoriteOutcome::Confirmed) {ProbeOutcome::Pass}else {ProbeOutcome::Fail},detail:"Restoration uses the last confirmed probe value as its precondition; non-CAS race remains".into()});
         Ok(results)
     };

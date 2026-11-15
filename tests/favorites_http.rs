@@ -30,6 +30,60 @@ fn evidence(r: &support::TestRig, s: &support::http::RatingServer) -> Capability
     .unwrap()
 }
 #[test]
+fn favorite_qualification_tracks_exact_supported_server_version() {
+    for version in ["v3.3.5", "3.4.0", "v3.4.0"] {
+        let r = support::TestRig::new();
+        let s = support::http::RatingServer::new();
+        *s.state.version.lock().unwrap() = version.into();
+        *s.state.rating.lock().unwrap() = Some(5);
+        let report = evidence(&r, &s);
+        assert!(
+            report
+                .results
+                .iter()
+                .all(|p| matches!(p.outcome, ProbeOutcome::Pass)),
+            "{report:?}"
+        );
+        assert_eq!(report.tested_version, version);
+        assert_eq!(
+            report.config_fingerprint,
+            favorite_fingerprint(&s.origin, version)
+        );
+        assert_eq!(*s.state.favorite.lock().unwrap(), Some(false));
+        assert_eq!(*s.state.rating.lock().unwrap(), Some(5));
+        let c = client(&r, &s).with_rating_policy(
+            RatingWriteMode::BestEffort,
+            CapabilityRegistry::new(vec![report]),
+        );
+        assert!(matches!(
+            c.set_favorite(request(&s, false, true)).unwrap(),
+            FavoriteOutcome::Confirmed
+        ));
+        let writes = s.state.favorite_writes.lock().unwrap().len();
+        *s.state.version.lock().unwrap() = "3.3.5".into();
+        assert!(c.set_favorite(request(&s, true, false)).is_err());
+        assert_eq!(s.state.favorite_writes.lock().unwrap().len(), writes);
+    }
+}
+
+#[test]
+fn unknown_favorite_versions_never_probe_or_write() {
+    for version in ["3.4.1", "v3.4.0-beta.1", "v4.0.0"] {
+        let r = support::TestRig::new();
+        let s = support::http::RatingServer::new();
+        *s.state.version.lock().unwrap() = version.into();
+        let report = evidence(&r, &s);
+        assert!(
+            report
+                .results
+                .iter()
+                .any(|p| matches!(p.outcome, ProbeOutcome::Fail))
+        );
+        assert!(s.state.favorite_writes.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
 fn qualified_favorite_roundtrip_and_restore_preserves_stars() {
     let r = support::TestRig::new();
     let s = support::http::RatingServer::new();

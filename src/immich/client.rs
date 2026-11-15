@@ -18,6 +18,12 @@ use std::{
 use url::Url;
 pub const SCHEMA_REVISION: &str = "8303cb117e197c700332b33b61b45314c9cc5bb4";
 pub const TESTED_VERSION: &str = "3.3.5";
+pub(crate) fn supported_favorite_version(version: &str) -> bool {
+    matches!(
+        version.strip_prefix('v').unwrap_or(version),
+        "3.3.5" | "3.4.0"
+    )
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetInfo {
@@ -256,10 +262,10 @@ impl ImmichClient {
             ));
         }
         let server = self.server_info()?;
-        if server.version != TESTED_VERSION {
+        if !supported_favorite_version(&server.version) {
             return Err(AppError::new(
                 ErrorCode::Unsupported,
-                "server upgrade invalidated rating write profile",
+                "unsupported Favorite API server version",
             ));
         }
         let decision =
@@ -369,9 +375,11 @@ impl ImmichClient {
 impl ImmichClient {
     pub(crate) fn probe_favorite(
         &self,
+        expected_version: &str,
         request: super::FavoriteWrite,
     ) -> AppResult<super::FavoriteOutcome> {
-        if self.server_info()?.version != TESTED_VERSION {
+        let version = self.server_info()?.version;
+        if version != expected_version || !supported_favorite_version(&version) {
             return Err(AppError::new(
                 ErrorCode::Unsupported,
                 "unsupported probe server version",
