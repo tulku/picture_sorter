@@ -1,0 +1,7 @@
+Chosen future name: Waystone
+
+The user selected Waystone as the future name for photo_sorter / picture_sorter.
+The rename is deferred; no implementation or deployment changes are requested now.
+Use this choice when the user asks to undertake the rename. The command name,
+repository name, configuration paths, service names and migration scope remain
+to be decided at that time.
